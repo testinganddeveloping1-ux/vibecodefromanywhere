@@ -123,10 +123,9 @@ process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 console.log(`FromYourPhone listening on http://${cfg.server.bind}:${cfg.server.port}`);
-console.log(`Admin link (token): ${adminUrl}\n`);
-qrcode.generate(adminUrl, { small: true });
 
 // Pairing QR: lets a new device claim the httpOnly cookie without typing/pasting the long token.
+let pairUrl = "";
 try {
   const r = await fetch(`http://127.0.0.1:${cfg.server.port}/api/auth/pair/start?token=${encodeURIComponent(cfg.auth.token)}`, {
     method: "POST",
@@ -136,13 +135,24 @@ try {
     const j = (await r.json()) as any;
     const code = typeof j?.code === "string" ? j.code : "";
     if (code) {
-      const pairUrl = `http://${host}:${cfg.server.port}/?pair=${encodeURIComponent(code)}`;
-      console.log(`\nPair link (no token): ${pairUrl}\n`);
-      qrcode.generate(pairUrl, { small: true });
+      pairUrl = `http://${host}:${cfg.server.port}/?pair=${encodeURIComponent(code)}`;
     }
   }
 } catch {
   // ignore
+}
+
+if (pairUrl) {
+  console.log(`\nScan on phone (recommended): Pair link (no token)`);
+  console.log(`${pairUrl}\n`);
+  qrcode.generate(pairUrl, { small: true });
+  console.log(`\nFallback: Token link (long)`);
+  console.log(`${adminUrl}\n`);
+  qrcode.generate(adminUrl, { small: true });
+} else {
+  console.log(`\nScan on phone: Token link`);
+  console.log(`${adminUrl}\n`);
+  qrcode.generate(adminUrl, { small: true });
 }
 
 console.log("\nTip (encrypted, no port forwarding):");

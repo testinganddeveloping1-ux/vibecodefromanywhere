@@ -111,6 +111,9 @@
         if (url) url.textContent = String(window.location.href || "");
 
         const showErr = (msg) => {
+          try {
+            if (boot) boot.style.display = "flex";
+          } catch {}
           if (!err) return;
           err.style.display = "block";
           err.textContent = "UI failed to start.\n\n" + String(msg || "unknown error");
@@ -125,7 +128,10 @@
         });
 
         window.__FYP_BOOT_OK = () => {
-          try { boot && boot.remove(); } catch {}
+          try { if (boot) boot.style.display = "none"; } catch {}
+        };
+        window.__FYP_BOOT_FAIL = (msg) => {
+          try { showErr(msg); } catch {}
         };
 
         setTimeout(() => {
@@ -140,7 +146,7 @@
           } catch (e) {
             showErr(e && e.message ? e.message : String(e));
           }
-        }, 2200);
+        }, 3500);
       })();
     </script>
     <script type="module" src="/src/main.tsx"></script>
