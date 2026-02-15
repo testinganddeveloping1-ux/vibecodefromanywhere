@@ -1,0 +1,12 @@
+{
+  "name": "FromYourPhone",
+  "short_name": "FYP",
+  "description": "Control AI coding tools from your phone",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#050608",
+  "theme_color": "#050608",
+  "categories": ["developer", "productivity"],
+  "icons": []
+}
