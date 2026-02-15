@@ -88,6 +88,15 @@ export function App() {
       return { slots: 3 };
     }
   });
+  const [autoPinNew, setAutoPinNew] = useState<boolean>(() => {
+    try {
+      const raw = typeof window !== "undefined" ? window.localStorage.getItem("fyp_autopin") : null;
+      if (raw == null) return true;
+      return raw === "1" || raw === "true" || raw === "yes";
+    } catch {
+      return true;
+    }
+  });
 
   const [codexOpt, setCodexOpt] = useState({
     sandbox: "",
@@ -202,6 +211,15 @@ export function App() {
       return 15;
     }
   });
+  const [lineHeight, setLineHeight] = useState<number>(() => {
+    try {
+      const v = typeof window !== "undefined" ? window.localStorage.getItem("fyp_lh") : null;
+      const n = v ? Number(v) : 1.32;
+      return Number.isFinite(n) ? Math.min(1.6, Math.max(1.1, n)) : 1.32;
+    } catch {
+      return 1.32;
+    }
+  });
 
   const orderedProfiles = useMemo(() => {
     const base = profiles.filter((p) => p.tool === tool);
@@ -275,15 +293,15 @@ export function App() {
         }
       })();
 
-      const t = new Terminal({
-        cursorBlink: true,
-        fontFamily: monoStack,
-        fontSize,
-        lineHeight: 1.2,
-        theme: {
-          background: "#060810",
-          foreground: "#e4eaf4",
-          cursor: "#f5a623",
+	      const t = new Terminal({
+	        cursorBlink: true,
+	        fontFamily: monoStack,
+	        fontSize,
+	        lineHeight,
+	        theme: {
+	          background: "#060810",
+	          foreground: "#e4eaf4",
+	          cursor: "#f5a623",
           selectionBackground: "rgba(245,166,35,.25)",
           selectionForeground: "#eaf0fa",
         },
@@ -383,7 +401,7 @@ export function App() {
     setPresetMsg("Applied workspace defaults");
   }
 
-  async function refreshSessions() {
+  async function refreshSessions(): Promise<SessionRow[] | null> {
     try {
       const rows = await api<SessionRow[]>("/api/sessions");
       setSessions(rows);
@@ -392,8 +410,10 @@ export function App() {
         if (prev && rows.some((s) => s.id === prev)) return prev;
         return rows.length > 0 ? rows[0]!.id : null;
       });
+      return rows;
     } catch {
       // ignore
+      return null;
     }
   }
 
@@ -773,6 +793,14 @@ export function App() {
   }, [slotCfg]);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem("fyp_autopin", autoPinNew ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  }, [autoPinNew]);
+
+  useEffect(() => {
     return () => {
       try {
         if (termOutBuf.current?.timer) clearTimeout(termOutBuf.current.timer);
@@ -817,6 +845,24 @@ export function App() {
       }
     }, 10);
   }, [fontSize]);
+
+  useEffect(() => {
+    if (!term.current) return;
+    term.current.options.lineHeight = lineHeight;
+    try {
+      window.localStorage.setItem("fyp_lh", String(lineHeight));
+    } catch {
+      // ignore
+    }
+    setTimeout(() => {
+      try {
+        fit.current?.fit();
+        term.current?.refresh(0, Math.max(0, (term.current?.rows ?? 1) - 1));
+      } catch {
+        // ignore
+      }
+    }, 10);
+  }, [lineHeight]);
 
   useEffect(() => {
     if (tab !== "run") return;
@@ -1294,30 +1340,31 @@ export function App() {
     }
   }
 
-  async function startSessionWith(input: { tool: ToolId; profileId: string; cwd?: string; overrides?: any; savePreset?: boolean; toolAction?: "resume" | "fork"; toolSessionId?: string }) {
-    try {
-      const res = await api<{ id: string }>("/api/sessions", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          tool: input.tool,
-          profileId: input.profileId,
-          cwd: input.cwd,
-          toolAction: input.toolAction,
-          toolSessionId: input.toolSessionId,
-          overrides: input.overrides ?? {},
-          savePreset: typeof input.savePreset === "boolean" ? input.savePreset : false,
-        }),
-      });
-      setToast("Session started");
-      await refreshSessions();
-      await refreshRecentWorkspaces();
-      await refreshWorkspaces();
-      openSession(res.id);
-    } catch (e: any) {
-      setToast(typeof e?.message === "string" ? e.message : "failed to create session");
-    }
-  }
+	  async function startSessionWith(input: { tool: ToolId; profileId: string; cwd?: string; overrides?: any; savePreset?: boolean; toolAction?: "resume" | "fork"; toolSessionId?: string }) {
+	    try {
+	      const res = await api<{ id: string }>("/api/sessions", {
+	        method: "POST",
+	        headers: { "content-type": "application/json" },
+	        body: JSON.stringify({
+	          tool: input.tool,
+	          profileId: input.profileId,
+	          cwd: input.cwd,
+	          toolAction: input.toolAction,
+	          toolSessionId: input.toolSessionId,
+	          overrides: input.overrides ?? {},
+	          savePreset: typeof input.savePreset === "boolean" ? input.savePreset : false,
+	        }),
+	      });
+	      setToast("Session started");
+	      const rows = await refreshSessions();
+	      await refreshRecentWorkspaces();
+	      await refreshWorkspaces();
+	      openSession(res.id);
+	      void autoPinSession(res.id, rows);
+	    } catch (e: any) {
+	      setToast(typeof e?.message === "string" ? e.message : "failed to create session");
+	    }
+	  }
 
   async function createSession() {
     const overrides: any = {};
@@ -1467,6 +1514,51 @@ export function App() {
       body: JSON.stringify(patch),
     });
     if (r?.event && activeIdRef.current === sessionId) ingestEventRaw(r.event);
+  }
+
+  async function autoPinSession(sessionId: string, rows?: SessionRow[] | null) {
+    if (!autoPinNew) return;
+    const list = Array.isArray(rows) && rows.length ? rows : sessions;
+    const sess = list.find((s) => s.id === sessionId) ?? null;
+    if (!sess) return;
+    const already = typeof sess.pinnedSlot === "number" ? sess.pinnedSlot : null;
+    if (already && already >= 1 && already <= 6) return;
+
+    const groupKey = String(sess.workspaceKey ?? (sess.cwd ? `dir:${sess.cwd}` : `dir:${sess.id}`));
+    const used = new Set<number>();
+    for (const s of list) {
+      const g = String(s.workspaceKey ?? (s.cwd ? `dir:${s.cwd}` : `dir:${s.id}`));
+      if (g !== groupKey) continue;
+      const ps = typeof s.pinnedSlot === "number" ? s.pinnedSlot : null;
+      if (ps && ps >= 1 && ps <= 6) used.add(ps);
+    }
+
+    let chosen: number = slotCfg.slots;
+    for (let i = 1; i <= slotCfg.slots; i++) {
+      if (!used.has(i)) {
+        chosen = i;
+        break;
+      }
+    }
+
+    // Optimistic update: clear any other session in this group already in the chosen slot.
+    setSessions((prev) =>
+      prev.map((s) => {
+        const g = String(s.workspaceKey ?? (s.cwd ? `dir:${s.cwd}` : `dir:${s.id}`));
+        if (g !== groupKey) return s;
+        if (s.id === sessionId) return { ...s, pinnedSlot: chosen };
+        if (s.pinnedSlot === chosen) return { ...s, pinnedSlot: null };
+        return s;
+      }),
+    );
+
+    try {
+      await setSessionMeta(sessionId, { pinnedSlot: chosen });
+    } catch {
+      // If pin fails (e.g. server rejected), re-sync.
+      refreshSessions();
+      refreshWorkspaces();
+    }
   }
 
   async function togglePin(sessionId: string) {
@@ -1807,12 +1899,26 @@ export function App() {
                       {activeInboxCount} pending
                     </button>
                   ) : null}
-                </div>
-                <div className="runBtns">
-                  <button className="btn" onClick={() => sendControl("interrupt")}>Ctrl+C</button>
-                  <button className="btn ghost" onClick={() => setShowControls(true)}>More</button>
-                </div>
-              </div>
+	                </div>
+	                <div className="runBtns">
+	                  <button className="btn" onClick={() => sendControl("interrupt")}>Ctrl+C</button>
+	                  <button
+	                    className="btn"
+	                    onClick={() => {
+	                      const t = activeSession?.tool ?? null;
+	                      const sid = String(activeSession?.toolSessionId ?? "");
+	                      if ((t !== "codex" && t !== "claude") || !sid) {
+	                        setToast("Chat history not linked yet");
+	                        return;
+	                      }
+	                      openToolChat(t, sid);
+	                    }}
+	                  >
+	                    Chat
+	                  </button>
+	                  <button className="btn ghost" onClick={() => setShowControls(true)}>More</button>
+	                </div>
+	              </div>
 
               {activeAttention ? (
                 <div className={`attentionCard attention${activeAttention.severity}`}>
@@ -1965,29 +2071,30 @@ export function App() {
                       <div className="help">No matching workspaces yet. Start a session in New.</div>
                     </div>
                   ) : null}
-                  {filteredWorkspaces.map((w) => {
-                    const waiting = (w.sessions ?? []).reduce((acc, s) => acc + (s.attention ?? 0), 0);
-                    const on = selectedWorkspaceKey === w.key;
-                    return (
-                      <button
-                        key={w.key}
-                        type="button"
-                        className={`listRow ${on ? "listRowOn" : ""}`}
-                        onClick={() => setSelectedWorkspaceKey(w.key)}
-                      >
-                        <div className="listLeft">
-                          <span className={`chip ${w.isGit ? "chipOn" : ""}`}>{w.isGit ? "git" : "dir"}</span>
-                          <div className="listText">
-                            <div className="listTitle mono">{w.root}</div>
-                            <div className="listSub mono">
-                              {(w.sessions ?? []).length} sessions{waiting ? ` · ${waiting} waiting` : ""}
-                            </div>
-                          </div>
-                        </div>
-                        <div className="listRight">{on ? "open" : ""}</div>
-                      </button>
-                    );
-                  })}
+	                  {filteredWorkspaces.map((w) => {
+	                    const waiting = (w.sessions ?? []).reduce((acc, s) => acc + (s.attention ?? 0), 0);
+	                    const on = selectedWorkspaceKey === w.key;
+	                    const rootLabel = String(w.root || "").trim() || "(unknown)";
+	                    return (
+	                      <button
+	                        key={w.key}
+	                        type="button"
+	                        className={`listRow ${on ? "listRowOn" : ""}`}
+	                        onClick={() => setSelectedWorkspaceKey(w.key)}
+	                      >
+	                        <div className="listLeft">
+	                          <span className={`chip ${w.isGit ? "chipOn" : ""}`}>{w.isGit ? "git" : "dir"}</span>
+	                          <div className="listText">
+	                            <div className="listTitle mono">{rootLabel}</div>
+	                            <div className="listSub mono">
+	                              {(w.sessions ?? []).length} sessions{waiting ? ` · ${waiting} waiting` : ""}
+	                            </div>
+	                          </div>
+	                        </div>
+	                        <div className="listRight">{on ? "open" : ""}</div>
+	                      </button>
+	                    );
+	                  })}
                 </div>
               </div>
               {(() => {
@@ -2017,30 +2124,35 @@ export function App() {
 
 	                    <div className="row">
 	                      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-	                        <button
-	                          className="btn primary"
-	                          onClick={() => {
-	                            const base = selectedTreePath || w.root || "";
-	                            if (base) {
-	                              setCwd(base);
-	                              setTab("new");
-	                              setToast("Workspace loaded into New Session");
-	                            }
-	                          }}
-	                        >
+		                        <button
+		                          className="btn primary"
+		                          onClick={() => {
+		                            const base = String(selectedTreePath || w.root || "").trim();
+		                            if (!base || base === "(unknown)") {
+		                              setToast("Workspace path unknown (legacy session). Pick a real path in New.");
+		                              setTab("new");
+		                              return;
+		                            }
+		                            if (base) {
+		                              setCwd(base);
+		                              setTab("new");
+		                              setToast("Workspace loaded into New Session");
+		                            }
+		                          }}
+		                        >
 	                          New Session Here
 	                        </button>
 	                      </div>
 	                    </div>
 
-                      {(() => {
-                        const base = selectedTreePath || w.root || "";
-                        const have = new Set(profiles.map((p) => p.id));
-                        if (!base) return null;
-                        const toolProfiles: { tool: ToolId; profiles: { id: string; label: string; danger?: boolean }[] }[] = [];
-                        if (tools.includes("codex")) {
-                          const p: { id: string; label: string; danger?: boolean }[] = [];
-                          if (have.has("codex.default")) p.push({ id: "codex.default", label: "Normal" });
+	                      {(() => {
+	                        const base = String(selectedTreePath || w.root || "").trim();
+	                        const have = new Set(profiles.map((p) => p.id));
+	                        if (!base || base === "(unknown)") return null;
+	                        const toolProfiles: { tool: ToolId; profiles: { id: string; label: string; danger?: boolean }[] }[] = [];
+	                        if (tools.includes("codex")) {
+	                          const p: { id: string; label: string; danger?: boolean }[] = [];
+	                          if (have.has("codex.default")) p.push({ id: "codex.default", label: "Normal" });
                           if (have.has("codex.plan")) p.push({ id: "codex.plan", label: "Plan" });
                           if (have.has("codex.full_auto")) p.push({ id: "codex.full_auto", label: "Auto" });
                           if (have.has("codex.danger")) p.push({ id: "codex.danger", label: "Danger", danger: true });
@@ -2729,32 +2841,38 @@ export function App() {
                 </div>
               ) : null}
             </div>
-            <div className="card">
-              <div className="cardHead">
-                <div>
-                  <div className="cardTitle">Pinned Slots</div>
-                  <div className="cardSub">3 recommended, 4 recommended max, 6 experimental.</div>
-                </div>
-              </div>
-              <div className="row">
-                <div className="seg">
-                  <button className={`segBtn ${slotCfg.slots === 3 ? "segOn" : ""}`} onClick={() => setSlotCfg({ slots: 3 })}>
-                    3 (Recommended)
-                  </button>
-                  <button className={`segBtn ${slotCfg.slots === 4 ? "segOn" : ""}`} onClick={() => setSlotCfg({ slots: 4 })}>
-                    4 (Rec. Max)
-                  </button>
-                  <button className={`segBtn ${slotCfg.slots === 6 ? "segOn" : ""}`} onClick={() => setSlotCfg({ slots: 6 })}>
-                    6 (Experimental)
-                  </button>
-                </div>
-              </div>
-              <div className="row">
-                <div className="help">
-                  Pin/unpin from Workspace. Swipe left/right in Run to switch between pinned sessions.
-                </div>
-              </div>
-            </div>
+	            <div className="card">
+	              <div className="cardHead">
+	                <div>
+	                  <div className="cardTitle">Pinned Slots</div>
+	                  <div className="cardSub">3 recommended, 4 recommended max, 6 experimental.</div>
+	                </div>
+	              </div>
+	              <div className="row">
+	                <div className="seg">
+	                  <button className={`segBtn ${slotCfg.slots === 3 ? "segOn" : ""}`} onClick={() => setSlotCfg({ slots: 3 })}>
+	                    3 (Recommended)
+	                  </button>
+	                  <button className={`segBtn ${slotCfg.slots === 4 ? "segOn" : ""}`} onClick={() => setSlotCfg({ slots: 4 })}>
+	                    4 (Rec. Max)
+	                  </button>
+	                  <button className={`segBtn ${slotCfg.slots === 6 ? "segOn" : ""}`} onClick={() => setSlotCfg({ slots: 6 })}>
+	                    6 (Experimental)
+	                  </button>
+	                </div>
+	              </div>
+	              <div className="row">
+	                <label className="toggle" style={{ margin: 0 }}>
+	                  <input type="checkbox" checked={autoPinNew} onChange={(e) => setAutoPinNew(e.target.checked)} />
+	                  <span className="muted">Auto-pin new sessions</span>
+	                </label>
+	              </div>
+	              <div className="row">
+	                <div className="help">
+	                  Pin/unpin from Workspace. Swipe left/right in Run to switch between pinned sessions.
+	                </div>
+	              </div>
+	            </div>
             <div className="card">
               <div className="cardHead">
                 <div>
@@ -3203,24 +3321,44 @@ export function App() {
 	                </div>
 	                <div className="help">Labels show on pinned slots and in the Workspace list.</div>
 	              </div>
-	              <div className="row">
-	                <div className="cardTitle">Terminal</div>
-	                <div className="runBtns" style={{ marginTop: 10 }}>
-	                  <button className="btn ghost" onClick={() => setFontSize((n) => Math.max(11, n - 1))}>
-	                    A-
-	                  </button>
-	                  <button className="btn ghost" onClick={() => setFontSize((n) => Math.min(22, n + 1))}>
-	                    A+
-	                  </button>
-	                  <button className="btn" onClick={() => fit.current?.fit()}>
-	                    Fit
-	                  </button>
-	                </div>
-                  <div className="runBtns" style={{ marginTop: 10 }}>
-                    <button className="btn" onClick={copyTermSelection}>
-                      Copy
-                    </button>
-                    <button className="btn" onClick={pasteClipboardToTerm}>
+		              <div className="row">
+		                <div className="cardTitle">Terminal</div>
+		                <div className="runBtns" style={{ marginTop: 10 }}>
+		                  <button className="btn ghost" onClick={() => setFontSize((n) => Math.max(11, n - 1))}>
+		                    A-
+		                  </button>
+		                  <button className="btn ghost" onClick={() => setFontSize((n) => Math.min(22, n + 1))}>
+		                    A+
+		                  </button>
+		                  <button className="btn" onClick={() => fit.current?.fit()}>
+		                    Fit
+		                  </button>
+		                </div>
+		                <div className="runBtns" style={{ marginTop: 10 }}>
+		                  <button
+		                    className={`btn ${lineHeight <= 1.26 ? "primary" : "ghost"}`}
+		                    onClick={() => setLineHeight(1.24)}
+		                  >
+		                    Tight
+		                  </button>
+		                  <button
+		                    className={`btn ${lineHeight > 1.26 && lineHeight < 1.38 ? "primary" : "ghost"}`}
+		                    onClick={() => setLineHeight(1.32)}
+		                  >
+		                    Normal
+		                  </button>
+		                  <button
+		                    className={`btn ${lineHeight >= 1.38 ? "primary" : "ghost"}`}
+		                    onClick={() => setLineHeight(1.44)}
+		                  >
+		                    Loose
+		                  </button>
+		                </div>
+	                  <div className="runBtns" style={{ marginTop: 10 }}>
+	                    <button className="btn" onClick={copyTermSelection}>
+	                      Copy
+	                    </button>
+	                    <button className="btn" onClick={pasteClipboardToTerm}>
                       Paste
                     </button>
                   </div>
@@ -3251,10 +3389,11 @@ export function App() {
                     <button className="btn" onClick={() => sendRaw("\u001b[C")}>
                       Right
                     </button>
-                  </div>
-                  <div className="help">Copy uses terminal selection. Paste reads from clipboard (works best on HTTPS or localhost).</div>
-                  <div className="help">Use these keys for TUI menus (permissions, mode picker, etc.).</div>
-	              </div>
+	                  </div>
+	                  <div className="help">Spacing can fix overlapping text on some mobile browsers.</div>
+	                  <div className="help">Copy uses terminal selection. Paste reads from clipboard (works best on HTTPS or localhost).</div>
+	                  <div className="help">Use these keys for TUI menus (permissions, mode picker, etc.).</div>
+		              </div>
 	              <div className="row">
 	                <div className="cardTitle">Process</div>
 	                <div className="runBtns" style={{ marginTop: 10 }}>

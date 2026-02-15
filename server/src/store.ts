@@ -228,6 +228,33 @@ export function createStore(baseDir: string) {
   );
   const stmtDeleteAttentionItemsBySession = db.prepare("DELETE FROM attention_items WHERE sessionId = ?");
 
+  // Backfill: older DBs may have sessions without cwd populated. This creates confusing blank
+  // "dir" workspace entries in the phone UI. We recover cwd from the stored session.created event.
+  const stmtSessionsMissingCwd = db.prepare("SELECT id FROM sessions WHERE cwd IS NULL OR TRIM(cwd) = '' LIMIT ?");
+  const stmtLastCreatedEvent = db.prepare(
+    "SELECT data FROM events WHERE sessionId = ? AND kind = 'session.created' ORDER BY id DESC LIMIT 1",
+  );
+  const stmtSetSessionCwd = db.prepare("UPDATE sessions SET cwd = ? WHERE id = ? AND (cwd IS NULL OR TRIM(cwd) = '')");
+  try {
+    const missing = stmtSessionsMissingCwd.all(250) as any[];
+    for (const r of missing) {
+      const id = typeof r?.id === "string" ? r.id : "";
+      if (!id) continue;
+      const ev = stmtLastCreatedEvent.get(id) as any;
+      const raw = typeof ev?.data === "string" ? ev.data : "";
+      if (!raw) continue;
+      try {
+        const j = JSON.parse(raw);
+        const cwd = typeof j?.cwd === "string" ? j.cwd.trim() : "";
+        if (cwd) stmtSetSessionCwd.run(cwd, id);
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   function createSession(input: {
     id: string;
     tool: ToolId;

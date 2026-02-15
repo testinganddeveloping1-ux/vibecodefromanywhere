@@ -34,6 +34,9 @@ export type SessionManagerOptions = {
 
 export class SessionManager {
   private sessions = new Map<string, Session>();
+  // Codex requires CR then (later) LF to reliably submit prompts. We serialize these
+  // writes per-session so interleaved HTTP/WS inputs can't reorder the synthetic LF.
+  private codexWriteQueues = new Map<string, { draining: boolean; queue: string[] }>();
   private opts: SessionManagerOptions;
 
   constructor(opts: SessionManagerOptions) {
@@ -47,15 +50,35 @@ export class SessionManager {
     const spec = this.opts.tools[tool];
     const args = [...spec.args, ...(input.extraArgs ?? [])];
 
+    const inheritedEnv: Record<string, string> = {
+      ...(process.env as any),
+    };
+
+    // If FYP is launched from inside another agent/tool harness, the parent process may
+    // include environment variables that "pin" Codex to a specific thread/session id.
+    // That breaks multi-session behavior and tool-session discovery.
+    //
+    // Important: we only strip these from the inherited env; a user can still explicitly
+    // set them via profile env (`profiles.*.env`) if they really want.
+    if (tool === "codex") {
+      delete (inheritedEnv as any).CODEX_THREAD_ID;
+      delete (inheritedEnv as any).CODEX_SESSION_ID;
+      delete (inheritedEnv as any).CODEX_CI;
+    }
+
+    const env: Record<string, string> = {
+      ...inheritedEnv,
+      ...(input.env ?? {}),
+      TERM: "xterm-256color",
+    };
+
     const p = pty.spawn(spec.command, args, {
       name: "xterm-256color",
       cols: 100,
       rows: 30,
       cwd: input.cwd ?? this.opts.cwd ?? process.cwd(),
       env: {
-        ...process.env,
-        ...(input.env ?? {}),
-        TERM: "xterm-256color",
+        ...env,
       },
     });
 
@@ -81,6 +104,7 @@ export class SessionManager {
     });
 
     this.sessions.set(id, sess);
+    if (tool === "codex") this.codexWriteQueues.set(id, { draining: false, queue: [] });
     return id;
   }
 
@@ -103,6 +127,7 @@ export class SessionManager {
       // ignore
     }
     this.sessions.delete(id);
+    this.codexWriteQueues.delete(id);
   }
 
   onOutput(id: string, fn: (chunk: string) => void): () => void {
@@ -118,7 +143,22 @@ export class SessionManager {
   }
 
   write(id: string, data: string): void {
-    this.must(id).pty.write(data);
+    const sess = this.must(id);
+    if (sess.tool !== "codex") {
+      sess.pty.write(data);
+      return;
+    }
+
+    const rec = this.codexWriteQueues.get(id);
+    if (!rec) {
+      // Shouldn't happen, but don't crash if the queue was GC'd for some reason.
+      sess.pty.write(String(data ?? ""));
+      return;
+    }
+    rec.queue.push(String(data ?? ""));
+    if (rec.draining) return;
+    rec.draining = true;
+    void this.drainCodexWrites(id);
   }
 
   resize(id: string, cols: number, rows: number): void {
@@ -173,11 +213,75 @@ export class SessionManager {
       }
     }
     this.sessions.clear();
+    this.codexWriteQueues.clear();
   }
 
   private must(id: string): Session {
     const s = this.sessions.get(id);
     if (!s) throw new Error(`unknown session: ${id}`);
     return s;
+  }
+
+  private async drainCodexWrites(id: string) {
+    const rec = this.codexWriteQueues.get(id);
+    if (!rec) return;
+
+    // Codex is sensitive to very-fast "type+enter" sequences delivered as one stream chunk.
+    // We add tiny delays so the TUI reliably treats this as a real keypress sequence:
+    // - type text
+    // - press Enter (CR)
+    // - linefeed (LF) shortly after
+    const textToCrDelayMs = 15;
+    const crToLfDelayMs = 25;
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const sess = this.sessions.get(id);
+        if (!sess || !sess.status.running) break;
+        const next = rec.queue.shift();
+        if (next == null) break;
+
+        const s = String(next);
+        if (!s) continue;
+
+        let i = 0;
+        while (i < s.length) {
+          const j = s.indexOf("\r", i);
+          if (j === -1) {
+            const tail = s.slice(i);
+            if (tail) sess.pty.write(tail);
+            break;
+          }
+
+          const head = s.slice(i, j);
+          if (head) sess.pty.write(head);
+
+          // Enter key: CR then LF (separate writes, with tiny delays).
+          // Give the TUI a beat to process the typed text before Enter.
+          if (head) await sleep(textToCrDelayMs);
+          sess.pty.write("\r");
+          await sleep(crToLfDelayMs);
+
+          const cur = this.sessions.get(id);
+          if (!cur || !cur.status.running) break;
+          cur.pty.write("\n");
+
+          i = j + 1;
+          // If caller already sent CRLF, skip the LF to avoid doubling.
+          if (s[i] === "\n") i += 1;
+        }
+      }
+    } finally {
+      const cur = this.codexWriteQueues.get(id);
+      if (cur) cur.draining = false;
+      // If new items arrived while we were finishing up, drain again.
+      const again = this.codexWriteQueues.get(id);
+      if (again && again.queue.length > 0 && !again.draining) {
+        again.draining = true;
+        void this.drainCodexWrites(id);
+      }
+    }
   }
 }

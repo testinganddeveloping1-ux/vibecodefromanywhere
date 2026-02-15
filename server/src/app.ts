@@ -1005,8 +1005,11 @@ main().catch(() => {});
 
     const byKey = new Map<string, Ws>();
     for (const s of sess) {
-      const key = s.workspaceKey ? String(s.workspaceKey) : `dir:${s.cwd ?? s.id}`;
-      const root = s.workspaceRoot || s.treePath || s.cwd || "";
+      const cwd = typeof s.cwd === "string" ? s.cwd.trim() : "";
+      // If cwd is missing (legacy sessions), group them together so the UI doesn't show a pile
+      // of blank "dir" rows with one session each.
+      const key = s.workspaceKey ? String(s.workspaceKey) : cwd ? `dir:${cwd}` : "dir:(unknown)";
+      const root = s.workspaceRoot || s.treePath || cwd || "(unknown)";
       const ws: Ws =
         byKey.get(key) ??
         ({

@@ -55,6 +55,11 @@ if (process.argv.includes("models")) {
   process.exit(0);
 }
 
+// Optional debug output for tests.
+if (process.env.FYP_PRINT_CODEX_THREAD_ID === "1") {
+  process.stdout.write(`CODEX_THREAD_ID=${process.env.CODEX_THREAD_ID || ""}\n`);
+}
+
 // Best-effort: honor `--cd <dir>` in case tests pass it through.
 try {
   const idx = process.argv.indexOf("--cd");
