@@ -868,25 +868,6 @@ export function App() {
     if (authed !== "yes") return;
     let stopped = false;
 
-    function backoffMs(attempt: number): number {
-      const base = 140;
-      const cap = 6000;
-      const exp = Math.min(7, Math.max(0, attempt));
-      const ms = Math.min(cap, base * Math.pow(2, exp));
-      const jitter = Math.floor(Math.random() * 200);
-      return ms + jitter;
-    }
-
-    function startPing(sock: WebSocket) {
-      return setInterval(() => {
-        try {
-          if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "ping", ts: Date.now() }));
-        } catch {
-          // ignore
-        }
-      }, 15000);
-    }
-
     function cleanup() {
       if (globalCtl.current.timer) clearTimeout(globalCtl.current.timer);
       globalCtl.current.timer = null;
@@ -1945,21 +1926,6 @@ export function App() {
                 </div>
                 <div className="runBtns">
                   <button className="btn" onClick={() => sendControl("interrupt")}>Ctrl+C</button>
-                  <button className="btn ghost" onClick={() => setShowLog(true)}>Log</button>
-                  <button
-                    className="btn ghost"
-                    onClick={() => {
-                      const t = activeSession?.tool ?? null;
-                      const sid = String(activeSession?.toolSessionId ?? "");
-                      if ((t !== "codex" && t !== "claude") || !sid) {
-                        setToast("Chat history not linked yet");
-                        return;
-                      }
-                      openToolChat(t, sid);
-                    }}
-                  >
-                    Chat
-                  </button>
                   <button className="btn ghost" onClick={() => setShowControls(true)}>More</button>
                 </div>
               </div>
@@ -2033,9 +1999,7 @@ export function App() {
 
               {events.length ? (
                 <div className="historyBar">
-                  <button className="btn ghost" onClick={() => setShowLog(true)}>
-                    History
-                  </button>
+                  <span className="chip mono">recent</span>
                   <div className="historyScroll">
                     {events
                       .filter(
@@ -3309,6 +3273,36 @@ export function App() {
               </button>
 	            </div>
 	            <div className="modalBody">
+                <div className="row">
+                  <div className="cardTitle">Views</div>
+                  <div className="runBtns" style={{ marginTop: 10 }}>
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        setShowControls(false);
+                        setShowLog(true);
+                      }}
+                    >
+                      Log
+                    </button>
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        const t = activeSession?.tool ?? null;
+                        const sid = String(activeSession?.toolSessionId ?? "");
+                        if ((t !== "codex" && t !== "claude") || !sid) {
+                          setToast("Chat history not linked yet");
+                          return;
+                        }
+                        setShowControls(false);
+                        openToolChat(t, sid);
+                      }}
+                    >
+                      Chat
+                    </button>
+                  </div>
+                  <div className="help">Tool-native chat history is stored by Codex/Claude on this host.</div>
+                </div>
 	              <div className="row">
 	                <div className="cardTitle">Session</div>
 	                <div className="field" style={{ marginTop: 10 }}>
@@ -3391,9 +3385,6 @@ export function App() {
 	              <div className="row">
 	                <div className="cardTitle">Process</div>
 	                <div className="runBtns" style={{ marginTop: 10 }}>
-	                  <button className="btn" onClick={() => sendControl("interrupt")}>
-	                    Ctrl+C
-	                  </button>
 	                  <button
 	                    className="btn danger"
 	                    disabled={!activeSession?.id || Boolean(activeSession?.running)}
@@ -3414,7 +3405,7 @@ export function App() {
 	                    Kill
 	                  </button>
 	                </div>
-	                <div className="help">Ctrl+C sends SIGINT. Kill sends SIGKILL. Remove deletes this FromYourPhone session from local history.</div>
+	                <div className="help">Kill sends SIGKILL. Remove deletes this FromYourPhone session from local history.</div>
 	              </div>
             </div>
           </div>
