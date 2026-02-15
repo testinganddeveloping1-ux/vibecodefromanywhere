@@ -83,19 +83,29 @@ describe("websockets", () => {
     const id = JSON.parse(created.payload).id as string;
     expect(typeof id).toBe("string");
 
-    const ws = await (app as any).injectWS(`/ws/sessions/${encodeURIComponent(id)}`, { headers: { authorization: "Bearer t123" } });
     let out = "";
-    ws.on("message", (raw: any) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg?.type === "output" && typeof msg.chunk === "string") out += msg.chunk;
-      } catch {
-        // ignore
-      }
-    });
+    let sawAssist = false;
+    const ws = await (app as any).injectWS(
+      `/ws/sessions/${encodeURIComponent(id)}`,
+      { headers: { authorization: "Bearer t123" } },
+      {
+        onInit: (sock: any) => {
+          sock.on("message", (raw: any) => {
+            try {
+              const msg = JSON.parse(raw.toString());
+              if (msg?.type === "output" && typeof msg.chunk === "string") out += msg.chunk;
+              if (msg?.type === "assist") sawAssist = true;
+            } catch {
+              // ignore
+            }
+          });
+        },
+      },
+    );
 
     ws.send(JSON.stringify({ type: "input", text: "hello\r" }));
     await waitFor(() => out.includes("hello"));
+    await waitFor(() => sawAssist);
 
     const ev = await app.inject({
       method: "GET",

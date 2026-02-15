@@ -98,6 +98,13 @@ type InboxItem = {
   session: SessionRow | null;
 };
 
+type TuiAssist = {
+  title: string;
+  body: string | null;
+  signature: string;
+  options: { id: string; label: string; send: string }[];
+};
+
 type ToolSessionTool = "codex" | "claude";
 type ToolSessionSummary = {
   tool: ToolSessionTool;
@@ -401,6 +408,7 @@ export function App() {
   const [showControls, setShowControls] = useState(false);
   const [labelDraft, setLabelDraft] = useState("");
   const [events, setEvents] = useState<EventItem[]>([]);
+  const [tuiAssist, setTuiAssist] = useState<TuiAssist | null>(null);
   const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>([]);
   const [workspacePreset, setWorkspacePreset] = useState<{ profileId: string; overrides: any } | null>(null);
   const [presetMsg, setPresetMsg] = useState<string | null>(null);
@@ -430,6 +438,7 @@ export function App() {
   const activeIdRef = useRef<string | null>(null);
   const tabRef = useRef<TabId>("workspace");
   const authedRef = useRef<"unknown" | "yes" | "no">("unknown");
+  const dismissedAssistSig = useRef<string>("");
   const sessionCtl = useRef<{ id: string | null; attempt: number; timer: any; ping: any }>({ id: null, attempt: 0, timer: null, ping: null });
   const globalCtl = useRef<{ attempt: number; timer: any; ping: any }>({ attempt: 0, timer: null, ping: null });
 
@@ -1126,6 +1135,8 @@ export function App() {
     connectedSessionId.current = id;
     term.current?.reset();
     term.current?.write("\u001b[2J\u001b[H");
+    dismissedAssistSig.current = "";
+    setTuiAssist(null);
 
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const s = new WebSocket(`${proto}://${window.location.host}/ws/sessions/${id}`);
@@ -1136,6 +1147,12 @@ export function App() {
         const msg = JSON.parse(String(ev.data));
         if (msg?.type === "pong") return;
         if (msg.type === "output" && typeof msg.chunk === "string") term.current?.write(msg.chunk);
+        if (msg.type === "assist") {
+          const a = (msg?.assist ?? null) as any;
+          const sig = a && typeof a.signature === "string" ? String(a.signature) : "";
+          if (sig && sig === dismissedAssistSig.current) return;
+          setTuiAssist(a && typeof a.title === "string" && Array.isArray(a.options) ? (a as TuiAssist) : null);
+        }
         if (msg.type === "event") {
           const raw = msg.event ?? msg; // back-compat
           ingestEventRaw(raw);
@@ -1200,6 +1217,8 @@ export function App() {
 
   function openSession(id: string) {
     setActiveId(id);
+    dismissedAssistSig.current = "";
+    setTuiAssist(null);
     const sess = sessions.find((s) => s.id === id) ?? null;
     if (sess) {
       const gk = String(sess.workspaceKey ?? (sess.cwd ? `dir:${sess.cwd}` : `dir:${sess.id}`));
@@ -1856,6 +1875,41 @@ export function App() {
 
               <div className="termPanel">
                 <div className="term" ref={termRef} />
+                {!activeAttention && tuiAssist ? (
+                  <div className="assistOverlay" aria-label="Terminal assist">
+                    <div className="assistCard">
+                      <div className="assistHead">
+                        <span className="chip">assist</span>
+                        <span className="mono assistTitle">{tuiAssist.title}</span>
+                        <div className="spacer" />
+                        <button
+                          className="btn ghost"
+                          onClick={() => {
+                            dismissedAssistSig.current = String(tuiAssist.signature ?? "");
+                            setTuiAssist(null);
+                          }}
+                        >
+                          Hide
+                        </button>
+                      </div>
+                      {tuiAssist.body ? <div className="assistBody mono">{tuiAssist.body}</div> : null}
+                      <div className="assistActions">
+                        {(tuiAssist.options ?? []).slice(0, 12).map((o) => {
+                          const label = String(o.label ?? "");
+                          const low = label.toLowerCase();
+                          const isNav = low === "up" || low === "down" || low === "tab" || low === "shift+tab" || low === "esc";
+                          const isEnter = low === "enter";
+                          const cls = isEnter ? "btn primary" : isNav ? "btn ghost" : "btn";
+                          return (
+                            <button key={o.id} className={cls} onClick={() => sendRaw(String(o.send ?? ""))}>
+                              {label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
               </div>
 
               {events.length ? (

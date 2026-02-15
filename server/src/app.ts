@@ -345,6 +345,7 @@ main().catch(() => {});
   const lastPreview = new Map<string, { ts: number; line: string }>();
   const lastPreviewBroadcast = new Map<string, number>();
   const lastInboxBroadcast = new Map<string, number>();
+  const assistState = new Map<string, { sig: string; assist: any | null }>();
   const worktreeCache = new Map<string, { ts: number; items: any[]; root: string }>();
   const debugWs = process.env.FYP_DEBUG_WS === "1" || process.env.FYP_DEBUG_WS === "true";
   const wsLog = (...args: any[]) => {
@@ -429,10 +430,22 @@ main().catch(() => {});
     }
   }
 
+  function setAssist(sessionId: string, assist: any | null) {
+    const sig = assist && typeof assist.signature === "string" ? assist.signature : "";
+    const prev = assistState.get(sessionId)?.sig ?? "";
+    if (sig === prev) return;
+    assistState.set(sessionId, { sig, assist });
+    const set = sockets.get(sessionId);
+    if (!set) return;
+    for (const sock of set) wsSend(sock, { type: "assist", assist, ts: Date.now() });
+  }
+
   function attachBroadcast(sessionId: string, tool: ToolId) {
     sessions.onOutput(sessionId, (chunk) => {
       queueOutput(sessionId, chunk);
       updateLastLine(sessionId, chunk);
+      const buf = updatePlainBuffer(sessionId, chunk);
+      const tail = buf.slice(-9000);
 
       // Light global preview updates (throttled).
       const lastTs = lastPreviewBroadcast.get(sessionId) ?? 0;
@@ -447,8 +460,6 @@ main().catch(() => {});
       // Lightweight Codex approval detection. Best with `codex --no-alt-screen`.
       // We do not spam: signature dedupe is enforced in the store.
       if (tool === "codex") {
-        const buf = updatePlainBuffer(sessionId, chunk);
-        const tail = buf.slice(-6000);
         const cand = detectCodexAttention(sessionId, tail);
         if (cand) {
           store.createAttentionItem(cand);
@@ -459,6 +470,15 @@ main().catch(() => {});
             broadcastGlobal({ type: "inbox.changed", sessionId });
           }
         }
+      }
+
+      // TUI Assist: best-effort option/menu detection for touch-friendly buttons on phones.
+      // This is intentionally generic (not tool-specific), so it survives small TUI text changes.
+      try {
+        const assist = detectTuiAssist(tail);
+        setAssist(sessionId, assist);
+      } catch {
+        // ignore
       }
 
       const set = sockets.get(sessionId);
@@ -499,6 +519,7 @@ main().catch(() => {});
         // Best-effort cleanup to avoid unbounded memory growth if many sessions are spawned.
         outputBuf.delete(sessionId);
         textBuf.delete(sessionId);
+        assistState.delete(sessionId);
         lastPreview.delete(sessionId);
         lastPreviewBroadcast.delete(sessionId);
         lastInboxBroadcast.delete(sessionId);
@@ -629,6 +650,130 @@ main().catch(() => {});
     }
 
     return null;
+  }
+
+  function detectTuiAssist(text: string): null | { title: string; body: string | null; options: any[]; signature: string } {
+    // Generic prompt/menu detector for touch UIs:
+    // - Extracts the most recent question-ish line (title)
+    // - Extracts option hotkeys like "(Y) Yes", "1) Foo", "[A] Allow"
+    // - Emits a stable signature so the UI can update without spamming
+    const raw = String(text ?? "").replace(/\r/g, "");
+    if (!raw.trim()) return null;
+
+    const linesAll = raw.split("\n");
+    const lines = linesAll.slice(Math.max(0, linesAll.length - 90)).map((l) => String(l ?? "").trimEnd());
+    while (lines.length && !lines[lines.length - 1]!.trim()) lines.pop();
+    if (!lines.length) return null;
+
+    const opts: { id: string; label: string; send: string }[] = [];
+    const seen = new Set<string>();
+    const pushOpt = (send: string, label: string) => {
+      const s = String(send ?? "");
+      const l = String(label ?? "").trim();
+      if (!s || !l) return;
+      if (seen.has(s)) return;
+      if (opts.length >= 10) return;
+      seen.add(s);
+      opts.push({ id: s, label: l.length > 60 ? l.slice(0, 60) : l, send: s });
+    };
+
+    const parseOptionLine = (ln: string) => {
+      const line = ln.trim();
+      if (!line) return;
+
+      // Inline: "... (Y) Yes (N) No ..."
+      const inlineRe = /\(([A-Za-z0-9])\)\s*([A-Za-z][^()]{0,50})/g;
+      let m: RegExpExecArray | null = null;
+      // eslint-disable-next-line no-cond-assign
+      while ((m = inlineRe.exec(line))) {
+        const key = String(m[1] ?? "").trim();
+        const label = String(m[2] ?? "").trim().replace(/^[,;:\-]+/, "").trim();
+        if (!key || !label) continue;
+        pushOpt(key.toLowerCase(), label);
+      }
+
+      // [Y] Yes
+      const b = line.match(/^\s*\[([A-Za-z0-9])\]\s*(.{2,80})\s*$/);
+      if (b?.[1] && b?.[2]) pushOpt(String(b[1]).toLowerCase(), String(b[2]));
+
+      // (Y) Yes
+      const p = line.match(/^\s*\(([A-Za-z0-9])\)\s*(.{2,80})\s*$/);
+      if (p?.[1] && p?.[2]) pushOpt(String(p[1]).toLowerCase(), String(p[2]));
+
+      // Y) Yes
+      const r = line.match(/^\s*([A-Za-z0-9])\)\s*(.{2,80})\s*$/);
+      if (r?.[1] && r?.[2]) pushOpt(String(r[1]).toLowerCase(), String(r[2]));
+
+      // 1) Foo / 1. Foo
+      const n = line.match(/^\s*([0-9]{1,2})[.)]\s*(.{2,80})\s*$/);
+      if (n?.[1] && n?.[2]) pushOpt(String(n[1]), String(n[2]));
+
+      // y/n quick prompt (no labels). We map to Yes/No.
+      if (/\b[yY]\/[nN]\b/.test(line) || /\b[nN]\/[yY]\b/.test(line)) {
+        pushOpt("y", "Yes");
+        pushOpt("n", "No");
+      }
+    };
+
+    // Scan recent lines for options.
+    const scanStart = Math.max(0, lines.length - 34);
+    for (let i = scanStart; i < lines.length; i++) parseOptionLine(lines[i]!);
+
+    // Also surface common navigation hints as single-tap buttons when they appear in the text.
+    // Keep this conservative to avoid showing the overlay during normal terminal output.
+    const lowTail = lines.slice(scanStart).join("\n").toLowerCase();
+    const hadChoices = opts.length > 0;
+    const hasShiftTab = /\bshift\s*[\+\- ]?\s*tab\b/.test(lowTail) || lowTail.includes("shift-tab");
+    const hasPressTab = /\b(?:press|hit)\s+tab\b/.test(lowTail);
+    const hasPressEnter = /\b(?:press|hit)\s+enter\b/.test(lowTail);
+    const hasPressEsc = /\b(?:press|hit)\s+(?:esc|escape)\b/.test(lowTail);
+    const hasArrowKeys = /\barrow\s+keys\b/.test(lowTail);
+
+    if (!hadChoices && !hasShiftTab && !hasPressTab && !hasPressEnter && !hasPressEsc && !hasArrowKeys) return null;
+
+    if (hasShiftTab) pushOpt("\u001b[Z", "Shift+Tab");
+    if (hasPressTab || hasShiftTab) pushOpt("\t", "Tab");
+    if (hasPressEnter) pushOpt("\r", "Enter");
+    if (hasPressEsc || (hadChoices && /\b(?:esc|escape)\b/.test(lowTail))) pushOpt("\u001b", "Esc");
+    if (hasArrowKeys) {
+      pushOpt("\u001b[A", "Up");
+      pushOpt("\u001b[B", "Down");
+      pushOpt("\r", "Enter");
+    }
+
+    if (opts.length === 0) return null;
+
+    // Pick a reasonable title.
+    let title = "";
+    let body: string | null = null;
+    for (let i = lines.length - 1; i >= 0 && lines.length - i <= 42; i--) {
+      const ln = lines[i]!.trim();
+      if (!ln) continue;
+      if (ln.length > 220) continue;
+      if (ln.includes("?") || /^(select|choose|pick|press|permission|mode|sandbox|approval)\b/i.test(ln)) {
+        title = ln;
+        break;
+      }
+      if (!title) title = ln;
+    }
+    title = title ? title.slice(0, 140) : "TUI";
+
+    for (let i = lines.length - 1; i >= 0 && lines.length - i <= 30; i--) {
+      const ln = lines[i]!.trim();
+      if (!ln) continue;
+      const low = ln.toLowerCase();
+      if (low.includes("arrow") || low.includes("shift+tab") || low.includes("escape") || low.includes("press enter")) {
+        body = ln.slice(0, 240);
+        break;
+      }
+    }
+
+    const sig = createHash("sha256")
+      .update(JSON.stringify({ title, body, options: opts.map((o) => ({ id: o.id, label: o.label })) }))
+      .digest("hex")
+      .slice(0, 16);
+
+    return { title, body, options: opts, signature: `assist:${sig}` };
   }
 
   function scheduleCodexToolSessionLink(fypSessionId: string, cwd: string, createdAt: number) {
@@ -1518,35 +1663,37 @@ main().catch(() => {});
       return;
     }
 
-	    const set = sockets.get(id) ?? new Set<WebSocket>();
-		    set.add(socket);
-		    sockets.set(id, set);
-      log("ws session open", { sessionId: id, ip: (req as any).ip ?? null });
-	    wsLog("session open", id);
+    const set = sockets.get(id) ?? new Set<WebSocket>();
+    set.add(socket);
+    sockets.set(id, set);
+    log("ws session open", { sessionId: id, ip: (req as any).ip ?? null });
+    wsLog("session open", id);
     socket.on("error", (err: any) => wsLog("session error", id, String(err?.message ?? err)));
     socket.on("close", (code: number, reason: any) =>
       wsLog("session close", id, code, reason && typeof reason.toString === "function" ? reason.toString() : ""),
     );
 
-	    // Send a small replay for instant context.
-	    flushOutput(id);
-	    const replay = store.getTranscript(id, { limit: 400, cursor: null });
-	    for (const item of replay.items) wsSend(socket, { type: "output", chunk: item.chunk, ts: item.ts });
-	    const evReplay = store.getEvents(id, { limit: 120, cursor: null });
-	    for (const e of evReplay.items) wsSend(socket, { type: "event", event: e });
+    // Send a small replay for instant context.
+    flushOutput(id);
+    const replay = store.getTranscript(id, { limit: 400, cursor: null });
+    for (const item of replay.items) wsSend(socket, { type: "output", chunk: item.chunk, ts: item.ts });
+    const evReplay = store.getEvents(id, { limit: 120, cursor: null });
+    for (const e of evReplay.items) wsSend(socket, { type: "event", event: e });
+    const assist = assistState.get(id)?.assist ?? null;
+    wsSend(socket, { type: "assist", assist, ts: Date.now() });
 
-	    socket.on("message", (raw: any) => {
-	      try {
-	        const msg = JSON.parse(raw.toString());
-          if (msg?.type === "ping") {
-            wsSend(socket, { type: "pong", ts: Date.now(), clientTs: Number(msg.ts ?? 0) || null });
-            return;
-          }
-	        if (msg?.type === "input" && typeof msg.text === "string") {
-	          const evId = store.appendEvent(id, "input", { text: msg.text });
-	          broadcastEvent(id, { id: evId, ts: Date.now(), kind: "input", data: { text: msg.text } });
-	          sessions.write(id, msg.text);
-	        }
+    socket.on("message", (raw: any) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg?.type === "ping") {
+          wsSend(socket, { type: "pong", ts: Date.now(), clientTs: Number(msg.ts ?? 0) || null });
+          return;
+        }
+        if (msg?.type === "input" && typeof msg.text === "string") {
+          const evId = store.appendEvent(id, "input", { text: msg.text });
+          broadcastEvent(id, { id: evId, ts: Date.now(), kind: "input", data: { text: msg.text } });
+          sessions.write(id, msg.text);
+        }
         if (msg?.type === "resize" && Number.isFinite(msg.cols) && Number.isFinite(msg.rows)) {
           sessions.resize(id, msg.cols, msg.rows);
         }
@@ -1570,38 +1717,38 @@ main().catch(() => {});
       }
     });
 
-	    socket.on("close", () => {
-	      const s = sockets.get(id);
-	      if (!s) return;
-	      s.delete(socket);
-	      if (s.size === 0) sockets.delete(id);
-        log("ws session close", { sessionId: id, ip: (req as any).ip ?? null });
-	    });
-	  });
+    socket.on("close", () => {
+      const s = sockets.get(id);
+      if (!s) return;
+      s.delete(socket);
+      if (s.size === 0) sockets.delete(id);
+      log("ws session close", { sessionId: id, ip: (req as any).ip ?? null });
+    });
+  });
 
-		  app.get("/ws/global", { websocket: true }, (socket: WebSocket) => {
-      wsLog("global open");
-	    globalSockets.add(socket);
-      log("ws global open");
-      socket.on("error", (err: any) => wsLog("global error", String(err?.message ?? err)));
-	    // Lightweight initial sync. UI can fetch details via HTTP.
-	    wsSend(socket, { type: "sessions.changed" });
-	    wsSend(socket, { type: "workspaces.changed" });
-	    wsSend(socket, { type: "inbox.changed" });
-      socket.on("message", (raw: any) => {
-        try {
-          const msg = JSON.parse(raw.toString());
-          if (msg?.type === "ping") wsSend(socket, { type: "pong", ts: Date.now(), clientTs: Number(msg.ts ?? 0) || null });
-        } catch {
-          // ignore
-        }
-      });
-	    socket.on("close", () => {
-        wsLog("global close");
-	      globalSockets.delete(socket);
-        log("ws global close");
-	    });
-	  });
+  app.get("/ws/global", { websocket: true }, (socket: WebSocket) => {
+    wsLog("global open");
+    globalSockets.add(socket);
+    log("ws global open");
+    socket.on("error", (err: any) => wsLog("global error", String(err?.message ?? err)));
+    // Lightweight initial sync. UI can fetch details via HTTP.
+    wsSend(socket, { type: "sessions.changed" });
+    wsSend(socket, { type: "workspaces.changed" });
+    wsSend(socket, { type: "inbox.changed" });
+    socket.on("message", (raw: any) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg?.type === "ping") wsSend(socket, { type: "pong", ts: Date.now(), clientTs: Number(msg.ts ?? 0) || null });
+      } catch {
+        // ignore
+      }
+    });
+    socket.on("close", () => {
+      wsLog("global close");
+      globalSockets.delete(socket);
+      log("ws global close");
+    });
+  });
 
   app.addHook("onClose", async () => {
     for (const sid of outputBuf.keys()) flushOutput(sid);
