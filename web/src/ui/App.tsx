@@ -435,6 +435,7 @@ export function App() {
   const globalWs = useRef<WebSocket | null>(null);
   const connectedSessionId = useRef<string | null>(null);
   const pendingInputBySession = useRef<Record<string, string[]>>({});
+  const termOutBuf = useRef<{ chunks: string[]; bytes: number; timer: any } | null>(null);
   const selectedWorkspaceKeyRef = useRef<string | null>(null);
   const activeIdRef = useRef<string | null>(null);
   const tabRef = useRef<TabId>("workspace");
@@ -803,6 +804,31 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (authed !== "yes") return;
+    // Mobile browsers frequently suspend background tabs and can leave websockets half-open.
+    // When the app becomes visible again, force a clean reconnect.
+    const onVis = () => {
+      try {
+        if (document.hidden) return;
+      } catch {
+        // ignore
+      }
+      try {
+        globalWs.current?.close();
+      } catch {
+        // ignore
+      }
+      try {
+        ws.current?.close();
+      } catch {
+        // ignore
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [authed]);
+
+  useEffect(() => {
     try {
       if (selectedWorkspaceKey) window.localStorage.setItem("fyp_ws", selectedWorkspaceKey);
       else window.localStorage.removeItem("fyp_ws");
@@ -1002,6 +1028,12 @@ export function App() {
 
   useEffect(() => {
     return () => {
+      try {
+        if (termOutBuf.current?.timer) clearTimeout(termOutBuf.current.timer);
+      } catch {
+        // ignore
+      }
+      termOutBuf.current = null;
       roRef.current?.disconnect();
       roRef.current = null;
       term.current?.dispose();
@@ -1083,6 +1115,12 @@ export function App() {
     ws.current = null;
     connectedSessionId.current = null;
     setSessionWsState("closed");
+    try {
+      if (termOutBuf.current?.timer) clearTimeout(termOutBuf.current.timer);
+    } catch {
+      // ignore
+    }
+    termOutBuf.current = null;
 
     dismissedAssistSig.current = "";
     setTuiAssist(null);
@@ -1148,6 +1186,37 @@ export function App() {
     });
   }
 
+  function flushTermOutput() {
+    const rec = termOutBuf.current;
+    if (!rec || rec.chunks.length === 0) return;
+    if (rec.timer) {
+      clearTimeout(rec.timer);
+      rec.timer = null;
+    }
+    const joined = rec.chunks.join("");
+    rec.chunks = [];
+    rec.bytes = 0;
+    try {
+      term.current?.write(joined);
+    } catch {
+      // ignore
+    }
+  }
+
+  function queueTermOutput(chunk: string) {
+    const rec = termOutBuf.current ?? { chunks: [], bytes: 0, timer: null };
+    rec.chunks.push(chunk);
+    rec.bytes += chunk.length;
+    termOutBuf.current = rec;
+    if (rec.bytes > 96_000 || rec.chunks.length > 120) {
+      flushTermOutput();
+      return;
+    }
+    if (!rec.timer) {
+      rec.timer = setTimeout(() => flushTermOutput(), 16);
+    }
+  }
+
   function startPing(sock: WebSocket) {
     return setInterval(() => {
       try {
@@ -1155,7 +1224,7 @@ export function App() {
       } catch {
         // ignore
       }
-    }, 15000);
+    }, 5000);
   }
 
   function connectWs(id: string, attempt = 0) {
@@ -1177,6 +1246,12 @@ export function App() {
     ws.current = null;
 
     connectedSessionId.current = id;
+    try {
+      if (termOutBuf.current?.timer) clearTimeout(termOutBuf.current.timer);
+    } catch {
+      // ignore
+    }
+    termOutBuf.current = null;
     term.current?.reset();
     term.current?.write("\u001b[2J\u001b[H");
     dismissedAssistSig.current = "";
@@ -1188,9 +1263,10 @@ export function App() {
 
     s.onmessage = (ev) => {
       try {
+        if (ws.current !== s) return; // stale socket after a fast session switch
         const msg = JSON.parse(String(ev.data));
         if (msg?.type === "pong") return;
-        if (msg.type === "output" && typeof msg.chunk === "string") term.current?.write(msg.chunk);
+        if (msg.type === "output" && typeof msg.chunk === "string") queueTermOutput(msg.chunk);
         if (msg.type === "assist") {
           const a = (msg?.assist ?? null) as any;
           const sig = a && typeof a.signature === "string" ? String(a.signature) : "";
@@ -1244,6 +1320,7 @@ export function App() {
       if (connectedSessionId.current === id) connectedSessionId.current = null;
       if (sessionCtl.current.ping) clearInterval(sessionCtl.current.ping);
       sessionCtl.current.ping = null;
+      flushTermOutput();
 
       const stillWanted = tabRef.current === "run" && activeIdRef.current === id && authedRef.current === "yes";
       if (!stillWanted) {
@@ -1368,6 +1445,62 @@ export function App() {
       });
       if (r?.event && activeIdRef.current === activeId) ingestEventRaw(r.event);
       setToast("Sent");
+    } catch (e: any) {
+      setToast(typeof e?.message === "string" ? e.message : "Not connected");
+    }
+  }
+
+  async function copyTermSelection() {
+    const sel = (() => {
+      try {
+        return String(term.current?.getSelection?.() ?? "");
+      } catch {
+        return "";
+      }
+    })();
+    if (!sel.trim()) {
+      setToast("Select text in the terminal to copy");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(sel);
+      setToast("Copied");
+    } catch {
+      setToast("Copy failed (clipboard blocked; try HTTPS or long-press)");
+    }
+  }
+
+  async function pasteClipboardToTerm() {
+    if (!activeId) {
+      setToast("No active session");
+      return;
+    }
+    let text = "";
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      setToast("Paste failed (clipboard blocked; try HTTPS)");
+      return;
+    }
+    if (!text) {
+      setToast("Clipboard empty");
+      return;
+    }
+
+    // Send directly so we can show a specific toast.
+    if (ws.current && ws.current.readyState === WebSocket.OPEN && connectedSessionId.current === activeId) {
+      ws.current.send(JSON.stringify({ type: "input", text }));
+      setToast("Pasted");
+      return;
+    }
+    try {
+      const r: any = await api(`/api/sessions/${encodeURIComponent(activeId)}/input`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (r?.event && activeIdRef.current === activeId) ingestEventRaw(r.event);
+      setToast("Pasted");
     } catch (e: any) {
       setToast(typeof e?.message === "string" ? e.message : "Not connected");
     }
@@ -1918,6 +2051,11 @@ export function App() {
                   <span className="mono" style={{ fontSize: 12, color: "var(--ink2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
                     {activeSession?.label || activeSession?.profileId || ""}
                   </span>
+                  {sessionWsState !== "open" ? (
+                    <span className="chip mono">
+                      {sessionWsState === "connecting" ? "reconnecting" : "disconnected"}
+                    </span>
+                  ) : null}
                   {activeInboxCount > 0 ? (
                     <button className="btn primary" style={{ padding: "4px 10px", minHeight: 28, fontSize: 11 }} onClick={() => { refreshInbox({ workspaceKey: activeWorkspaceKey }); setTab("inbox"); }}>
                       {activeInboxCount} pending
@@ -3353,6 +3491,14 @@ export function App() {
 	                  </button>
 	                </div>
                   <div className="runBtns" style={{ marginTop: 10 }}>
+                    <button className="btn" onClick={copyTermSelection}>
+                      Copy
+                    </button>
+                    <button className="btn" onClick={pasteClipboardToTerm}>
+                      Paste
+                    </button>
+                  </div>
+                  <div className="runBtns" style={{ marginTop: 10 }}>
                     <button className="btn" onClick={() => sendRaw("\u001b")}>
                       Esc
                     </button>
@@ -3380,6 +3526,7 @@ export function App() {
                       Right
                     </button>
                   </div>
+                  <div className="help">Copy uses terminal selection. Paste reads from clipboard (works best on HTTPS or localhost).</div>
                   <div className="help">Use these keys for TUI menus (permissions, mode picker, etc.).</div>
 	              </div>
 	              <div className="row">
