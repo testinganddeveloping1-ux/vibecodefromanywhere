@@ -14,14 +14,15 @@ import { SessionManager, type ToolCommand, type ToolId } from "./sessions/sessio
 import { createStore, type Store } from "./store.js";
 import { configDir, configPath, defaultConfig, parseConfigToml, type Config } from "./config.js";
 import { macroToWrites } from "./macros/macro_engine.js";
-import { listDir, normalizeRoots, validateCwd } from "./workspaces.js";
+import { isUnderRoot, listDir, normalizeRoots, validateCwd } from "./workspaces.js";
 import { ToolDetector } from "./tools/detector.js";
 import { buildArgsForSession } from "./tools/arg_builders.js";
 import { execCapture } from "./tools/exec.js";
 import { PairingManager } from "./pairing.js";
 import { resolveGitForPath, listGitWorktrees } from "./git.js";
 import { nanoid } from "nanoid";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { ToolSessionIndex } from "./tool_sessions.js";
 
 export type AppConfig = {
   token: string;
@@ -55,6 +56,7 @@ export async function buildApp(cfg: AppConfig): Promise<FastifyInstance> {
   let profiles = cfg.profiles ?? defaultConfig().profiles;
   const roots = normalizeRoots(cfg.workspaces?.roots ?? defaultConfig().workspaces.roots);
   const store = createStore(baseDir);
+  const toolIndex = new ToolSessionIndex({ roots });
   const sessions = new SessionManager({ token: cfg.token, tools });
   const detector = new ToolDetector(tools);
   const pairing = new PairingManager();
@@ -629,6 +631,47 @@ main().catch(() => {});
     return null;
   }
 
+  function scheduleCodexToolSessionLink(fypSessionId: string, cwd: string, createdAt: number) {
+    // Codex does not let us set the session UUID ahead of time, so we discover it by scanning
+    // the ~/.codex/sessions logs shortly after spawn.
+    const maxAttempts = 10;
+    const baseDelayMs = 250;
+    const stepMs = 450;
+
+    const attempt = (n: number) => {
+      const delay = baseDelayMs + n * stepMs + Math.floor(Math.random() * 80);
+      setTimeout(() => {
+        try {
+          const cur = store.getSession(fypSessionId);
+          if (!cur) return;
+          if (cur.toolSessionId) return;
+
+          const items = toolIndex
+            .list({ refresh: true })
+            .filter((s) => s.tool === "codex" && s.cwd === cwd)
+            .sort((a, b) => b.updatedAt - a.updatedAt);
+          const cand = items[0] ?? null;
+          if (!cand || cand.updatedAt < createdAt - 5000) {
+            if (n + 1 < maxAttempts) attempt(n + 1);
+            return;
+          }
+
+          store.setSessionToolSessionId(fypSessionId, cand.id);
+          const evId = store.appendEvent(fypSessionId, "session.tool_link", { tool: "codex", toolSessionId: cand.id });
+          if (evId !== -1) {
+            broadcastEvent(fypSessionId, { id: evId, ts: Date.now(), kind: "session.tool_link", data: { tool: "codex", toolSessionId: cand.id } });
+          }
+          broadcastGlobal({ type: "sessions.changed" });
+          broadcastGlobal({ type: "workspaces.changed" });
+        } catch {
+          // ignore
+        }
+      }, delay).unref?.();
+    };
+
+    attempt(0);
+  }
+
   // Pairing: generate short code so you don’t have to paste long tokens.
   app.post("/api/auth/pair/start", async () => {
     const rec = pairing.start();
@@ -796,6 +839,7 @@ main().catch(() => {});
         id: s.id,
         tool: s.tool,
         profileId: s.profileId,
+        toolSessionId: s.toolSessionId ?? null,
         cwd: s.cwd,
         treePath: s.treePath,
         workspaceKey: s.workspaceKey,
@@ -886,6 +930,43 @@ main().catch(() => {});
     return { ok: true };
   });
 
+  // Tool-native session discovery (Codex + Claude).
+  // This powers chat-history rendering and lets the phone UI resume/fork sessions created outside FYP.
+  app.get("/api/tool-sessions", async (req, reply) => {
+    const q = (req.query ?? {}) as any;
+    const tool = typeof q?.tool === "string" ? String(q.tool).trim() : "";
+    const under = typeof q?.under === "string" ? String(q.under).trim() : "";
+    const refresh = q?.refresh === "1" || q?.refresh === "true" || q?.refresh === "yes";
+
+    let items = toolIndex.list({ refresh });
+    if (tool === "codex" || tool === "claude") items = items.filter((s) => s.tool === tool);
+
+    if (under) {
+      const vv = validateCwd(under, roots);
+      if (!vv.ok) return reply.code(400).send({ error: "bad_path", reason: vv.reason });
+      const root = vv.cwd;
+      items = items.filter((s) => isUnderRoot(s.cwd, root));
+    }
+
+    return { ok: true, items };
+  });
+
+  app.get("/api/tool-sessions/:tool/:id/messages", async (req, reply) => {
+    const params = (req.params ?? {}) as any;
+    const tool = params.tool as any;
+    const id = typeof params.id === "string" ? String(params.id) : "";
+    const q = (req.query ?? {}) as any;
+    const refresh = q?.refresh === "1" || q?.refresh === "true" || q?.refresh === "yes";
+    const limit = Number(q?.limit ?? 160);
+    if (tool !== "codex" && tool !== "claude") return reply.code(400).send({ error: "bad_tool" });
+    if (!id) return reply.code(400).send({ error: "bad_id" });
+
+    const sess = toolIndex.get(tool, id, { refresh });
+    if (!sess) return reply.code(404).send({ error: "not_found" });
+    const messages = toolIndex.getMessages(tool, id, { refresh, limit });
+    return { ok: true, session: sess, messages: messages ?? [] };
+  });
+
   app.get("/api/inbox", async (req) => {
     const q = req.query as any;
     const limit = Number(q?.limit ?? 120);
@@ -968,6 +1049,17 @@ main().catch(() => {});
     const profileId = typeof body.profileId === "string" ? body.profileId : `${tool}.default`;
     const requestedCwd = typeof body.cwd === "string" ? body.cwd : null;
     const savePreset = typeof body.savePreset === "boolean" ? body.savePreset : true;
+    const toolActionRaw = typeof body.toolAction === "string" ? body.toolAction : null;
+    const toolAction = toolActionRaw === "resume" || toolActionRaw === "fork" ? toolActionRaw : null;
+    const toolSessionId = typeof body.toolSessionId === "string" ? body.toolSessionId.trim() : "";
+    const wantsToolSession = Boolean(toolAction && toolSessionId);
+
+    if ((toolActionRaw || toolSessionId) && !wantsToolSession) {
+      return reply.code(400).send({ error: "bad_tool_session" });
+    }
+    if (wantsToolSession && tool !== "codex" && tool !== "claude") {
+      return reply.code(400).send({ error: "unsupported", field: "toolAction", value: toolAction });
+    }
     if (tool !== "codex" && tool !== "claude" && tool !== "opencode") {
       return reply.code(400).send({ error: "invalid tool" });
     }
@@ -977,9 +1069,20 @@ main().catch(() => {});
       tool === "codex" ? caps.codex : tool === "claude" ? caps.claude : caps.opencode;
     if (!(toolCaps as any).installed) return reply.code(400).send({ error: "tool_not_installed" });
 
-    const cwdOk = requestedCwd ? validateCwd(requestedCwd, roots) : null;
+    let toolSess: any | null = null;
+    if (wantsToolSession) {
+      toolSess = toolIndex.get(tool as any, toolSessionId, { refresh: false }) ?? toolIndex.get(tool as any, toolSessionId, { refresh: true });
+      if (!toolSess) return reply.code(404).send({ error: "tool_session_not_found" });
+    }
+
+    const desiredCwd = requestedCwd ?? (toolSess?.cwd ?? null);
+    const cwdOk = desiredCwd ? validateCwd(desiredCwd, roots) : null;
     if (cwdOk && !cwdOk.ok) return reply.code(400).send({ error: "bad_cwd", reason: cwdOk.reason });
-    const cwd = cwdOk && cwdOk.ok ? cwdOk.cwd : undefined;
+    let cwd = cwdOk && cwdOk.ok ? cwdOk.cwd : undefined;
+    if (!cwd) {
+      const v = validateCwd(process.cwd(), roots);
+      cwd = v.ok ? v.cwd : roots[0] ?? process.cwd();
+    }
 
     const profile = profiles[profileId];
     const extraEnv: Record<string, string> = {};
@@ -1094,12 +1197,29 @@ main().catch(() => {});
       if (typeof o.port === "number") effectiveProfile.opencode.port = o.port;
     }
 
+    // Link FYP sessions to tool-native session IDs so we can render chat history.
+    // - Claude: we can force a deterministic UUID with --session-id for new sessions.
+    // - Codex: we discover the created session log shortly after spawn.
+    let toolSessionIdForStore: string | null = null;
+    if (wantsToolSession) toolSessionIdForStore = toolSessionId;
+    else if (tool === "claude") toolSessionIdForStore = randomUUID();
+
     const built = buildArgsForSession({
       tool,
       baseArgs: [],
       profile: effectiveProfile,
       cwd,
     });
+
+    if (wantsToolSession) {
+      if (tool === "codex") built.args = [toolAction!, toolSessionId, ...built.args];
+      if (tool === "claude") {
+        built.args.push("--resume", toolSessionId);
+        if (toolAction === "fork") built.args.push("--fork-session");
+      }
+    } else if (tool === "claude" && toolSessionIdForStore) {
+      built.args.push("--session-id", toolSessionIdForStore);
+    }
 
     // OpenCode supports a positional "project" path. Use cwd if provided.
     if (tool === "opencode" && cwd) built.args.unshift(cwd);
@@ -1130,6 +1250,7 @@ main().catch(() => {});
       }
     }
 
+    const spawnedAt = Date.now();
     try {
       sessions.createSession({ id, tool, profileId, cwd, extraArgs: built.args, env: extraEnv });
     } catch (e: any) {
@@ -1140,7 +1261,7 @@ main().catch(() => {});
       });
     }
 
-    log("session created", { id, tool, profileId, cwd: cwd ?? null });
+    log("session created", { id, tool, profileId, cwd: cwd ?? null, toolSessionId: toolSessionIdForStore });
 
     // Persist the session immediately so hook callbacks (Claude) and websockets can
     // associate events with it. Git resolution can be slow; do that async later.
@@ -1148,15 +1269,23 @@ main().catch(() => {});
       id,
       tool,
       profileId,
+      toolSessionId: toolSessionIdForStore,
       cwd: cwd ?? null,
       workspaceKey: null,
       workspaceRoot: null,
       treePath: null,
     });
+
+    if (tool === "codex" && !toolSessionIdForStore && cwd) {
+      scheduleCodexToolSessionLink(id, cwd, spawnedAt);
+    }
+
     const createdEventId = store.appendEvent(id, "session.created", {
       tool,
       profileId,
       cwd: cwd ?? null,
+      toolAction: wantsToolSession ? toolAction : null,
+      toolSessionId: wantsToolSession ? toolSessionId : toolSessionIdForStore,
       args: built.args,
       notes: built.notes,
       overrides: overrides ?? {},

@@ -7,6 +7,7 @@ export type StoreSessionRow = {
   id: string;
   tool: ToolId;
   profileId: string;
+  toolSessionId: string | null;
   cwd: string | null;
   workspaceKey: string | null;
   workspaceRoot: string | null;
@@ -49,6 +50,7 @@ export function createStore(baseDir: string) {
       id TEXT PRIMARY KEY,
       tool TEXT NOT NULL,
       profileId TEXT NOT NULL,
+      toolSessionId TEXT,
       cwd TEXT,
       workspaceKey TEXT,
       workspaceRoot TEXT,
@@ -118,6 +120,7 @@ export function createStore(baseDir: string) {
   const addCol = (name: string, ddl: string) => {
     if (!cols.includes(name)) db.exec(`ALTER TABLE sessions ADD COLUMN ${ddl}`);
   };
+  addCol("toolSessionId", "toolSessionId TEXT");
   addCol("cwd", "cwd TEXT");
   addCol("workspaceKey", "workspaceKey TEXT");
   addCol("workspaceRoot", "workspaceRoot TEXT");
@@ -126,7 +129,7 @@ export function createStore(baseDir: string) {
   addCol("pinnedSlot", "pinnedSlot INTEGER");
 
   const stmtCreateSession = db.prepare(
-    "INSERT INTO sessions (id, tool, profileId, cwd, workspaceKey, workspaceRoot, treePath, label, pinnedSlot, createdAt, updatedAt, exitCode, signal) VALUES (@id, @tool, @profileId, @cwd, @workspaceKey, @workspaceRoot, @treePath, @label, @pinnedSlot, @createdAt, @updatedAt, NULL, NULL)",
+    "INSERT INTO sessions (id, tool, profileId, toolSessionId, cwd, workspaceKey, workspaceRoot, treePath, label, pinnedSlot, createdAt, updatedAt, exitCode, signal) VALUES (@id, @tool, @profileId, @toolSessionId, @cwd, @workspaceKey, @workspaceRoot, @treePath, @label, @pinnedSlot, @createdAt, @updatedAt, NULL, NULL)",
   );
   const stmtListSessions = db.prepare("SELECT * FROM sessions ORDER BY createdAt DESC");
   const stmtGetSession = db.prepare("SELECT * FROM sessions WHERE id = ?");
@@ -134,6 +137,7 @@ export function createStore(baseDir: string) {
   const stmtSetSessionMeta = db.prepare(
     "UPDATE sessions SET workspaceKey=@workspaceKey, workspaceRoot=@workspaceRoot, treePath=@treePath, label=@label WHERE id=@id",
   );
+  const stmtSetSessionToolSessionId = db.prepare("UPDATE sessions SET toolSessionId = ?, updatedAt = ? WHERE id = ?");
   const stmtSetSessionLabel = db.prepare("UPDATE sessions SET label = ?, updatedAt = ? WHERE id = ?");
   const stmtClearPinnedByWorkspaceSlot = db.prepare(
     "UPDATE sessions SET pinnedSlot = NULL, updatedAt = ? WHERE workspaceKey = ? AND pinnedSlot = ? AND id != ?",
@@ -223,6 +227,7 @@ export function createStore(baseDir: string) {
     id: string;
     tool: ToolId;
     profileId: string;
+    toolSessionId?: string | null;
     cwd: string | null;
     workspaceKey?: string | null;
     workspaceRoot?: string | null;
@@ -233,6 +238,7 @@ export function createStore(baseDir: string) {
     const now = Date.now();
     stmtCreateSession.run({
       ...input,
+      toolSessionId: input.toolSessionId ?? null,
       workspaceKey: input.workspaceKey ?? null,
       workspaceRoot: input.workspaceRoot ?? null,
       treePath: input.treePath ?? null,
@@ -260,6 +266,10 @@ export function createStore(baseDir: string) {
     label: string | null;
   }) {
     stmtSetSessionMeta.run(input as any);
+  }
+
+  function setSessionToolSessionId(sessionId: string, toolSessionId: string | null) {
+    stmtSetSessionToolSessionId.run(toolSessionId, Date.now(), sessionId);
   }
 
   function setSessionLabel(sessionId: string, label: string | null) {
@@ -499,6 +509,7 @@ export function createStore(baseDir: string) {
     listSessions,
     getSession,
     setSessionMeta,
+    setSessionToolSessionId,
     setSessionLabel,
     setSessionPinnedSlot,
     setSessionExit,

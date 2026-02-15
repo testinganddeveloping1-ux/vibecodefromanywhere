@@ -5,7 +5,8 @@ Self-hosted phone UI that lets you run **OpenCode**, **Codex CLI**, or **Claude 
 - Send messages cleanly
 - Interrupt and continue
 - Switch tool/profile presets (tool-native flags; startup macros optional)
-- See full terminal rendering (ANSI) + session history
+- See full terminal rendering (ANSI) + input/action history
+- Browse tool-native sessions (Codex/Claude) with chat history + resume/fork
 
 ## Quick Start (LAN)
 
@@ -71,6 +72,14 @@ Config file:
 Notes:
 - Tool flags/modes change across versions. If a macro doesn’t work, tweak it in `config.toml`.
 - The UI always streams the real TUI/terminal, so you can still operate manually even if a macro is imperfect.
+
+## Tool Sessions (Chat History)
+
+In **Projects**, each workspace shows **Tool Sessions** discovered from the host:
+- Codex: `~/.codex/sessions/**/*.jsonl`
+- Claude: `~/.claude/projects/*/sessions-index.json` + session logs
+
+You can tap a tool session to view a chat-style history and resume or fork it into a live terminal session.
 
 ## Tool Capability Detection
 

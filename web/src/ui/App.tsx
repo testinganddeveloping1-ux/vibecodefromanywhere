@@ -52,6 +52,7 @@ type SessionRow = {
   id: string;
   tool: ToolId;
   profileId: string;
+  toolSessionId?: string | null;
   cwd?: string | null;
   workspaceKey?: string | null;
   workspaceRoot?: string | null;
@@ -96,6 +97,20 @@ type InboxItem = {
   options: { id: string; label: string; send: string }[];
   session: SessionRow | null;
 };
+
+type ToolSessionTool = "codex" | "claude";
+type ToolSessionSummary = {
+  tool: ToolSessionTool;
+  id: string;
+  cwd: string;
+  createdAt: number | null;
+  updatedAt: number;
+  title: string | null;
+  preview: string | null;
+  messageCount: number | null;
+  gitBranch: string | null;
+};
+type ToolSessionMessage = { role: "user" | "assistant"; ts: number; text: string };
 
 type Doctor = {
   tools: {
@@ -225,6 +240,36 @@ function formatEventLine(e: EventItem): string {
   }
 }
 
+function FencedMessage({ text }: { text: string }) {
+  const raw = String(text ?? "");
+  const parts = raw.split("```");
+  if (parts.length <= 1) return <div className="mdText">{raw}</div>;
+
+  return (
+    <div className="md">
+      {parts.map((p, i) => {
+        const isCode = i % 2 === 1;
+        if (isCode) {
+          const idx = p.indexOf("\n");
+          const lang = idx >= 0 ? p.slice(0, idx).trim() : "";
+          const code = (idx >= 0 ? p.slice(idx + 1) : p).replace(/\n$/, "");
+          return (
+            <pre key={i} className="mdCode" data-lang={lang || undefined}>
+              <code>{code}</code>
+            </pre>
+          );
+        }
+        if (!p) return null;
+        return (
+          <div key={i} className="mdText">
+            {p}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function App() {
   const [authed, setAuthed] = useState<"unknown" | "yes" | "no">("unknown");
   const [token, setToken] = useState("");
@@ -270,6 +315,15 @@ export function App() {
   const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([]);
   const [workspaceQuery, setWorkspaceQuery] = useState("");
   const [inbox, setInbox] = useState<InboxItem[]>([]);
+  const [toolSessions, setToolSessions] = useState<ToolSessionSummary[]>([]);
+  const [toolSessionsLoading, setToolSessionsLoading] = useState(false);
+  const [toolSessionsMsg, setToolSessionsMsg] = useState<string | null>(null);
+
+  const [showToolChat, setShowToolChat] = useState(false);
+  const [toolChatSession, setToolChatSession] = useState<ToolSessionSummary | null>(null);
+  const [toolChatMessages, setToolChatMessages] = useState<ToolSessionMessage[]>([]);
+  const [toolChatLoading, setToolChatLoading] = useState(false);
+  const [toolChatMsg, setToolChatMsg] = useState<string | null>(null);
 
   const [slotCfg, setSlotCfg] = useState<{ slots: 3 | 4 | 6 }>(() => {
     try {
@@ -446,10 +500,10 @@ export function App() {
         fontFamily: "var(--mono)",
         fontSize,
         theme: {
-          background: "#050608",
-          foreground: "#eaf0fa",
-          cursor: "#ffb000",
-          selectionBackground: "rgba(255,176,0,.20)",
+          background: "#060810",
+          foreground: "#e4eaf4",
+          cursor: "#f5a623",
+          selectionBackground: "rgba(245,166,35,.25)",
           selectionForeground: "#eaf0fa",
         },
         scrollback: 8000,
@@ -586,6 +640,25 @@ export function App() {
       setInbox(r.items ?? []);
     } catch {
       // ignore
+    }
+  }
+
+  async function refreshToolSessions(opts?: { under?: string; refresh?: boolean }) {
+    const under = typeof opts?.under === "string" ? opts.under.trim() : "";
+    const refresh = Boolean(opts?.refresh);
+    setToolSessionsMsg(null);
+    setToolSessionsLoading(true);
+    try {
+      const qs = new URLSearchParams();
+      if (under) qs.set("under", under);
+      if (refresh) qs.set("refresh", "1");
+      const r = await api<{ ok: true; items: ToolSessionSummary[] }>(`/api/tool-sessions?${qs.toString()}`);
+      setToolSessions(Array.isArray(r.items) ? r.items : []);
+    } catch (e: any) {
+      setToolSessions([]);
+      setToolSessionsMsg(typeof e?.message === "string" ? e.message : "failed to load tool sessions");
+    } finally {
+      setToolSessionsLoading(false);
     }
   }
 
@@ -882,6 +955,18 @@ export function App() {
     if (authed !== "yes") return;
     refreshInbox({ workspaceKey: selectedWorkspaceKey });
   }, [selectedWorkspaceKey, authed]);
+
+  useEffect(() => {
+    if (authed !== "yes") return;
+    const w = selectedWorkspaceKey ? workspaces.find((x) => x.key === selectedWorkspaceKey) ?? null : null;
+    const under = String(w?.root ?? "").trim();
+    if (!under) {
+      setToolSessions([]);
+      return;
+    }
+    const t = setTimeout(() => refreshToolSessions({ under }), 160);
+    return () => clearTimeout(t);
+  }, [selectedWorkspaceKey, workspaces, authed]);
 
   useEffect(() => {
     try {
@@ -1216,7 +1301,7 @@ export function App() {
     }
   }
 
-  async function startSessionWith(input: { tool: ToolId; profileId: string; cwd?: string; overrides?: any; savePreset?: boolean }) {
+  async function startSessionWith(input: { tool: ToolId; profileId: string; cwd?: string; overrides?: any; savePreset?: boolean; toolAction?: "resume" | "fork"; toolSessionId?: string }) {
     try {
       const res = await api<{ id: string }>("/api/sessions", {
         method: "POST",
@@ -1225,6 +1310,8 @@ export function App() {
           tool: input.tool,
           profileId: input.profileId,
           cwd: input.cwd,
+          toolAction: input.toolAction,
+          toolSessionId: input.toolSessionId,
           overrides: input.overrides ?? {},
           savePreset: typeof input.savePreset === "boolean" ? input.savePreset : false,
         }),
@@ -1320,6 +1407,58 @@ export function App() {
       await refreshInbox({ workspaceKey: selectedWorkspaceKey });
     } catch {
       setToast("dismiss failed");
+    }
+  }
+
+  async function openToolChat(tool: ToolSessionTool, sessionId: string, opts?: { refresh?: boolean }) {
+    setToolChatMsg(null);
+    setToolChatLoading(true);
+    setToolChatMessages([]);
+    setToolChatSession(null);
+    setShowToolChat(true);
+    try {
+      const qs = new URLSearchParams();
+      qs.set("limit", "240");
+      if (opts?.refresh) qs.set("refresh", "1");
+      const r = await api<{ ok: true; session: ToolSessionSummary; messages: ToolSessionMessage[] }>(
+        `/api/tool-sessions/${encodeURIComponent(tool)}/${encodeURIComponent(sessionId)}/messages?${qs.toString()}`,
+      );
+      setToolChatSession(r.session ?? null);
+      setToolChatMessages(Array.isArray(r.messages) ? r.messages : []);
+    } catch (e: any) {
+      setToolChatMsg(typeof e?.message === "string" ? e.message : "failed to load chat history");
+    } finally {
+      setToolChatLoading(false);
+    }
+  }
+
+  async function startFromToolSession(ts: ToolSessionSummary, action: "resume" | "fork") {
+    try {
+      // Prefer per-workspace defaults (tool-native settings and approvals) if present.
+      let pid = `${ts.tool}.default`;
+      let overrides: any = {};
+      try {
+        const pr = await api<{ ok: true; preset: any | null }>(
+          `/api/workspaces/preset?path=${encodeURIComponent(ts.cwd)}&tool=${encodeURIComponent(ts.tool)}`,
+        );
+        if (pr?.preset && typeof pr.preset.profileId === "string") {
+          pid = pr.preset.profileId;
+          overrides = pr.preset.overrides ?? {};
+        }
+      } catch {
+        // ignore
+      }
+      await startSessionWith({
+        tool: ts.tool as any,
+        profileId: pid,
+        cwd: ts.cwd,
+        overrides,
+        savePreset: false,
+        toolAction: action,
+        toolSessionId: ts.id,
+      });
+    } catch (e: any) {
+      setToast(typeof e?.message === "string" ? e.message : "failed to start session");
     }
   }
 
@@ -1508,7 +1647,41 @@ export function App() {
     setLabelDraft(activeSession?.label ?? "");
   }, [showControls, activeId]);
 
-  if (authed === "unknown") return null;
+  const codexCaps = doctor?.tools.codex;
+  const claudeCaps = doctor?.tools.claude;
+  const opencodeCaps = doctor?.tools.opencode as any;
+  const activeInboxItems = activeId ? inbox.filter((x) => x.sessionId === activeId) : [];
+  const activeInboxCount = activeInboxItems.length;
+  const workspaceInboxCount = inbox.length;
+  const activeAttention = activeInboxItems[0] ?? null;
+
+  const modelProviders = useMemo(() => {
+    const set = new Set<string>();
+    for (const m of modelList) {
+      const s = String(m || "");
+      const idx = s.indexOf("/");
+      if (idx > 0) set.add(s.slice(0, idx));
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [modelList]);
+
+  const filteredModels = useMemo(() => {
+    const prov = String(modelProvider || "").trim();
+    const q = String(modelQuery || "").trim().toLowerCase();
+    let items = modelList;
+    if (prov) items = items.filter((m) => String(m).startsWith(prov + "/"));
+    if (q) items = items.filter((m) => String(m).toLowerCase().includes(q));
+    return items;
+  }, [modelList, modelProvider, modelQuery]);
+
+  if (authed === "unknown") return (
+    <div className="login">
+      <div style={{ textAlign: "center" }}>
+        <div className="logo" style={{ width: 48, height: 48, fontSize: 14, margin: "0 auto 12px" }}>FYP</div>
+        <div className="muted" style={{ fontSize: 13 }}>Connecting...</div>
+      </div>
+    </div>
+  );
 
   if (authed === "no") {
     return (
@@ -1576,33 +1749,6 @@ export function App() {
     );
   }
 
-  const codexCaps = doctor?.tools.codex;
-  const claudeCaps = doctor?.tools.claude;
-  const opencodeCaps = doctor?.tools.opencode as any;
-  const activeInboxItems = activeId ? inbox.filter((x) => x.sessionId === activeId) : [];
-  const activeInboxCount = activeInboxItems.length;
-  const workspaceInboxCount = inbox.length;
-  const activeAttention = activeInboxItems[0] ?? null;
-
-  const modelProviders = useMemo(() => {
-    const set = new Set<string>();
-    for (const m of modelList) {
-      const s = String(m || "");
-      const idx = s.indexOf("/");
-      if (idx > 0) set.add(s.slice(0, idx));
-    }
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [modelList]);
-
-  const filteredModels = useMemo(() => {
-    const prov = String(modelProvider || "").trim();
-    const q = String(modelQuery || "").trim().toLowerCase();
-    let items = modelList;
-    if (prov) items = items.filter((m) => String(m).startsWith(prov + "/"));
-    if (q) items = items.filter((m) => String(m).toLowerCase().includes(q));
-    return items;
-  }, [modelList, modelProvider, modelQuery]);
-
   return (
     <div className="shell">
       <header className="hdr">
@@ -1628,17 +1774,17 @@ export function App() {
       </header>
 
       <main className="stage">
-        <section className="view" hidden={tab !== "run"} aria-hidden={tab !== "run"}>
+        <section className="viewRun" hidden={tab !== "run"} aria-hidden={tab !== "run"}>
           {!activeId ? (
             <div className="empty">
               <div className="emptyTitle">No active session</div>
               <div className="emptySub">Start a new session to see the terminal here.</div>
-              <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+              <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                 <button className="btn primary" onClick={() => setTab("new")}>
                   New Session
                 </button>
                 <button className="btn ghost" onClick={() => setTab("workspace")}>
-                  Browse Projects
+                  Projects
                 </button>
               </div>
             </div>
@@ -1647,32 +1793,36 @@ export function App() {
               {renderPinnedBar()}
               <div className="runBar">
                 <div className="runInfo">
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, flex: 1 }}>
-                    <div className={`dot ${activeSession?.running ? "dotOn" : "dotOff"}`}>
-                      {activeSession?.running ? "RUN" : "STOP"}
-                    </div>
-                    <span className="mono muted" style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {activeSession?.label || activeSession?.profileId || ""}
-                    </span>
+                  <div className={`dot ${activeSession?.running ? "dotOn" : "dotOff"}`}>
+                    {activeSession?.running ? "RUN" : "IDLE"}
                   </div>
-                  <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
-                    {activeInboxCount > 0 ? (
-                      <button className="btn primary" style={{ padding: "6px 10px", minHeight: 32, fontSize: 11 }} onClick={() => { refreshInbox({ workspaceKey: activeWorkspaceKey }); setTab("inbox"); }}>
-                        Inbox ({activeInboxCount})
-                      </button>
-                    ) : null}
-                  </div>
+                  <span className="mono" style={{ fontSize: 12, color: "var(--ink2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
+                    {activeSession?.label || activeSession?.profileId || ""}
+                  </span>
+                  {activeInboxCount > 0 ? (
+                    <button className="btn primary" style={{ padding: "4px 10px", minHeight: 28, fontSize: 11 }} onClick={() => { refreshInbox({ workspaceKey: activeWorkspaceKey }); setTab("inbox"); }}>
+                      {activeInboxCount} pending
+                    </button>
+                  ) : null}
                 </div>
                 <div className="runBtns">
-                  <button className="btn" onClick={() => sendControl("interrupt")}>
-                    Interrupt
+                  <button className="btn" onClick={() => sendControl("interrupt")}>Int</button>
+                  <button className="btn ghost" onClick={() => setShowLog(true)}>Log</button>
+                  <button
+                    className="btn ghost"
+                    onClick={() => {
+                      const t = activeSession?.tool ?? null;
+                      const sid = String(activeSession?.toolSessionId ?? "");
+                      if ((t !== "codex" && t !== "claude") || !sid) {
+                        setToast("Chat history not linked yet");
+                        return;
+                      }
+                      openToolChat(t, sid);
+                    }}
+                  >
+                    Chat
                   </button>
-                  <button className="btn ghost" onClick={() => setShowLog(true)}>
-                    Log
-                  </button>
-                  <button className="btn ghost" onClick={() => setShowControls(true)}>
-                    More
-                  </button>
+                  <button className="btn ghost" onClick={() => setShowControls(true)}>More</button>
                 </div>
               </div>
 
@@ -2004,6 +2154,137 @@ export function App() {
 	                        })()}
 	                      </div>
 	                    </div>
+
+                      {(() => {
+                        const wsRoot = String(w.root || "").trim();
+                        const items = Array.isArray(toolSessions) ? toolSessions : [];
+
+                        const isUnder = (p: string, root: string): boolean => {
+                          const r = root.replace(/\/+$/g, "");
+                          return p === r || p.startsWith(r + "/");
+                        };
+
+                        const treeRoots = [String(w.root || ""), ...trees.map((t) => String(t.path || "")).filter(Boolean)]
+                          .map((s) => s.replace(/\/+$/g, ""))
+                          .filter(Boolean);
+
+                        const pickTreeRoot = (p: string): string => {
+                          if (!w.isGit) return wsRoot || p;
+                          let best = wsRoot || (treeRoots[0] ?? p);
+                          for (const r of treeRoots) {
+                            if (!r) continue;
+                            if (isUnder(p, r) && r.length >= best.length) best = r;
+                          }
+                          return best || p;
+                        };
+
+                        const map = new Map<string, ToolSessionSummary[]>();
+                        for (const ts of items) {
+                          if (!ts?.cwd) continue;
+                          if (wsRoot && !isUnder(ts.cwd, wsRoot)) continue;
+                          const k = pickTreeRoot(String(ts.cwd));
+                          const arr = map.get(k) ?? [];
+                          arr.push(ts);
+                          map.set(k, arr);
+                        }
+
+                        const groups = Array.from(map.entries())
+                          .map(([k, sess]) => ({
+                            key: k,
+                            last: Math.max(0, ...sess.map((s) => Number(s.updatedAt ?? 0))),
+                            sessions: sess.sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0)),
+                          }))
+                          .sort((a, b) => b.last - a.last);
+
+                        const labelForTree = (treePath: string): string => {
+                          if (!w.isGit) return "dir";
+                          if (treePath === w.root) return "main";
+                          const wt = trees.find((t) => t.path === treePath) ?? null;
+                          if (wt?.branch) return wt.branch.replace(/^refs\/heads\//, "");
+                          if (wt?.detached) return "detached";
+                          return "tree";
+                        };
+
+                        return (
+                          <>
+                            <div className="row" style={{ marginTop: 8 }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
+                                <div className="cardTitle" style={{ margin: 0 }}>Tool Sessions</div>
+                                <div className="spacer" />
+                                <button className="btn ghost" onClick={() => refreshToolSessions({ under: wsRoot, refresh: true })}>
+                                  Refresh
+                                </button>
+                              </div>
+                              <div className="help">Chat history stored by Codex and Claude on this host. Tap to view, or resume in a live terminal.</div>
+                              {toolSessionsMsg ? <div className="help mono">{toolSessionsMsg}</div> : null}
+                            </div>
+
+                            <div className="row" style={{ padding: 0 }}>
+                              <div className="list">
+                                {toolSessionsLoading ? (
+                                  <div className="row">
+                                    <div className="help">Loading tool sessions...</div>
+                                  </div>
+                                ) : groups.length === 0 ? (
+                                  <div className="row">
+                                    <div className="help">No stored tool sessions found in this workspace yet.</div>
+                                  </div>
+                                ) : null}
+
+                                {groups.map((g) => (
+                                  <div key={g.key}>
+                                    <div className="groupHdr">
+                                      <span className="chip">{labelForTree(g.key)}</span>
+                                      <span className="mono groupPath">{g.key}</span>
+                                    </div>
+                                    {g.sessions.map((ts) => (
+                                      <div
+                                        key={ts.id}
+                                        className="listRow listRowDiv"
+                                        role="button"
+                                        tabIndex={0}
+                                        onClick={() => openToolChat(ts.tool, ts.id)}
+                                        onKeyDown={(e) => {
+                                          if (e.key === "Enter" || e.key === " ") {
+                                            e.preventDefault();
+                                            openToolChat(ts.tool, ts.id);
+                                          }
+                                        }}
+                                      >
+                                        <div className="listLeft">
+                                          <ToolChip tool={ts.tool as any} />
+                                          <div className="listText">
+                                            <div className="listTitle">
+                                              {ts.title ? ts.title : ts.gitBranch ? ts.gitBranch : ts.id.slice(0, 8)}
+                                              {typeof ts.messageCount === "number" ? <span className="badge">{ts.messageCount}</span> : null}
+                                            </div>
+                                            <div className="listSub mono">
+                                              {ts.gitBranch ? `${ts.gitBranch} · ` : ""}
+                                              {new Date(ts.updatedAt).toLocaleString()} · {ts.id.slice(0, 8)}
+                                            </div>
+                                            {ts.preview ? <div className="preview mono">{ts.preview}</div> : null}
+                                          </div>
+                                        </div>
+                                        <div className="listRight">
+                                          <button
+                                            className="btn primary"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              startFromToolSession(ts, "resume");
+                                            }}
+                                          >
+                                            Resume
+                                          </button>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          </>
+                        );
+                      })()}
 	                  </>
 	                );
 	              })()}
@@ -2732,6 +3013,52 @@ export function App() {
               </div>
               <div className="help mono">
                 {filteredModels.length > 240 ? `Showing 240 of ${filteredModels.length}. Refine provider/search.` : `Showing ${filteredModels.length}.`}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showToolChat ? (
+        <div className="modalOverlay" role="dialog" aria-modal="true">
+          <div className="modal modalChat">
+            <div className="modalHead">
+              <b>Chat History</b>
+              {toolChatSession ? <span className="chip chipOn">{toolChatSession.tool}</span> : <span className="chip">loading</span>}
+              {toolChatSession?.id ? <span className="chip mono">{toolChatSession.id.slice(0, 8)}</span> : null}
+              <div className="spacer" />
+              {toolChatSession ? (
+                <>
+                  <button className="btn" onClick={() => openToolChat(toolChatSession.tool, toolChatSession.id, { refresh: true })} disabled={toolChatLoading}>
+                    Refresh
+                  </button>
+                  <button className="btn primary" onClick={() => startFromToolSession(toolChatSession, "resume")} disabled={toolChatLoading}>
+                    Resume
+                  </button>
+                  <button className="btn ghost" onClick={() => startFromToolSession(toolChatSession, "fork")} disabled={toolChatLoading}>
+                    Fork
+                  </button>
+                </>
+              ) : null}
+              <button className="btn" onClick={() => setShowToolChat(false)}>
+                Close
+              </button>
+            </div>
+            <div className="modalBody">
+              {toolChatSession?.cwd ? <div className="help mono">{toolChatSession.cwd}</div> : null}
+              {toolChatMsg ? <div className="help mono">{toolChatMsg}</div> : null}
+              {toolChatLoading ? <div className="help">Loading chat...</div> : null}
+              <div className="chatList">
+                {toolChatMessages.map((m, idx) => (
+                  <div key={idx} className={`chatMsg ${m.role === "user" ? "chatUser" : "chatAssistant"}`}>
+                    <div className="chatMeta mono">
+                      {m.role} · {new Date(m.ts).toLocaleString()}
+                    </div>
+                    <div className="chatText">
+                      <FencedMessage text={m.text} />
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           </div>
