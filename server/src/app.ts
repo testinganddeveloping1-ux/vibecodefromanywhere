@@ -776,32 +776,57 @@ main().catch(() => {});
     return { title, body, options: opts, signature: `assist:${sig}` };
   }
 
+  // Tracks linking attempts so repeated inputs don't start overlapping scans.
+  const codexToolSessionLinkInFlight = new Set<string>();
+
   function scheduleCodexToolSessionLink(fypSessionId: string, cwd: string, createdAt: number) {
     // Codex does not let us set the session UUID ahead of time, so we discover it by scanning
     // the ~/.codex/sessions logs shortly after spawn.
+    // Notes:
+    // - Codex may resume an existing session log whose *createdAt* is older than this FYP session.
+    //   In that case, the session is still "new" to us if the log is being written now.
+    // - We also re-trigger linking on first input (HTTP/WS) in case the log appears late.
     const maxAttempts = 10;
     const baseDelayMs = 250;
     const stepMs = 450;
+    const normCwd = path.resolve(cwd);
+    if (codexToolSessionLinkInFlight.has(fypSessionId)) return;
+    codexToolSessionLinkInFlight.add(fypSessionId);
+
+    const done = () => {
+      try {
+        codexToolSessionLinkInFlight.delete(fypSessionId);
+      } catch {
+        // ignore
+      }
+    };
 
     const attempt = (n: number) => {
       const delay = baseDelayMs + n * stepMs + Math.floor(Math.random() * 80);
       setTimeout(() => {
         try {
           const cur = store.getSession(fypSessionId);
-          if (!cur) return;
-          if (cur.toolSessionId) return;
+          if (!cur) {
+            done();
+            return;
+          }
+          if (cur.toolSessionId) {
+            done();
+            return;
+          }
 
           const items = toolIndex
             .list({ refresh: true })
-            .filter((s) => s.tool === "codex" && s.cwd === cwd)
+            .filter((s) => s.tool === "codex" && path.resolve(s.cwd) === normCwd)
             .sort((a, b) => b.updatedAt - a.updatedAt);
 
           const cutoff = createdAt - 12_000;
-          const recent = items.filter((s) => Number(s.createdAt ?? s.updatedAt) >= cutoff);
+          const recent = items.filter((s) => Math.max(Number(s.updatedAt ?? 0), Number(s.createdAt ?? 0)) >= cutoff);
           const cand = recent[0] ?? null;
 
           if (!cand) {
             if (n + 1 < maxAttempts) attempt(n + 1);
+            else done();
             return;
           }
 
@@ -809,6 +834,7 @@ main().catch(() => {});
           const dup = store.listSessions().find((s) => s.id !== fypSessionId && s.toolSessionId === cand.id) ?? null;
           if (dup) {
             if (n + 1 < maxAttempts) attempt(n + 1);
+            else done();
             return;
           }
 
@@ -819,7 +845,9 @@ main().catch(() => {});
           }
           broadcastGlobal({ type: "sessions.changed" });
           broadcastGlobal({ type: "workspaces.changed" });
+          done();
         } catch {
+          if (n + 1 >= maxAttempts) done();
           // ignore
         }
       }, delay).unref?.();
@@ -1655,10 +1683,14 @@ main().catch(() => {});
     const id = (req.params as any).id as string;
     const body = (req.body ?? {}) as any;
     const text = typeof body.text === "string" ? body.text : "";
-    if (!store.getSession(id)) return reply.code(404).send({ error: "not found" });
+    const sess = store.getSession(id);
+    if (!sess) return reply.code(404).send({ error: "not found" });
     const evId = store.appendEvent(id, "input", { text });
     broadcastEvent(id, { id: evId, ts: Date.now(), kind: "input", data: { text } });
     sessions.write(id, text);
+    if (sess.tool === "codex" && !sess.toolSessionId && sess.cwd) {
+      scheduleCodexToolSessionLink(id, sess.cwd, Date.now());
+    }
     return { ok: true, event: { id: evId, ts: Date.now(), kind: "input", data: { text } } };
   });
 
@@ -1760,6 +1792,14 @@ main().catch(() => {});
           const evId = store.appendEvent(id, "input", { text: msg.text });
           broadcastEvent(id, { id: evId, ts: Date.now(), kind: "input", data: { text: msg.text } });
           sessions.write(id, msg.text);
+          try {
+            const sess = store.getSession(id);
+            if (sess && sess.tool === "codex" && !sess.toolSessionId && sess.cwd) {
+              scheduleCodexToolSessionLink(id, sess.cwd, Date.now());
+            }
+          } catch {
+            // ignore
+          }
         }
         if (msg?.type === "resize" && Number.isFinite(msg.cols) && Number.isFinite(msg.rows)) {
           sessions.resize(id, msg.cols, msg.rows);
