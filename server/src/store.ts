@@ -147,6 +147,7 @@ export function createStore(baseDir: string) {
   );
   const stmtSetSessionPinnedSlot = db.prepare("UPDATE sessions SET pinnedSlot = ?, updatedAt = ? WHERE id = ?");
   const stmtSetSessionExit = db.prepare("UPDATE sessions SET exitCode = ?, signal = ?, updatedAt = ? WHERE id = ?");
+  const stmtDeleteSession = db.prepare("DELETE FROM sessions WHERE id = ?");
   const stmtEvent = db.prepare("INSERT INTO events (sessionId, ts, kind, data) VALUES (?, ?, ?, ?)");
   const stmtEventsFirst = db.prepare(
     "SELECT id, ts, kind, data FROM events WHERE sessionId = ? ORDER BY id DESC LIMIT ?",
@@ -154,6 +155,7 @@ export function createStore(baseDir: string) {
   const stmtEventsAfter = db.prepare(
     "SELECT id, ts, kind, data FROM events WHERE sessionId = ? AND id < ? ORDER BY id DESC LIMIT ?",
   );
+  const stmtDeleteEvents = db.prepare("DELETE FROM events WHERE sessionId = ?");
   const stmtOut = db.prepare("INSERT INTO output (sessionId, ts, chunk) VALUES (?, ?, ?)");
   const stmtTranscriptFirst = db.prepare(
     "SELECT id, ts, chunk FROM output WHERE sessionId = ? ORDER BY id DESC LIMIT ?",
@@ -161,6 +163,7 @@ export function createStore(baseDir: string) {
   const stmtTranscriptAfter = db.prepare(
     "SELECT id, ts, chunk FROM output WHERE sessionId = ? AND id < ? ORDER BY id DESC LIMIT ?",
   );
+  const stmtDeleteOutput = db.prepare("DELETE FROM output WHERE sessionId = ?");
   const stmtRecentWorkspaces = db.prepare(
     `
       SELECT cwd as path, MAX(updatedAt) as lastUsed
@@ -219,9 +222,11 @@ export function createStore(baseDir: string) {
   const stmtAttentionActionInsert = db.prepare(
     "INSERT INTO attention_actions (attentionId, sessionId, ts, action, data) VALUES (?, ?, ?, ?, ?)",
   );
+  const stmtDeleteAttentionActionsBySession = db.prepare("DELETE FROM attention_actions WHERE sessionId = ?");
   const stmtAttentionCounts = db.prepare(
     "SELECT sessionId, COUNT(*) as count FROM attention_items WHERE status = 'open' GROUP BY sessionId",
   );
+  const stmtDeleteAttentionItemsBySession = db.prepare("DELETE FROM attention_items WHERE sessionId = ?");
 
   function createSession(input: {
     id: string;
@@ -301,6 +306,20 @@ export function createStore(baseDir: string) {
 
   function setSessionExit(sessionId: string, exitCode: number | null, signal: number | null) {
     stmtSetSessionExit.run(exitCode, signal, Date.now(), sessionId);
+  }
+
+  const txDeleteSession = db.transaction((sessionId: string) => {
+    // Fully remove a FromYourPhone session from the local DB.
+    // This does NOT touch tool-native logs (Codex/Claude/OpenCode).
+    stmtDeleteAttentionActionsBySession.run(sessionId);
+    stmtDeleteAttentionItemsBySession.run(sessionId);
+    stmtDeleteEvents.run(sessionId);
+    stmtDeleteOutput.run(sessionId);
+    stmtDeleteSession.run(sessionId);
+  });
+
+  function deleteSession(sessionId: string) {
+    txDeleteSession(sessionId);
   }
 
   function touchSession(sessionId: string) {
@@ -506,6 +525,7 @@ export function createStore(baseDir: string) {
 
   return {
     createSession,
+    deleteSession,
     listSessions,
     getSession,
     setSessionMeta,

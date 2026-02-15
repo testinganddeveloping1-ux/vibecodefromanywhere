@@ -1199,6 +1199,73 @@ main().catch(() => {});
     }));
   });
 
+  app.delete("/api/sessions/:id", async (req, reply) => {
+    const id = (req.params as any).id as string;
+    const sess = store.getSession(id);
+    if (!sess) return reply.code(404).send({ ok: false, error: "not_found" });
+
+    const st = sessions.getStatus(id);
+    if (st?.running) return reply.code(409).send({ ok: false, error: "running" });
+
+    // Remove from the in-memory session manager as well (frees PTY refs).
+    try {
+      sessions.forget(id);
+    } catch {
+      // ignore
+    }
+
+    // Flush any buffered output chunks for this session before deleting DB rows.
+    try {
+      flushOutput(id);
+    } catch {
+      // ignore
+    }
+
+    try {
+      store.deleteSession(id);
+    } catch (e: any) {
+      return reply.code(500).send({ ok: false, error: "delete_failed", message: String(e?.message ?? "delete_failed") });
+    }
+
+    // Close and forget session websockets, if any.
+    try {
+      const set = sockets.get(id);
+      if (set) {
+        for (const sock of set) {
+          try {
+            sock.close();
+          } catch {
+            // ignore
+          }
+        }
+      }
+      sockets.delete(id);
+    } catch {
+      // ignore
+    }
+
+    // Best-effort cleanup for memory caches.
+    try {
+      outputBuf.delete(id);
+      textBuf.delete(id);
+      assistState.delete(id);
+      lastPreview.delete(id);
+      lastPreviewBroadcast.delete(id);
+      lastInboxBroadcast.delete(id);
+      claudeHookSessions.delete(id);
+      for (const [sig, r] of claudeHookRequests.entries()) {
+        if (r.sessionId === id) claudeHookRequests.delete(sig);
+      }
+    } catch {
+      // ignore
+    }
+
+    broadcastGlobal({ type: "sessions.changed" });
+    broadcastGlobal({ type: "workspaces.changed" });
+    broadcastGlobal({ type: "inbox.changed", sessionId: id });
+    return { ok: true };
+  });
+
   app.post("/api/sessions", async (req, reply) => {
     const body = (req.body ?? {}) as any;
     const tool = body.tool as ToolId;

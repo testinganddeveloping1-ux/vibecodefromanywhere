@@ -640,7 +640,11 @@ export function App() {
     try {
       const rows = await api<SessionRow[]>("/api/sessions");
       setSessions(rows);
-      if (rows.length > 0) setActiveId((prev) => prev ?? rows[0]!.id);
+      // Keep the UI stable: if the current active session was deleted, fall back to the newest session (or none).
+      setActiveId((prev) => {
+        if (prev && rows.some((s) => s.id === prev)) return prev;
+        return rows.length > 0 ? rows[0]!.id : null;
+      });
     } catch {
       // ignore
     }
@@ -1082,6 +1086,28 @@ export function App() {
   }, [tab, activeId]);
 
   useEffect(() => {
+    if (tab !== "run") return;
+    if (activeId) return;
+
+    // If there is no active session (e.g. user deleted the last one), stop reconnect loops and close the socket.
+    if (sessionCtl.current.timer) clearTimeout(sessionCtl.current.timer);
+    sessionCtl.current.timer = null;
+    if (sessionCtl.current.ping) clearInterval(sessionCtl.current.ping);
+    sessionCtl.current.ping = null;
+    try {
+      ws.current?.close();
+    } catch {
+      // ignore
+    }
+    ws.current = null;
+    connectedSessionId.current = null;
+    setSessionWsState("closed");
+
+    dismissedAssistSig.current = "";
+    setTuiAssist(null);
+  }, [tab, activeId]);
+
+  useEffect(() => {
     // Swipe left/right on the terminal area to switch pinned sessions.
     // This keeps the UI fast and uncluttered on mobile.
     if (tab !== "run") return;
@@ -1266,6 +1292,57 @@ export function App() {
     }
     setEvents([]);
     setTab("run");
+  }
+
+  async function removeSession(sessionId: string) {
+    const sess = sessions.find((s) => s.id === sessionId) ?? null;
+    if (!sess) return;
+    if (sess.running) {
+      setToast("Session is running. Kill it first.");
+      return;
+    }
+
+    const label = sess.label || sess.profileId || sessionId.slice(0, 8);
+    const ok = window.confirm(
+      `Remove session "${label}"?\n\nThis deletes the FromYourPhone record (terminal replay + inbox items). It does NOT delete ${sess.tool} chat logs stored by the tool.`,
+    );
+    if (!ok) return;
+
+    // Optimistic UI so it disappears immediately.
+    const remaining = sessions.filter((s) => s.id !== sessionId);
+    setSessions(remaining);
+    setWorkspaces((prev) =>
+      prev.map((w) => ({
+        ...w,
+        sessions: (w.sessions ?? []).filter((s) => s.id !== sessionId),
+      })),
+    );
+    setInbox((prev) => prev.filter((it) => it.sessionId !== sessionId));
+    try {
+      delete pendingInputBySession.current[sessionId];
+    } catch {
+      // ignore
+    }
+
+    // If the removed session was active, switch immediately to avoid reconnect loops.
+    if (activeIdRef.current === sessionId) {
+      const next = remaining[0]?.id ?? null;
+      activeIdRef.current = next;
+      setActiveId(next);
+    }
+
+    setShowControls(false);
+
+    try {
+      await api(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+      setToast("Session removed");
+    } catch (e: any) {
+      setToast(typeof e?.message === "string" ? e.message : "remove failed");
+    } finally {
+      refreshSessions();
+      refreshWorkspaces();
+      refreshInbox({ workspaceKey: selectedWorkspaceKeyRef.current });
+    }
   }
 
   async function sendControl(type: "interrupt" | "stop" | "kill") {
@@ -3263,7 +3340,7 @@ export function App() {
 	                    Save
 	                  </button>
 	                  <button className="btn ghost" onClick={() => setLabelDraft("")}>
-	                    Clear
+	                    Clear label
 	                  </button>
 	                </div>
 	                <div className="help">Labels show on pinned slots and in the Workspace list.</div>
@@ -3319,6 +3396,16 @@ export function App() {
 	                  </button>
 	                  <button
 	                    className="btn danger"
+	                    disabled={!activeSession?.id || Boolean(activeSession?.running)}
+	                    onClick={() => {
+	                      if (!activeSession?.id) return;
+	                      removeSession(activeSession.id);
+	                    }}
+	                  >
+	                    Remove session
+	                  </button>
+	                  <button
+	                    className="btn danger"
 	                    onClick={() => {
 	                      sendControl("kill");
 	                      setShowControls(false);
@@ -3327,7 +3414,7 @@ export function App() {
 	                    Kill
 	                  </button>
 	                </div>
-	                <div className="help">Ctrl+C sends SIGINT. Kill sends SIGKILL to the tool process.</div>
+	                <div className="help">Ctrl+C sends SIGINT. Kill sends SIGKILL. Remove deletes this FromYourPhone session from local history.</div>
 	              </div>
             </div>
           </div>

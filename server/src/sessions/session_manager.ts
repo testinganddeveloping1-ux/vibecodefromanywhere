@@ -88,6 +88,23 @@ export class SessionManager {
     return this.sessions.get(id)?.status ?? null;
   }
 
+  forget(id: string): void {
+    const sess = this.sessions.get(id);
+    if (!sess) return;
+    try {
+      sess.outputListeners.clear();
+      sess.exitListeners.clear();
+    } catch {
+      // ignore
+    }
+    try {
+      sess.pty.kill();
+    } catch {
+      // ignore
+    }
+    this.sessions.delete(id);
+  }
+
   onOutput(id: string, fn: (chunk: string) => void): () => void {
     const sess = this.must(id);
     sess.outputListeners.add(fn);
