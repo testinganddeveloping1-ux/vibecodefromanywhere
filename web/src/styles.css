@@ -1152,12 +1152,6 @@ pre.mdCode[data-lang]::before {
   font-size: 13px;
   font-weight: 700;
 }
-.doctorBadges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: var(--sp-sm);
-}
 
 /* ---- Modals (Bottom Sheet) ---- */
 .modalOverlay {

@@ -2244,9 +2244,6 @@ export function App() {
                   })}
                 </div>
               </div>
-              <div className="row">
-                <div className="help mono">{selectedWorkspaceKey ?? ""}</div>
-              </div>
               {(() => {
 	                const w = selectedWorkspaceKey ? workspaces.find((x) => x.key === selectedWorkspaceKey) ?? null : null;
 	                if (!w) return <div className="row"><div className="help">Pick a workspace to see sessions and worktrees.</div></div>;
@@ -2286,9 +2283,6 @@ export function App() {
 	                          }}
 	                        >
 	                          New Session Here
-	                        </button>
-	                        <button className="btn" onClick={() => setTab("inbox")}>
-	                          Inbox
 	                        </button>
 	                      </div>
 	                    </div>
@@ -3029,28 +3023,14 @@ export function App() {
                 <div className="doctorBox">
                   <div className="doctorTitle">codex</div>
                   <div className="mono muted">{doctor?.tools.codex.version ?? ""}</div>
-                  <div className="doctorBadges">
-                    <span className="chip">sandbox</span>
-                    <span className="chip">approvals</span>
-                    <span className="chip">--cd</span>
-                  </div>
                 </div>
                 <div className="doctorBox">
                   <div className="doctorTitle">claude</div>
                   <div className="mono muted">{doctor?.tools.claude.version ?? ""}</div>
-                  <div className="doctorBadges">
-                    <span className="chip">permission-mode</span>
-                    <span className="chip">skip-perms</span>
-                  </div>
                 </div>
                 <div className="doctorBox">
                   <div className="doctorTitle">opencode</div>
                   <div className="mono muted">{doctor?.tools.opencode.version ?? ""}</div>
-                  <div className="doctorBadges">
-                    <span className="chip">--agent</span>
-                    <span className="chip">serve</span>
-                    <span className="chip">web</span>
-                  </div>
                 </div>
               </div>
               <div className="help">
