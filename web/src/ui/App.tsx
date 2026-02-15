@@ -25,7 +25,7 @@ import { HeaderBar } from "./components/HeaderBar";
 import { ConnectingScreen, UnlockScreen } from "./components/LoginScreens";
 import { BottomNav } from "./components/BottomNav";
 import { PinnedSlotsBar } from "./components/PinnedSlotsBar";
-import { HistoryBar } from "./components/HistoryBar";
+
 import { TerminalAssistOverlay } from "./components/TerminalAssistOverlay";
 import { CodexNativeThreadView } from "./components/CodexNativeThreadView";
 import { ToolChip } from "./components/ToolChip";
@@ -1964,82 +1964,51 @@ export function App() {
       <main className="stage">
         <section className="viewRun" hidden={tab !== "run"} aria-hidden={tab !== "run"}>
           {!activeId ? (
-            <div className="empty">
-              <div className="emptyTitle">No active session</div>
-              <div className="emptySub">Start a new session to see the terminal here.</div>
-              <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-                <button className="btn primary" onClick={() => setTab("new")}>
-                  New Session
-                </button>
-                <button className="btn ghost" onClick={() => setTab("workspace")}>
-                  Projects
-                </button>
+            <div className="emptyRun">
+              <div className="emptyRunIcon">
+                <svg viewBox="0 0 24 24" width="40" height="40"><polyline points="4 17 10 11 4 5" stroke="var(--faint)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" fill="none"/><line x1="12" y1="19" x2="20" y2="19" stroke="var(--faint)" strokeWidth="1.8" strokeLinecap="round"/></svg>
               </div>
+              <div className="emptyTitle">No active session</div>
+              <div className="emptySub">Tap below to start</div>
+              <button className="btn primary" onClick={() => setTab("new")} style={{ marginTop: 8 }}>
+                New Session
+              </button>
             </div>
           ) : (
             <div className="run">
-              <PinnedSlotsBar
-                slots={slotCfg.slots}
-                activeId={activeId}
-                pinnedBySlot={pinnedBySlot}
-                onOpenSession={openSession}
-                onOpenWorkspace={() => setTab("workspace")}
-                onTogglePin={togglePin}
-              />
-              <div className="runBar">
+              <div className="runStrip">
+                <PinnedSlotsBar
+                  slots={slotCfg.slots}
+                  activeId={activeId}
+                  pinnedBySlot={pinnedBySlot}
+                  onOpenSession={openSession}
+                />
                 <div className="runInfo">
                   <div className={`dot ${activeSession?.running ? "dotOn" : "dotOff"}`}>
                     {activeSession?.running ? "RUN" : "IDLE"}
                   </div>
-                  <span className="mono" style={{ fontSize: 12, color: "var(--ink2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
+                  <span className="mono runLabel">
                     {activeSession?.label || activeSession?.profileId || ""}
                   </span>
                   {sessionWsState !== "open" ? (
                     <span className="chip mono">
-                      {sessionWsState === "connecting" ? "reconnecting" : "disconnected"}
+                      {sessionWsState === "connecting" ? "..." : "off"}
                     </span>
                   ) : null}
                   {activeInboxCount > 0 ? (
-                    <button className="btn primary" style={{ padding: "4px 10px", minHeight: 28, fontSize: 11 }} onClick={() => { refreshInbox({ workspaceKey: activeWorkspaceKey }); setTab("inbox"); }}>
-                      {activeInboxCount} pending
+                    <button className="runAlert" onClick={() => { refreshInbox({ workspaceKey: activeWorkspaceKey }); setTab("inbox"); }}>
+                      {activeInboxCount}
                     </button>
                   ) : null}
-	                </div>
-	                <div className="runBtns">
-	                  <button className="btn" onClick={() => sendControl("interrupt")}>Ctrl+C</button>
-	                  {!activeIsCodexNative ? (
-	                    <button
-	                      className="btn"
-	                      onClick={() => {
-	                        const t = activeSession?.tool ?? null;
-	                        const sid = String(activeSession?.toolSessionId ?? "");
-	                        if ((t !== "codex" && t !== "claude") || !sid) {
-	                          setToast("Chat history not linked yet");
-	                          return;
-	                        }
-	                        openToolChat(t, sid);
-	                      }}
-	                    >
-	                      Chat
-	                    </button>
-	                  ) : (
-	                    <button
-	                      className="btn"
-	                      onClick={() => {
-	                        const threadId = String(activeSession?.toolSessionId ?? "");
-	                        if (!threadId) {
-	                          setToast("No thread id");
-	                          return;
-	                        }
-	                        void loadCodexNativeThread(threadId);
-	                      }}
-	                    >
-	                      Reload
-	                    </button>
-	                  )}
-	                  <button className="btn ghost" onClick={() => setShowControls(true)}>More</button>
-	                </div>
-	              </div>
+                  <div className="spacer" />
+                  <button className="runBtn" onClick={() => sendControl("interrupt")} aria-label="Ctrl+C">
+                    <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM5 5l6 6M11 5l-6 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/></svg>
+                  </button>
+                  <button className="runBtn" onClick={() => setShowControls(true)} aria-label="More">
+                    <svg viewBox="0 0 16 16" width="14" height="14"><circle cx="3" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="13" cy="8" r="1.3" fill="currentColor"/></svg>
+                  </button>
+                </div>
+              </div>
 
               {activeAttention ? (
                 <div className={`attentionCard attention${activeAttention.severity}`}>
@@ -2097,13 +2066,12 @@ export function App() {
                 )}
               </div>
 
-              <HistoryBar events={events} />
-
               <div className="compose">
                 <textarea
                   value={composer}
                   onChange={(e) => setComposer(e.target.value)}
-                  placeholder="Message... (Enter to send, Shift+Enter for newline)"
+                  placeholder="Message..."
+                  rows={1}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
@@ -2111,8 +2079,8 @@ export function App() {
                     }
                   }}
                 />
-                <button className="btn primary" onClick={sendText}>
-                  Send
+                <button className="composeSend" onClick={sendText} aria-label="Send">
+                  <svg viewBox="0 0 20 20" width="18" height="18"><path d="M3 10l14-7-7 14v-7H3z" fill="currentColor"/></svg>
                 </button>
               </div>
             </div>
@@ -2125,24 +2093,20 @@ export function App() {
               <div className="cardHead">
                 <div>
                   <div className="cardTitle">Projects</div>
-                  <div className="cardSub">Your workspaces and active sessions.</div>
                 </div>
                 <button className="btn ghost" onClick={refreshWorkspaces}>
                   Refresh
                 </button>
               </div>
               <div className="row">
-                <div className="field">
-                  <label>Find Workspace</label>
-                  <input
-                    value={workspaceQuery}
-                    onChange={(e) => setWorkspaceQuery(e.target.value)}
-                    placeholder="Search paths..."
-                    autoCapitalize="none"
-                    autoCorrect="off"
-                  />
-                  <div className="help">Tap a workspace to open its trees + sessions below.</div>
-                </div>
+                <input
+                  value={workspaceQuery}
+                  onChange={(e) => setWorkspaceQuery(e.target.value)}
+                  placeholder="Search workspaces..."
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  className="searchInput"
+                />
               </div>
               <div className="row" style={{ padding: 0 }}>
                 <div className="list">
@@ -2482,14 +2446,10 @@ export function App() {
               <div className="cardHead">
                 <div>
                   <div className="cardTitle">Inbox</div>
-                  <div className="cardSub">Approvals and questions that need your touch.</div>
                 </div>
-                <button className="btn" onClick={() => refreshInbox({ workspaceKey: selectedWorkspaceKey })}>
+                <button className="btn ghost" onClick={() => refreshInbox({ workspaceKey: selectedWorkspaceKey })}>
                   Refresh
                 </button>
-              </div>
-              <div className="row">
-                <div className="help">Showing open items {selectedWorkspaceKey ? "for this workspace" : "(all)"}.</div>
               </div>
               <div className="row" style={{ padding: 0 }}>
                 <div className="list">
@@ -2544,10 +2504,9 @@ export function App() {
               <div className="cardHead">
                 <div>
                   <div className="cardTitle">New Session</div>
-                  <div className="cardSub">Pick a tool, profile, and workspace to begin.</div>
                 </div>
                 <button className="btn ghost" onClick={() => setAdvanced((v) => !v)}>
-                  {advanced ? "Hide Options" : "Options"}
+                  {advanced ? "Less" : "More"}
                 </button>
               </div>
 
@@ -2646,35 +2605,36 @@ export function App() {
                       ))}
                     </div>
                   ) : null}
-                  <div className="chipsRow" style={{ marginTop: 10, justifyContent: "space-between" }}>
-                    <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                      <label className="toggle" style={{ margin: 0 }}>
-                        <input type="checkbox" checked={autoPreset} onChange={(e) => setAutoPreset(e.target.checked)} />
-                        <span className="muted">Auto defaults</span>
-                      </label>
-                      <label className="toggle" style={{ margin: 0 }}>
-                        <input type="checkbox" checked={savePreset} onChange={(e) => setSavePreset(e.target.checked)} />
-                        <span className="muted">Save defaults</span>
-                      </label>
-                    </div>
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <button
-                        className="btn"
-                        onClick={() => {
-                          const p = workspacePreset;
-                          if (!p) {
-                            setPresetMsg("No saved defaults for this workspace");
-                            return;
-                          }
-                          applyPresetNow(p);
-                        }}
-                      >
-                        Apply Defaults
-                      </button>
-                    </div>
-                  </div>
-                  {presetMsg ? <div className="help mono">{presetMsg}</div> : null}
-                  <div className="help">Codex uses `--cd`. OpenCode uses the positional project path.</div>
+                  {advanced ? (
+                    <>
+                      <div className="chipsRow" style={{ marginTop: 10, justifyContent: "space-between" }}>
+                        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                          <label className="toggle" style={{ margin: 0 }}>
+                            <input type="checkbox" checked={autoPreset} onChange={(e) => setAutoPreset(e.target.checked)} />
+                            <span className="muted">Auto defaults</span>
+                          </label>
+                          <label className="toggle" style={{ margin: 0 }}>
+                            <input type="checkbox" checked={savePreset} onChange={(e) => setSavePreset(e.target.checked)} />
+                            <span className="muted">Save defaults</span>
+                          </label>
+                        </div>
+                        <button
+                          className="btn"
+                          onClick={() => {
+                            const p = workspacePreset;
+                            if (!p) {
+                              setPresetMsg("No saved defaults for this workspace");
+                              return;
+                            }
+                            applyPresetNow(p);
+                          }}
+                        >
+                          Apply
+                        </button>
+                      </div>
+                      {presetMsg ? <div className="help mono">{presetMsg}</div> : null}
+                    </>
+                  ) : null}
                 </div>
               </div>
 

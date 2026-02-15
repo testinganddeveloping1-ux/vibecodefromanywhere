@@ -21,20 +21,15 @@ export function HeaderBar(props: {
     <header className="hdr">
       <div className="hdrLeft">
         <div className="logo">FYP</div>
-        <div className="hdrText">
-          <div className="hdrTitle">FromYourPhone</div>
-          <div className="hdrMeta">
-            <span className={`chip ${chipOn ? "chipOn" : ""}`}>{status}</span>
-            {props.activeSession ? <span className="chip mono" style={{ fontSize: 10 }}>{props.activeSession.tool}</span> : null}
-          </div>
-        </div>
+        <span className={`chip ${chipOn ? "chipOn" : ""}`}>{status}</span>
+        {props.activeSession ? <span className="chip mono" style={{ fontSize: 10 }}>{props.activeSession.tool}</span> : null}
       </div>
       <div className="hdrRight">
         <button
           className="btn ghost"
           onClick={props.onOpenSettings}
           aria-label="Settings"
-          style={{ padding: "8px 10px" }}
+          style={{ padding: "6px 8px" }}
         >
           <IconSettings />
         </button>
