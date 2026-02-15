@@ -3248,6 +3248,16 @@ export function App() {
                   <div className="mono muted">{doctor?.tools.opencode.version ?? ""}</div>
                 </div>
               </div>
+              {doctor?.app?.version ? (
+                <div className="help mono" style={{ wordBreak: "break-all" }}>
+                  App: {doctor.app.name ?? "fromyourphone"}@{doctor.app.version} · node {doctor.process?.node ?? ""} · pid {doctor.process?.pid ?? ""}
+                </div>
+              ) : null}
+              {doctor?.app?.webRoot ? (
+                <div className="help mono" style={{ wordBreak: "break-all" }}>
+                  Web: {doctor.app.webRoot}
+                </div>
+              ) : null}
               <div className="help">
                 Allowed workspace roots: <span className="mono">{(doctor?.workspaceRoots ?? []).join(", ")}</span>
               </div>

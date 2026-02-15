@@ -324,6 +324,13 @@ main().catch(() => {});
   // Serve UI assets from dist no matter what directory the server is launched from.
   // When compiled, this file lives at `dist/server/app.js`, so `../web` is `dist/web`.
   const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const appRoot = path.resolve(moduleDir, "..", "..");
+  let appPkg: any = null;
+  try {
+    appPkg = JSON.parse(fs.readFileSync(path.join(appRoot, "package.json"), "utf8"));
+  } catch {
+    appPkg = null;
+  }
   const webRootCandidates = [
     path.join(moduleDir, "..", "web"),
     path.join(process.cwd(), "dist", "web"),
@@ -1125,6 +1132,20 @@ main().catch(() => {});
     return {
       ok: true,
       scannedAt: caps.scannedAt,
+      app: {
+        name: typeof appPkg?.name === "string" ? appPkg.name : null,
+        version: typeof appPkg?.version === "string" ? appPkg.version : null,
+        root: appRoot,
+        moduleDir,
+        webRoot,
+      },
+      process: {
+        pid: process.pid,
+        cwd: process.cwd(),
+        node: process.version,
+        platform: process.platform,
+        arch: process.arch,
+      },
       tools: caps,
       store: store.doctor(),
       workspaceRoots: roots,
@@ -1136,6 +1157,20 @@ main().catch(() => {});
     return {
       ok: true,
       scannedAt: caps.scannedAt,
+      app: {
+        name: typeof appPkg?.name === "string" ? appPkg.name : null,
+        version: typeof appPkg?.version === "string" ? appPkg.version : null,
+        root: appRoot,
+        moduleDir,
+        webRoot,
+      },
+      process: {
+        pid: process.pid,
+        cwd: process.cwd(),
+        node: process.version,
+        platform: process.platform,
+        arch: process.arch,
+      },
       tools: caps,
       store: store.doctor(),
       workspaceRoots: roots,

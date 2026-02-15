@@ -77,6 +77,20 @@ export type ToolSessionSummary = {
 export type ToolSessionMessage = { role: "user" | "assistant"; ts: number; text: string };
 
 export type Doctor = {
+  app?: {
+    name: string | null;
+    version: string | null;
+    root: string;
+    moduleDir: string;
+    webRoot: string;
+  };
+  process?: {
+    pid: number;
+    cwd: string;
+    node: string;
+    platform: string;
+    arch: string;
+  };
   tools: {
     codex: { sandboxModes: string[]; approvalPolicies: string[]; supports: any; version?: string };
     claude: { permissionModes: string[]; supports: any; version?: string };

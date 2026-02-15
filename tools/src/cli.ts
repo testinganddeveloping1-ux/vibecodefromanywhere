@@ -75,6 +75,7 @@ Commands:
   start        Start the server (dev-friendly)
   stop         Stop the running server (best-effort)
   status       Show whether the server is running
+  doctor       Print install + server diagnostics
   config       Print config path
 `);
 }
@@ -97,6 +98,36 @@ async function main() {
   const cmd = process.argv[2] ?? "start";
   if (cmd === "config") {
     console.log(configPath());
+    return;
+  }
+  if (cmd === "doctor") {
+    const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+    const distServer = path.join(moduleDir, "server", "index.js"); // dist/cli.js -> dist/server/index.js
+    console.log("FromYourPhone diagnostics\n");
+    console.log("CLI:      " + fileURLToPath(import.meta.url));
+    console.log("Server:   " + distServer + (fs.existsSync(distServer) ? "" : " (missing)"));
+    console.log("Config:   " + configPath() + (fs.existsSync(configPath()) ? "" : " (missing)"));
+
+    if (!fs.existsSync(configPath())) return;
+    const cfg = readConfig();
+    const running = await probeExistingServer(cfg);
+    const { host, port, url } = getAdminUrl(cfg);
+    console.log("");
+    console.log("Running:  " + (running ? "yes" : "no"));
+    console.log("Listen:   http://" + host + ":" + port);
+    console.log("Admin:    " + url);
+
+    if (!running) return;
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/api/doctor`, { headers: { authorization: `Bearer ${String(cfg?.auth?.token ?? "")}` } });
+      const j = (await r.json().catch(() => null)) as any;
+      if (j && typeof j === "object") {
+        console.log("");
+        console.log(JSON.stringify({ app: j.app ?? null, process: j.process ?? null, tools: j.tools ?? null, workspaceRoots: j.workspaceRoots ?? null }, null, 2));
+      }
+    } catch {
+      // ignore
+    }
     return;
   }
   if (cmd === "status") {
