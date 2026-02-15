@@ -341,16 +341,24 @@ main().catch(() => {});
       root: webRoot,
       prefix: "/",
       decorateReply: false,
+      // We set Cache-Control manually in `setHeaders` so `index.html` can't go stale
+      // and "blank screen after update" is avoided. fastify-static otherwise sets
+      // cache-control after `setHeaders`, overwriting our values.
+      cacheControl: false,
       setHeaders: (res, filePath) => {
         try {
-          const p = String(filePath ?? "");
+          const pRaw = String(filePath ?? "");
+          const p = pRaw.replaceAll("\\", "/");
+          // Default: behave like fastify-static's maxAge=0.
+          res.setHeader("cache-control", "public, max-age=0");
           // Avoid "blank screen after update" due to stale cached index.html pointing to old hashed assets.
-          if (p.endsWith(`${path.sep}index.html`)) {
+          // fastify-static may provide either absolute or relative paths here, so match both.
+          if (p === "index.html" || p.endsWith("/index.html")) {
             res.setHeader("cache-control", "no-store");
             return;
           }
           // Cache Vite-hashed assets aggressively.
-          if (p.includes(`${path.sep}assets${path.sep}`)) {
+          if (p.startsWith("assets/") || p.includes("/assets/")) {
             res.setHeader("cache-control", "public, max-age=31536000, immutable");
             return;
           }
