@@ -49,7 +49,7 @@ export async function buildApp(cfg: AppConfig): Promise<FastifyInstance> {
   await app.register(cookie);
 
   // Protect API + websocket only; UI assets can load and show the unlock screen.
-  addAuthGuard(app, cfg.token, { onlyPrefixes: ["/api", "/ws"], exceptPrefixes: ["/api/auth/pair/claim"] });
+  addAuthGuard(app, cfg.token, { onlyPrefixes: ["/api", "/ws"], exceptPrefixes: ["/api/auth/pair/claim", "/api/auth/logout"] });
 
   const baseDir = cfg.dataDir ?? configDir();
   const hookBaseUrl = cfg.hookBaseUrl ?? `http://127.0.0.1:7337`;
@@ -977,6 +977,17 @@ main().catch(() => {});
     const scanStart = Math.max(0, lines.length - 34);
     for (let i = scanStart; i < lines.length; i++) parseOptionLine(lines[i]!);
 
+    // "Type/Reply with CODE ..." confirmation prompts.
+    // Codex sometimes asks for an explicit code instead of a (Y/N) hotkey.
+    const tailText = lines.slice(scanStart).join("\n");
+    const codeRe =
+      /\b(?:reply\s+with|type)\s+([A-Za-z0-9]{4,12})\b(?:\s+(?:only|to\s+(?:continue|proceed|confirm)|to\s+approve))?/i;
+    const mCode = tailText.match(codeRe);
+    if (mCode?.[1]) {
+      const code = String(mCode[1]).trim();
+      if (code) pushOpt(code + "\r", `Reply ${code}`);
+    }
+
     // Also surface common navigation hints as single-tap buttons when they appear in the text.
     // Keep this conservative to avoid showing the overlay during normal terminal output.
     const lowTail = lines.slice(scanStart).join("\n").toLowerCase();
@@ -1044,10 +1055,18 @@ main().catch(() => {});
     // - Codex may resume an existing session log whose *createdAt* is older than this FYP session.
     //   In that case, the session is still "new" to us if the log is being written now.
     // - We also re-trigger linking on first input (HTTP/WS) in case the log appears late.
-    const maxAttempts = 10;
+    // Codex may create/update its session log a few seconds after spawning,
+    // especially on slower disks or when resuming an existing session.
+    const maxAttempts = 32;
     const baseDelayMs = 250;
-    const stepMs = 450;
+    const stepMs = 650;
     const normCwd = path.resolve(cwd);
+    let normCwdReal = "";
+    try {
+      normCwdReal = fs.realpathSync(normCwd);
+    } catch {
+      normCwdReal = "";
+    }
     if (codexToolSessionLinkInFlight.has(fypSessionId)) return;
     codexToolSessionLinkInFlight.add(fypSessionId);
 
@@ -1073,9 +1092,20 @@ main().catch(() => {});
             return;
           }
 
+          const matchCwd = (p: string): boolean => {
+            const resolved = path.resolve(p);
+            if (resolved === normCwd) return true;
+            if (!normCwdReal) return false;
+            try {
+              return fs.realpathSync(resolved) === normCwdReal;
+            } catch {
+              return false;
+            }
+          };
+
           const items = toolIndex
             .list({ refresh: true })
-            .filter((s) => s.tool === "codex" && path.resolve(s.cwd) === normCwd)
+            .filter((s) => s.tool === "codex" && matchCwd(s.cwd))
             .sort((a, b) => b.updatedAt - a.updatedAt);
 
           const cutoff = createdAt - 12_000;
@@ -1118,6 +1148,18 @@ main().catch(() => {});
   app.post("/api/auth/pair/start", async () => {
     const rec = pairing.start();
     return { ok: true, code: rec.code, expiresAt: rec.expiresAt };
+  });
+
+  // Clear the auth cookie on this device (useful for debugging or changing hosts).
+  // No auth required because it only removes access, it doesn't grant access.
+  app.post("/api/auth/logout", async (_req, reply) => {
+    reply.setCookie("fyp_token", "", {
+      httpOnly: true,
+      sameSite: "lax",
+      path: "/",
+      maxAge: 0,
+    });
+    return { ok: true };
   });
 
   // No auth required. Exchange a short-lived code for the httpOnly cookie.

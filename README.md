@@ -8,7 +8,7 @@ Self-hosted phone UI that lets you run **OpenCode**, **Codex CLI**, or **Claude 
 - See full terminal rendering (ANSI) + input/action history
 - Browse tool-native sessions (Codex/Claude) with chat history + resume/fork
 
-## Quick Start (LAN)
+## Quick Start (Local)
 
 ### Option A: No Git (Fastest)
 
@@ -32,12 +32,19 @@ cd vibecodefromanywhere
 fromyourphone start
 ```
 
-It prints:
+By default it binds to `127.0.0.1` (local-only) and prints a local admin link (token).
 
-- An **admin** QR/link that includes the token (works immediately).
-- A **pair** QR/link (no token) that sets an `httpOnly` cookie on the phone after you scan it.
+For phone access on the same WiFi/LAN, start with:
 
-Open it on your phone while on the same WiFi.
+```bash
+fromyourphone start --lan
+```
+
+In `--lan` mode it prints:
+- A **pair** QR/link (recommended, no token) that sets an `httpOnly` cookie on the phone after you scan it.
+- A **token** admin link (fallback, long).
+
+If you want a token QR too, set `FYP_SHOW_TOKEN_QR=1` before starting.
 
 ## Quick Start (Encrypted, Remote)
 

@@ -71,7 +71,9 @@ export function configPath(): string {
 
 export function defaultConfig(): Config {
   return {
-    server: { bind: "0.0.0.0", port: 7337 },
+    // Secure-by-default: bind locally. Use `fromyourphone start --lan` (or edit config.toml)
+    // to expose on your LAN, or use Tailscale/Cloudflared for encrypted access.
+    server: { bind: "127.0.0.1", port: 7337 },
     auth: { token: nanoid(48) },
     workspaces: { roots: [os.homedir()] },
     tools: {
@@ -83,21 +85,21 @@ export function defaultConfig(): Config {
       "codex.default": {
         tool: "codex",
         title: "Codex: Default",
-        codex: { noAltScreen: true },
+        codex: { sandbox: "read-only", askForApproval: "on-request", noAltScreen: true },
         startup: [],
         sendSuffix: "\r",
       },
       "codex.plan": {
         tool: "codex",
         title: "Codex: Plan",
-        codex: { noAltScreen: true },
+        codex: { sandbox: "read-only", askForApproval: "on-request", noAltScreen: true },
         startup: [{ type: "text", text: "/plan\r" }],
         sendSuffix: "\r",
       },
       "codex.full_auto": {
         tool: "codex",
         title: "Codex: Full Auto (Workspace)",
-        codex: { fullAuto: true, noAltScreen: true },
+        codex: { sandbox: "workspace-write", fullAuto: true, noAltScreen: true },
         startup: [],
         sendSuffix: "\r",
       },
@@ -176,12 +178,26 @@ export function stringifyConfigToml(cfg: Config): string {
 
 export async function loadOrCreateConfig(): Promise<Config> {
   const p = configPath();
+  let cfg: Config;
   if (!fs.existsSync(p)) {
     fs.mkdirSync(configDir(), { recursive: true });
-    const cfg = defaultConfig();
+    cfg = defaultConfig();
     fs.writeFileSync(p, stringifyConfigToml(cfg), "utf8");
-    return cfg;
+  } else {
+    const raw = fs.readFileSync(p, "utf8");
+    cfg = parseConfigToml(raw);
   }
-  const raw = fs.readFileSync(p, "utf8");
-  return parseConfigToml(raw);
+
+  // Runtime-only overrides (do not mutate config.toml).
+  // Useful for `fromyourphone start --lan` without weakening the default config.
+  const bindOverride = typeof process.env.FYP_BIND === "string" ? process.env.FYP_BIND.trim() : "";
+  if (bindOverride) cfg.server.bind = bindOverride;
+
+  const portOverride = typeof process.env.FYP_PORT === "string" ? process.env.FYP_PORT.trim() : "";
+  if (portOverride) {
+    const n = Number(portOverride);
+    if (Number.isFinite(n) && n > 0 && n < 65536) cfg.server.port = Math.floor(n);
+  }
+
+  return cfg;
 }

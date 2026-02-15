@@ -34,7 +34,28 @@ export function UnlockScreen(props: {
           </div>
           <div className="loginTitle">FromYourPhone</div>
         </div>
-        <div className="loginSub">Scan the QR code or paste the token from the host terminal.</div>
+        <div className="loginSub">Scan the Pair QR code (recommended) or paste the token from the host terminal.</div>
+
+        <div className="loginHint" style={{ marginTop: 8 }}>
+          Pair is easiest: scan the Pair QR from the host. You should only need this once per device.
+        </div>
+        <div className="loginActions" style={{ marginTop: 10 }}>
+          <input
+            value={props.pairCode}
+            onChange={(e) => props.setPairCode(e.target.value)}
+            placeholder="pair code (8 chars)"
+            autoCapitalize="characters"
+            autoCorrect="off"
+          />
+          <button className="btn" onClick={props.onPair}>
+            Pair
+          </button>
+        </div>
+        {props.pairMsg ? <div className="loginHint">{props.pairMsg}</div> : null}
+
+        <div className="loginHint" style={{ marginTop: 10 }}>
+          Fallback: paste the long token (printed on the host) to unlock.
+        </div>
         <input
           value={props.token}
           onChange={(e) => props.setToken(e.target.value)}
@@ -50,23 +71,8 @@ export function UnlockScreen(props: {
             Retry
           </button>
         </div>
-        <div className="loginHint">Or pair with a short code (from Settings on an already-auth'd device).</div>
-        <div className="loginActions" style={{ marginTop: 10 }}>
-          <input
-            value={props.pairCode}
-            onChange={(e) => props.setPairCode(e.target.value)}
-            placeholder="pair code (8 chars)"
-            autoCapitalize="characters"
-            autoCorrect="off"
-          />
-          <button className="btn" onClick={props.onPair}>
-            Pair
-          </button>
-        </div>
-        {props.pairMsg ? <div className="loginHint">{props.pairMsg}</div> : null}
-        <div className="loginHint">Token is stored as an httpOnly cookie after first use.</div>
+        <div className="loginHint">After first unlock/pair, your device stores an httpOnly cookie so you usually will not be asked again.</div>
       </div>
     </div>
   );
 }
-

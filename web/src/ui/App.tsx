@@ -102,15 +102,20 @@ export function App() {
     return raw === "1" || raw === "true" || raw === "yes";
   });
 
-  const [codexOpt, setCodexOpt] = useState({
-    transport: "codex-app-server",
-    sandbox: "",
-    askForApproval: "",
-    fullAuto: false,
-    bypassApprovalsAndSandbox: false,
-    search: false,
-    noAltScreen: true,
-    addDirText: "",
+  const [codexOpt, setCodexOpt] = useState(() => {
+    const rawTransport = lsGet("fyp_codex_transport");
+    const transport =
+      rawTransport === "pty" || rawTransport === "codex-app-server" ? rawTransport : "codex-app-server";
+    return {
+      transport,
+      sandbox: "",
+      askForApproval: "",
+      fullAuto: false,
+      bypassApprovalsAndSandbox: false,
+      search: false,
+      noAltScreen: true,
+      addDirText: "",
+    };
   });
   const [claudeOpt, setClaudeOpt] = useState({
     permissionMode: "",
@@ -219,8 +224,8 @@ export function App() {
   });
   const [lineHeight, setLineHeight] = useState<number>(() => {
     const v = lsGet("fyp_lh");
-    const n = v ? Number(v) : 1.32;
-    return Number.isFinite(n) ? Math.min(1.6, Math.max(1.1, n)) : 1.32;
+    const n = v ? Number(v) : 1.4;
+    return Number.isFinite(n) ? Math.min(1.6, Math.max(1.1, n)) : 1.4;
   });
 
   const orderedProfiles = useMemo(() => {
@@ -308,6 +313,8 @@ export function App() {
           selectionForeground: "#eaf0fa",
         },
         scrollback: 8000,
+        allowTransparency: true,
+        rightClickSelectsWord: false,
       });
       const f = new FitAddon();
       t.loadAddon(f);
@@ -324,7 +331,10 @@ export function App() {
       // Make the terminal interactive: forward keystrokes to the remote PTY.
       t.onData((data) => {
         if (!ws.current || ws.current.readyState !== WebSocket.OPEN || !connectedSessionId.current) return;
-        ws.current.send(JSON.stringify({ type: "input", text: data }));
+        // Filter out focus tracking sequences which can confuse some TUIs.
+        const filtered = String(data ?? "").replace(/\x1b\[\[?[IO]/g, "");
+        if (!filtered) return;
+        ws.current.send(JSON.stringify({ type: "input", text: filtered }));
       });
 
       roRef.current?.disconnect();
@@ -525,7 +535,11 @@ export function App() {
 
       setCodexOpt((p) => ({
         ...p,
-        sandbox: d.tools.codex.sandboxModes?.includes("workspace-write") ? "workspace-write" : (d.tools.codex.sandboxModes?.[0] ?? ""),
+        sandbox: d.tools.codex.sandboxModes?.includes("read-only")
+          ? "read-only"
+          : d.tools.codex.sandboxModes?.includes("workspace-write")
+            ? "workspace-write"
+            : (d.tools.codex.sandboxModes?.[0] ?? ""),
         askForApproval: d.tools.codex.approvalPolicies?.includes("on-request") ? "on-request" : (d.tools.codex.approvalPolicies?.[0] ?? ""),
       }));
       setClaudeOpt((p) => ({
@@ -534,6 +548,16 @@ export function App() {
       }));
     })();
   }, [authed]);
+
+  useEffect(() => {
+    // Persist the user's preferred Codex transport (Native vs Terminal).
+    // This is especially important on mobile where the default should be stable.
+    try {
+      lsSet("fyp_codex_transport", String((codexOpt as any).transport ?? "codex-app-server"));
+    } catch {
+      // ignore
+    }
+  }, [String((codexOpt as any).transport ?? "")]);
 
   useEffect(() => {
     if (authed !== "yes") return;
@@ -848,6 +872,37 @@ export function App() {
   }, [tab, activeId]);
 
   useEffect(() => {
+    // Mobile browsers (esp. iOS) often change the visual viewport when the address bar or keyboard
+    // appears. ResizeObserver doesn't always fire in those cases, so we explicitly refit xterm.
+    const onResize = () => {
+      try {
+        fit.current?.fit();
+        const cols = term.current?.cols;
+        const rows = term.current?.rows;
+        if (!cols || !rows || !ws.current || ws.current.readyState !== WebSocket.OPEN || !connectedSessionId.current) return;
+        ws.current.send(JSON.stringify({ type: "resize", cols, rows }));
+      } catch {
+        // ignore
+      }
+    };
+
+    window.addEventListener("resize", onResize, { passive: true } as any);
+    window.addEventListener("orientationchange", onResize, { passive: true } as any);
+    const vv: any = (window as any).visualViewport;
+    if (vv && typeof vv.addEventListener === "function") {
+      vv.addEventListener("resize", onResize, { passive: true } as any);
+    }
+
+    return () => {
+      window.removeEventListener("resize", onResize as any);
+      window.removeEventListener("orientationchange", onResize as any);
+      if (vv && typeof vv.removeEventListener === "function") {
+        vv.removeEventListener("resize", onResize as any);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (tab !== "run") return;
     if (!activeId) return;
     let cancelled = false;
@@ -945,25 +1000,121 @@ export function App() {
     // Swipe left/right on the terminal area to switch pinned sessions.
     // This keeps the UI fast and uncluttered on mobile.
     if (tab !== "run") return;
+    if (activeIsCodexNative) return;
     const el = runSurfaceRef.current ?? termRef.current;
     if (!el) return;
+    let pointerId: number | null = null;
     let startX = 0;
     let startY = 0;
-    let active = false;
+    let lastY = 0;
+    let mode: "pending" | "scroll" | "swipe" = "pending";
+    let scrollRemainderPx = 0;
+
+    const linePx = () => Math.min(46, Math.max(10, fontSize * lineHeight));
+
+    const reset = () => {
+      pointerId = null;
+      mode = "pending";
+      scrollRemainderPx = 0;
+    };
+
     const onDown = (e: PointerEvent) => {
-      term.current?.focus();
       if (e.pointerType === "mouse") return;
-      active = true;
+      // Capture-phase listeners (see addEventListener options below) ensure we get touch input
+      // even if xterm attaches its own handlers and stops propagation.
+      try {
+        (el as any).setPointerCapture?.(e.pointerId);
+      } catch {
+        // ignore
+      }
+      pointerId = e.pointerId;
       startX = e.clientX;
       startY = e.clientY;
+      lastY = e.clientY;
+      mode = "pending";
+      scrollRemainderPx = 0;
+      // Prevent xterm selection on touch. We handle focus on tap in onUp.
+      try {
+        e.preventDefault();
+      } catch {
+        // ignore
+      }
+      try {
+        e.stopPropagation();
+      } catch {
+        // ignore
+      }
     };
+
+    const onMove = (e: PointerEvent) => {
+      if (e.pointerType === "mouse") return;
+      if (pointerId == null || e.pointerId !== pointerId) return;
+
+      const dxTotal = e.clientX - startX;
+      const dyTotal = e.clientY - startY;
+      const ax = Math.abs(dxTotal);
+      const ay = Math.abs(dyTotal);
+
+      if (mode === "pending") {
+        if (ay > 10 && ay > ax * 1.15) mode = "scroll";
+        else if (ax > 70 && ax > ay * 1.15) mode = "swipe";
+      }
+
+      if (mode !== "scroll") {
+        if (mode === "swipe") {
+          // Disable xterm selection while swiping between slots.
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        return;
+      }
+      // Disable xterm selection drag; we implement scrollback ourselves.
+      e.preventDefault();
+      e.stopPropagation();
+
+      const dy = e.clientY - lastY;
+      lastY = e.clientY;
+
+      const px = dy + scrollRemainderPx;
+      const lp = linePx();
+      const lines = Math.trunc(px / lp);
+      scrollRemainderPx = px - lines * lp;
+      if (!lines) return;
+      try {
+        // xterm: negative scrollLines => up (older), positive => down (newer)
+        term.current?.scrollLines(-lines);
+      } catch {
+        // ignore
+      }
+    };
+
     const onUp = (e: PointerEvent) => {
-      if (!active) return;
-      active = false;
+      if (e.pointerType === "mouse") return;
+      if (pointerId == null || e.pointerId !== pointerId) return;
+
       const dx = e.clientX - startX;
       const dy = e.clientY - startY;
-      if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
+      const ax = Math.abs(dx);
+      const ay = Math.abs(dy);
+      const wasTap = mode === "pending" && ax < 8 && ay < 8;
+      const wasSwipe = (mode === "swipe" || mode === "pending") && ax >= 60 && ax > ay * 1.2;
 
+      try {
+        (el as any).releasePointerCapture?.(e.pointerId);
+      } catch {
+        // ignore
+      }
+      reset();
+
+      if (wasTap) {
+        try {
+          term.current?.focus();
+        } catch {
+          // ignore
+        }
+      }
+
+      if (!wasSwipe) return;
       if (!activeId) return;
       if (pinnedOrder.length < 2) return;
       const idx = pinnedOrder.indexOf(activeId);
@@ -973,13 +1124,31 @@ export function App() {
       const id = pinnedOrder[next];
       if (id) openSession(id);
     };
-    el.addEventListener("pointerdown", onDown, { passive: true });
-    el.addEventListener("pointerup", onUp, { passive: true });
-    return () => {
-      el.removeEventListener("pointerdown", onDown);
-      el.removeEventListener("pointerup", onUp);
+
+    const onCancel = (e: PointerEvent) => {
+      if (e.pointerType === "mouse") return;
+      if (pointerId == null || e.pointerId !== pointerId) return;
+      try {
+        (el as any).releasePointerCapture?.(e.pointerId);
+      } catch {
+        // ignore
+      }
+      reset();
     };
-  }, [tab, activeId, pinnedOrder, slotCfg]);
+
+    // Capture phase is important: xterm attaches its own listeners, and we want
+    // touch gestures to stay consistent on iOS/Android.
+    el.addEventListener("pointerdown", onDown, { passive: false, capture: true });
+    el.addEventListener("pointermove", onMove, { passive: false, capture: true });
+    el.addEventListener("pointerup", onUp, { passive: false, capture: true });
+    el.addEventListener("pointercancel", onCancel, { passive: true, capture: true });
+    return () => {
+      el.removeEventListener("pointerdown", onDown, { capture: true } as any);
+      el.removeEventListener("pointermove", onMove, { capture: true } as any);
+      el.removeEventListener("pointerup", onUp, { capture: true } as any);
+      el.removeEventListener("pointercancel", onCancel, { capture: true } as any);
+    };
+  }, [tab, activeId, pinnedOrder, slotCfg, activeIsCodexNative, fontSize, lineHeight]);
 
   function backoffMs(attempt: number): number {
     const base = 140;
@@ -2004,6 +2173,31 @@ export function App() {
                   <button className="runBtn" onClick={() => sendControl("interrupt")} aria-label="Ctrl+C">
                     <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM5 5l6 6M11 5l-6 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/></svg>
                   </button>
+                  {!activeIsCodexNative && (activeSession?.tool === "codex" || activeSession?.tool === "claude") ? (
+                    <button
+                      className="runBtn"
+                      onClick={() => {
+                        const toolId = activeSession?.tool as any;
+                        const tid = typeof activeSession?.toolSessionId === "string" ? String(activeSession.toolSessionId) : "";
+                        if (!tid) {
+                          setToast("Chat history not linked yet");
+                          return;
+                        }
+                        openToolChat(toolId, tid, { refresh: true, limit: toolChatLimit });
+                      }}
+                      aria-label="Chat history"
+                    >
+                      <svg viewBox="0 0 16 16" width="14" height="14">
+                        <path
+                          d="M3 3.5h10v6H6.5L4 12V9.5H3v-6z"
+                          stroke="currentColor"
+                          strokeWidth="1.5"
+                          strokeLinejoin="round"
+                          fill="none"
+                        />
+                      </svg>
+                    </button>
+                  ) : null}
                   <button className="runBtn" onClick={() => setShowControls(true)} aria-label="More">
                     <svg viewBox="0 0 16 16" width="14" height="14"><circle cx="3" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="13" cy="8" r="1.3" fill="currentColor"/></svg>
                   </button>
@@ -2038,7 +2232,10 @@ export function App() {
                 </div>
               ) : null}
 
-              <div className="termPanel" ref={runSurfaceRef}>
+              <div
+                className={`termPanel ${activeIsCodexNative ? "termPanelNative" : "termPanelPty"}`}
+                ref={runSurfaceRef}
+              >
                 {activeIsCodexNative ? (
                   <CodexNativeThreadView
                     threadId={String(activeSession?.toolSessionId ?? "")}
@@ -2814,6 +3011,31 @@ export function App() {
 
         {tab === "settings" ? (
           <section className="view">
+            <div className="card">
+              <div className="cardHead">
+                <div>
+                  <div className="cardTitle">This Device</div>
+                  <div className="cardSub">Clear the saved cookie and re-auth.</div>
+                </div>
+                <button
+                  className="btn"
+                  onClick={async () => {
+                    try {
+                      await api("/api/auth/logout", { method: "POST" });
+                    } catch {
+                      // ignore
+                    } finally {
+                      window.location.reload();
+                    }
+                  }}
+                >
+                  Forget
+                </button>
+              </div>
+              <div className="row">
+                <div className="help">Useful when the phone “never asks for token” because it’s already paired.</div>
+              </div>
+            </div>
             <div className="card">
               <div className="cardHead">
                 <div>

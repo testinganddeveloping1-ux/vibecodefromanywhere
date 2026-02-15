@@ -65,26 +65,28 @@
 /* ==== Reset ==== */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; -webkit-text-size-adjust: 100%; }
-html { touch-action: manipulation; }
 body {
   font-family: var(--sans);
   font-size: 15px;
   line-height: 1.5;
   color: var(--ink);
   background: var(--bg0);
+  /* Mobile viewport: avoid address-bar resize glitches on iOS/Android */
+  height: 100vh;
+  height: 100dvh;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
   user-select: none;
-  touch-action: manipulation;
+  /* Allow normal panning/scrolling on touch devices. Specific regions can override. */
+  touch-action: pan-x pan-y;
 }
 a { color: inherit; text-decoration: none; }
 button, input, select, textarea {
   font: inherit; color: inherit; background: none;
   border: none; outline: none;
   -webkit-appearance: none; appearance: none;
-  touch-action: manipulation;
 }
 /* Allow text selection in inputs/textareas */
 input, textarea { user-select: text; -webkit-user-select: text; }
@@ -248,7 +250,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(3px); }
-  to { opacity: 1; transform: translateY(0); }
+  /* Avoid leaving a transform active at rest (can cause canvas/text rendering glitches on iOS). */
+  to { opacity: 1; transform: none; }
 }
 
 /* ==== Buttons ==== */
@@ -799,13 +802,40 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   background: var(--bg0);
   border: 1px solid var(--edge);
   overflow: hidden;
+  overscroll-behavior-y: contain;
   flex: 1;
   min-height: 0;
+}
+.termPanelNative {
+  /* Native chat view should scroll normally. */
+  touch-action: pan-y;
+}
+.termPanelPty {
+  /* Terminal view: we implement touch scroll + swipe in JS so text selection doesn't eat gestures. */
+  touch-action: none;
 }
 .term {
   height: 100%;
   min-height: 0;
   padding: 2px;
+}
+/* xterm.js touch scrolling support (mobile) */
+.termPanel .xterm-viewport {
+  -webkit-overflow-scrolling: touch;
+  touch-action: none;
+  background: transparent !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+}
+.termPanel .xterm-screen {
+  background: transparent !important;
+}
+.termPanel .xterm {
+  width: 100% !important;
+  height: 100% !important;
+}
+.termPanel .xterm-screen canvas {
+  max-width: 100%;
 }
 
 /* ==== Codex Native Thread ==== */

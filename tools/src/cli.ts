@@ -73,6 +73,8 @@ function usage() {
 
 Commands:
   start        Start the server (dev-friendly)
+              Default: local-only (bind 127.0.0.1)
+              Options: --lan (bind 0.0.0.0), --local (bind 127.0.0.1)
   stop         Stop the running server (best-effort)
   status       Show whether the server is running
   doctor       Print install + server diagnostics
@@ -96,6 +98,7 @@ function findRepoRoot(startDir: string): string | null {
 
 async function main() {
   const cmd = process.argv[2] ?? "start";
+  const cmdArgs = process.argv.slice(3);
   if (cmd === "config") {
     console.log(configPath());
     return;
@@ -221,6 +224,16 @@ async function main() {
     process.exit(2);
   }
 
+  const wantsLan = cmdArgs.includes("--lan");
+  const wantsLocal = cmdArgs.includes("--local");
+  if (wantsLan && wantsLocal) {
+    console.error("Choose only one: --lan or --local");
+    process.exit(2);
+  }
+  const envOverride: Record<string, string> = {};
+  // Secure-by-default: bind locally unless user opts into LAN exposure explicitly.
+  envOverride.FYP_BIND = wantsLan ? "0.0.0.0" : "127.0.0.1";
+
   // The server will create a full config if missing; keep this helper lightweight.
   if (!fs.existsSync(configPath())) {
     console.log(`Config missing; it will be created at: ${configPath()}`);
@@ -253,7 +266,7 @@ async function main() {
     ? { bin: process.execPath, args: [distServer] }
     : { bin: "npx", args: ["tsx", devServer] };
 
-  const child = spawn(runner.bin, runner.args, { stdio: "inherit" });
+  const child = spawn(runner.bin, runner.args, { stdio: "inherit", env: { ...(process.env as any), ...envOverride } });
 
   // Ensure Ctrl+C reliably tears down the child (and its fastify server).
   let signaled = false;

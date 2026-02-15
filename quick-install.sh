@@ -10,6 +10,37 @@ REPO_TARBALL_URL="${FYP_TARBALL_URL:-https://github.com/testinganddeveloping1-ux
 BASE_DIR="${FYP_BASE_DIR:-$HOME/.fromyourphone}"
 APP_DIR="${FYP_APP_DIR:-$BASE_DIR/app}"
 
+stop_running_server() {
+  local pid_file="$BASE_DIR/server.pid"
+  if [ ! -f "$pid_file" ]; then
+    return 0
+  fi
+
+  local pid=""
+  pid="$(node -e "try{const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(String(j&&j.pid||''));}catch(e){process.stdout.write('');}" "$pid_file" 2>/dev/null || true)"
+  if [ -z "$pid" ]; then
+    rm -f "$pid_file" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    echo "Stopping running FromYourPhone server (pid $pid)..."
+    kill -INT "$pid" >/dev/null 2>&1 || true
+    local i=0
+    while kill -0 "$pid" >/dev/null 2>&1; do
+      i=$((i+1))
+      if [ "$i" -ge 60 ]; then
+        echo "Server did not exit; sending SIGKILL..."
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+
+  rm -f "$pid_file" >/dev/null 2>&1 || true
+}
+
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "Missing required command: $1" >&2
@@ -54,6 +85,7 @@ if [ -z "${src_dir:-}" ] || [ ! -d "$src_dir" ]; then
 fi
 
 mkdir -p "$BASE_DIR"
+stop_running_server
 if [ -d "$APP_DIR" ]; then
   backup="$BASE_DIR/app.bak.$(date +%s)"
   echo "Backing up existing install to: $backup"
@@ -77,11 +109,13 @@ echo "Linking global CLI (best-effort)..."
 if npm link >/dev/null 2>&1; then
   echo ""
   echo "Installed. Run:"
-  echo "  fromyourphone start"
+  echo "  fromyourphone start        # local-only (recommended)"
+  echo "  fromyourphone start --lan  # expose on WiFi/LAN"
 else
   echo ""
   echo "Could not install a global command. You can still run:"
-  echo "  node \"$APP_DIR/dist/cli.js\" start"
+  echo "  node \"$APP_DIR/dist/cli.js\" start        # local-only"
+  echo "  node \"$APP_DIR/dist/cli.js\" start --lan  # expose on WiFi/LAN"
   echo ""
   echo "If you want a global command, set a writable npm prefix and retry:"
   echo "  npm config set prefix \"$HOME/.npm-global\""
