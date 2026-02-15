@@ -650,8 +650,19 @@ main().catch(() => {});
             .list({ refresh: true })
             .filter((s) => s.tool === "codex" && s.cwd === cwd)
             .sort((a, b) => b.updatedAt - a.updatedAt);
-          const cand = items[0] ?? null;
-          if (!cand || cand.updatedAt < createdAt - 5000) {
+
+          const cutoff = createdAt - 12_000;
+          const recent = items.filter((s) => Number(s.createdAt ?? s.updatedAt) >= cutoff);
+          const cand = recent[0] ?? null;
+
+          if (!cand) {
+            if (n + 1 < maxAttempts) attempt(n + 1);
+            return;
+          }
+
+          // Avoid linking two FYP sessions to the same Codex session id.
+          const dup = store.listSessions().find((s) => s.id !== fypSessionId && s.toolSessionId === cand.id) ?? null;
+          if (dup) {
             if (n + 1 < maxAttempts) attempt(n + 1);
             return;
           }
