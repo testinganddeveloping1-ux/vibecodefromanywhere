@@ -2861,6 +2861,29 @@ export function App() {
                 </div>
               </div>
 
+              {tool === "codex" ? (
+                <div className="row">
+                  <div className="field">
+                    <label>Codex Mode</label>
+                    <div className="seg" role="group" aria-label="Codex mode">
+                      <button
+                        className={`segBtn ${String((codexOpt as any).transport ?? "pty") === "codex-app-server" ? "segOn" : ""}`}
+                        onClick={() => setCodexOpt((p) => ({ ...p, transport: "codex-app-server" }))}
+                      >
+                        Native
+                      </button>
+                      <button
+                        className={`segBtn ${String((codexOpt as any).transport ?? "pty") !== "codex-app-server" ? "segOn" : ""}`}
+                        onClick={() => setCodexOpt((p) => ({ ...p, transport: "pty" }))}
+                      >
+                        Terminal
+                      </button>
+                    </div>
+                    <div className="help">Native uses Codex App Server (chat-first). Terminal streams the real Codex TUI (compatibility mode).</div>
+                  </div>
+                </div>
+              ) : null}
+
               <div className="row">
                 <div className="field">
                   <label>Workspace</label>
