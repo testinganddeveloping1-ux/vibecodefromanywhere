@@ -331,6 +331,7 @@ export function App() {
   const [toolChatMessages, setToolChatMessages] = useState<ToolSessionMessage[]>([]);
   const [toolChatLoading, setToolChatLoading] = useState(false);
   const [toolChatMsg, setToolChatMsg] = useState<string | null>(null);
+  const [toolChatLimit, setToolChatLimit] = useState<number>(240);
 
   const [slotCfg, setSlotCfg] = useState<{ slots: 3 | 4 | 6 }>(() => {
     try {
@@ -1429,15 +1430,20 @@ export function App() {
     }
   }
 
-  async function openToolChat(tool: ToolSessionTool, sessionId: string, opts?: { refresh?: boolean }) {
+  async function openToolChat(tool: ToolSessionTool, sessionId: string, opts?: { refresh?: boolean; limit?: number; keep?: boolean }) {
     setToolChatMsg(null);
     setToolChatLoading(true);
-    setToolChatMessages([]);
-    setToolChatSession(null);
+    const limit = Number.isFinite(Number(opts?.limit)) ? Math.floor(Number(opts?.limit)) : 240;
+    const lim = Math.min(5000, Math.max(60, limit));
+    setToolChatLimit(lim);
+    if (!opts?.keep) {
+      setToolChatMessages([]);
+      setToolChatSession(null);
+    }
     setShowToolChat(true);
     try {
       const qs = new URLSearchParams();
-      qs.set("limit", "240");
+      qs.set("limit", String(lim));
       if (opts?.refresh) qs.set("refresh", "1");
       const r = await api<{ ok: true; session: ToolSessionSummary; messages: ToolSessionMessage[] }>(
         `/api/tool-sessions/${encodeURIComponent(tool)}/${encodeURIComponent(sessionId)}/messages?${qs.toString()}`,
@@ -3080,10 +3086,29 @@ export function App() {
               <b>Chat History</b>
               {toolChatSession ? <span className="chip chipOn">{toolChatSession.tool}</span> : <span className="chip">loading</span>}
               {toolChatSession?.id ? <span className="chip mono">{toolChatSession.id.slice(0, 8)}</span> : null}
+              <span className="chip mono">{toolChatMessages.length}/{toolChatLimit}</span>
               <div className="spacer" />
               {toolChatSession ? (
                 <>
-                  <button className="btn" onClick={() => openToolChat(toolChatSession.tool, toolChatSession.id, { refresh: true })} disabled={toolChatLoading}>
+                  <button
+                    className="btn"
+                    onClick={() => openToolChat(toolChatSession.tool, toolChatSession.id, { limit: Math.min(5000, toolChatLimit * 2), keep: true })}
+                    disabled={toolChatLoading || toolChatLimit >= 5000 || toolChatMessages.length < toolChatLimit}
+                  >
+                    Older
+                  </button>
+                  <button
+                    className="btn ghost"
+                    onClick={() => openToolChat(toolChatSession.tool, toolChatSession.id, { limit: 5000, keep: true })}
+                    disabled={toolChatLoading || toolChatLimit >= 5000 || toolChatMessages.length < toolChatLimit}
+                  >
+                    All
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => openToolChat(toolChatSession.tool, toolChatSession.id, { refresh: true, limit: toolChatLimit, keep: true })}
+                    disabled={toolChatLoading}
+                  >
                     Refresh
                   </button>
                   <button className="btn primary" onClick={() => startFromToolSession(toolChatSession, "resume")} disabled={toolChatLoading}>
@@ -3102,6 +3127,13 @@ export function App() {
               {toolChatSession?.cwd ? <div className="help mono">{toolChatSession.cwd}</div> : null}
               {toolChatMsg ? <div className="help mono">{toolChatMsg}</div> : null}
               {toolChatLoading ? <div className="help">Loading chat...</div> : null}
+              {toolChatSession && !toolChatLoading ? (
+                toolChatMessages.length >= toolChatLimit && toolChatLimit < 5000 ? (
+                  <div className="help">Showing the last {toolChatMessages.length} messages. Tap Older (or All) to load more.</div>
+                ) : (
+                  <div className="help">Full chat history loaded for this session.</div>
+                )
+              ) : null}
               <div className="chatList">
                 {toolChatMessages.map((m, idx) => (
                   <div key={idx} className={`chatMsg ${m.role === "user" ? "chatUser" : "chatAssistant"}`}>

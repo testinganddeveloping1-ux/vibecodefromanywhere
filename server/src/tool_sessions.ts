@@ -226,7 +226,9 @@ export class ToolSessionIndex {
     const key = `${tool}:${id}`;
     const fp = this.fileByKey.get(key);
     if (!fp) return null;
-    const limit = Math.min(400, Math.max(20, Number(opts?.limit ?? 160)));
+    // Chat logs can be long; allow larger limits so the UI can "load older" messages.
+    // Keep a sane ceiling so we don't accidentally send huge payloads to phones.
+    const limit = Math.min(5000, Math.max(20, Number(opts?.limit ?? 160)));
 
     if (tool === "codex") return parseCodexMessages(fp, limit);
     if (tool === "claude") return parseClaudeMessages(fp, limit);
@@ -354,7 +356,9 @@ function parseCodexMessages(filePath: string, limit: number): ToolSessionMessage
   // and only fall back to full-file if we can't extract anything.
   const tail = readTail(filePath, 512 * 1024);
   const parsed = parseCodexMessagesFromText(tail);
-  if (parsed.length >= Math.min(40, limit)) return parsed.slice(-limit);
+  // If the tail doesn't contain enough messages to satisfy the requested limit,
+  // we must parse the full file so "load older" can show earlier messages.
+  if (parsed.length >= limit) return parsed.slice(-limit);
 
   // Full parse (still reasonable for typical session logs).
   let raw = "";
@@ -397,7 +401,7 @@ function parseCodexMessagesFromText(raw: string): ToolSessionMessage[] {
 function parseClaudeMessages(filePath: string, limit: number): ToolSessionMessage[] {
   const tail = readTail(filePath, 512 * 1024);
   const parsed = parseClaudeMessagesFromText(tail);
-  if (parsed.length >= Math.min(40, limit)) return parsed.slice(-limit);
+  if (parsed.length >= limit) return parsed.slice(-limit);
 
   let raw = "";
   try {
