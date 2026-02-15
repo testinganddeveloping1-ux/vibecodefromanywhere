@@ -15,6 +15,10 @@ function configPath() {
   return path.join(configDir(), "config.toml");
 }
 
+function pidPath() {
+  return path.join(configDir(), "server.pid");
+}
+
 function localIp(): string | null {
   const ifaces = os.networkInterfaces();
   for (const name of Object.keys(ifaces)) {
@@ -33,11 +37,44 @@ function readConfig(): any {
   return TOML.parse(raw);
 }
 
+async function probeExistingServer(cfg: any): Promise<boolean> {
+  const port = Number(cfg?.server?.port ?? 7337);
+  const token = String(cfg?.auth?.token ?? "");
+  if (!Number.isFinite(port) || port <= 0 || port > 65535 || !token) return false;
+
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 450);
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/api/doctor`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: ac.signal,
+    });
+    if (!r.ok) return false;
+    const j = (await r.json().catch(() => null)) as any;
+    return Boolean(j?.ok);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function getAdminUrl(cfg: any): { host: string; port: number; url: string } {
+  const bind = String(cfg?.server?.bind ?? "0.0.0.0");
+  const port = Number(cfg?.server?.port ?? 7337);
+  const token = String(cfg?.auth?.token ?? "");
+  const host = bind === "0.0.0.0" ? localIp() ?? "127.0.0.1" : bind;
+  const url = `http://${host}:${port}/?token=${encodeURIComponent(token)}`;
+  return { host, port, url };
+}
+
 function usage() {
   console.log(`fromyourphone
 
 Commands:
   start        Start the server (dev-friendly)
+  stop         Stop the running server (best-effort)
+  status       Show whether the server is running
   config       Print config path
 `);
 }
@@ -62,6 +99,92 @@ async function main() {
     console.log(configPath());
     return;
   }
+  if (cmd === "status") {
+    if (!fs.existsSync(configPath())) {
+      console.log("Not running (no config yet).");
+      process.exit(1);
+    }
+    const cfg = readConfig();
+    const running = await probeExistingServer(cfg);
+    const { host, port, url } = getAdminUrl(cfg);
+    if (running) {
+      console.log(`Running: http://${host}:${port}`);
+      console.log(url);
+      process.exit(0);
+    }
+    console.log("Not running.");
+    process.exit(1);
+  }
+  if (cmd === "stop") {
+    if (!fs.existsSync(configPath())) {
+      console.log("Nothing to stop (no config yet).");
+      return;
+    }
+    const cfg = readConfig();
+    const { port } = getAdminUrl(cfg);
+
+    const pp = pidPath();
+    if (!fs.existsSync(pp)) {
+      const running = await probeExistingServer(cfg);
+      if (!running) {
+        console.log("Not running.");
+        return;
+      }
+      console.error("Server appears to be running, but no pid file was found.");
+      console.error(`Find the process: lsof -iTCP:${port} -sTCP:LISTEN -P`);
+      console.error("Then: kill <pid>");
+      process.exit(1);
+    }
+
+    let pid = 0;
+    try {
+      const raw = fs.readFileSync(pp, "utf8");
+      const j = JSON.parse(raw) as any;
+      pid = Number(j?.pid ?? 0);
+    } catch {
+      pid = 0;
+    }
+    if (!pid || !Number.isFinite(pid)) {
+      console.error("Pid file is invalid; delete it and try again: " + pp);
+      process.exit(1);
+    }
+
+    try {
+      process.kill(pid, "SIGINT");
+    } catch {
+      try {
+        fs.unlinkSync(pp);
+      } catch {
+        // ignore
+      }
+      console.log("Not running (stale pid file removed).");
+      return;
+    }
+
+    const deadline = Date.now() + 4500;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        try {
+          fs.unlinkSync(pp);
+        } catch {
+          // ignore
+        }
+        console.log("Stopped.");
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 120));
+    }
+
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ignore
+    }
+    console.log("Stopped (SIGKILL).");
+    return;
+  }
   if (cmd !== "start") {
     usage();
     process.exit(2);
@@ -70,6 +193,22 @@ async function main() {
   // The server will create a full config if missing; keep this helper lightweight.
   if (!fs.existsSync(configPath())) {
     console.log(`Config missing; it will be created at: ${configPath()}`);
+  }
+
+  // If the server is already running, don't crash with EADDRINUSE.
+  if (fs.existsSync(configPath())) {
+    try {
+      const cfg = readConfig();
+      if (await probeExistingServer(cfg)) {
+        const { host, port, url } = getAdminUrl(cfg);
+        console.log(`Already running: http://${host}:${port}`);
+        console.log(url + "\n");
+        qrcode.generate(url, { small: true });
+        return;
+      }
+    } catch {
+      // ignore
+    }
   }
 
   // Resolve server entry relative to the installed CLI, not the user's cwd.
@@ -85,15 +224,33 @@ async function main() {
 
   const child = spawn(runner.bin, runner.args, { stdio: "inherit" });
 
+  // Ensure Ctrl+C reliably tears down the child (and its fastify server).
+  let signaled = false;
+  const forward = (sig: NodeJS.Signals) => {
+    if (signaled) return;
+    signaled = true;
+    try {
+      child.kill(sig);
+    } catch {
+      // ignore
+    }
+    setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+    }, 5000).unref?.();
+  };
+  process.on("SIGINT", () => forward("SIGINT"));
+  process.on("SIGTERM", () => forward("SIGTERM"));
+
   // Best-effort: print a QR after a brief delay, once config exists.
   setTimeout(() => {
     try {
       if (!fs.existsSync(configPath())) return;
       const cfg = readConfig();
-      const host = localIp() ?? "127.0.0.1";
-      const url = `http://${host}:${cfg.server?.port ?? 7337}/?token=${encodeURIComponent(
-        cfg.auth?.token ?? "",
-      )}`;
+      const { url } = getAdminUrl(cfg);
       console.log("\nScan to open on your phone:\n" + url + "\n");
       qrcode.generate(url, { small: true });
       console.log("\nTip (encrypted, no port forwarding): use Tailscale and run:");

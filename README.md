@@ -9,11 +9,26 @@ Self-hosted phone UI that lets you run **OpenCode**, **Codex CLI**, or **Claude 
 
 ## Quick Start (LAN)
 
+### Option A: No Git (Fastest)
+
 ```bash
-git clone <this-repo-url>
+curl -fsSL https://raw.githubusercontent.com/testinganddeveloping1-ux/vibecodefromanywhere/main/quick-install.sh | bash
+fromyourphone start
+```
+
+If your shell can’t find `fromyourphone`:
+
+```bash
+export PATH="$(npm config get prefix)/bin:$PATH"
+```
+
+### Option B: Git Clone
+
+```bash
+git clone https://github.com/testinganddeveloping1-ux/vibecodefromanywhere.git
 cd vibecodefromanywhere
-./install.sh
-npm start
+./install.sh --global
+fromyourphone start
 ```
 
 It prints:

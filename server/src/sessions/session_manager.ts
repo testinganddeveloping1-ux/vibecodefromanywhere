@@ -109,8 +109,28 @@ export class SessionManager {
   }
 
   interrupt(id: string): void {
-    // Ctrl+C
-    this.write(id, "\u0003");
+    const sess = this.must(id);
+    if (!sess.status.running) return;
+
+    // First: write ^C (what a real terminal does). This is the least surprising for interactive TUIs.
+    // Some TUIs disable ISIG (raw mode) though, so ^C may become just input instead of SIGINT.
+    try {
+      sess.pty.write("\u0003");
+    } catch {
+      // ignore
+    }
+
+    // Second (fallback): if it's still running shortly after, send SIGINT to the child PID.
+    // Delaying avoids EBADF write noise when SIGINT makes the process exit immediately.
+    const pid = sess.status.pid;
+    setTimeout(() => {
+      if (!sess.status.running) return;
+      try {
+        if (pid) process.kill(pid, "SIGINT");
+      } catch {
+        // ignore
+      }
+    }, 80).unref?.();
   }
 
   stop(id: string): void {
