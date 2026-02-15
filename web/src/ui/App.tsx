@@ -505,10 +505,34 @@ export function App() {
       if (!el2) return;
       if (term.current) return;
 
+      // Best-effort: wait for web fonts so xterm measures cell height correctly.
+      // This reduces "lines clipping into each other" on some mobile browsers.
+      try {
+        const fonts: any = (document as any).fonts;
+        if (fonts && typeof fonts.ready?.then === "function") {
+          await Promise.race([
+            fonts.ready,
+            new Promise((r) => setTimeout(r, 700)),
+          ]);
+        }
+      } catch {
+        // ignore
+      }
+
+      const monoStack = (() => {
+        try {
+          const v = getComputedStyle(document.documentElement).getPropertyValue("--mono").trim();
+          return v || "\"IBM Plex Mono\", ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Monaco, Consolas, monospace";
+        } catch {
+          return "\"IBM Plex Mono\", ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Monaco, Consolas, monospace";
+        }
+      })();
+
       const t = new Terminal({
         cursorBlink: true,
-        fontFamily: "var(--mono)",
+        fontFamily: monoStack,
         fontSize,
+        lineHeight: 1.2,
         theme: {
           background: "#060810",
           foreground: "#e4eaf4",
@@ -522,6 +546,11 @@ export function App() {
       t.loadAddon(f);
       t.open(el2);
       f.fit();
+      try {
+        t.refresh(0, Math.max(0, t.rows - 1));
+      } catch {
+        // ignore
+      }
       term.current = t;
       fit.current = f;
 
@@ -1016,7 +1045,14 @@ export function App() {
     } catch {
       // ignore
     }
-    setTimeout(() => fit.current?.fit(), 10);
+    setTimeout(() => {
+      try {
+        fit.current?.fit();
+        term.current?.refresh(0, Math.max(0, (term.current?.rows ?? 1) - 1));
+      } catch {
+        // ignore
+      }
+    }, 10);
   }, [fontSize]);
 
   useEffect(() => {
@@ -1831,7 +1867,7 @@ export function App() {
                   ) : null}
                 </div>
                 <div className="runBtns">
-                  <button className="btn" onClick={() => sendControl("interrupt")}>Int</button>
+                  <button className="btn" onClick={() => sendControl("interrupt")}>Ctrl+C</button>
                   <button className="btn ghost" onClick={() => setShowLog(true)}>Log</button>
                   <button
                     className="btn ghost"
@@ -3275,24 +3311,24 @@ export function App() {
                   </div>
                   <div className="help">Use these keys for TUI menus (permissions, mode picker, etc.).</div>
 	              </div>
-              <div className="row">
-                <div className="cardTitle">Process</div>
-                <div className="runBtns" style={{ marginTop: 10 }}>
-                  <button className="btn" onClick={() => sendControl("stop")}>
-                    Stop
-                  </button>
-                  <button
-                    className="btn danger"
-                    onClick={() => {
-                      sendControl("kill");
-                      setShowControls(false);
-                    }}
-                  >
-                    Kill
-                  </button>
-                </div>
-                <div className="help">Stop sends Ctrl+C. Kill sends SIGKILL to the tool process.</div>
-              </div>
+	              <div className="row">
+	                <div className="cardTitle">Process</div>
+	                <div className="runBtns" style={{ marginTop: 10 }}>
+	                  <button className="btn" onClick={() => sendControl("interrupt")}>
+	                    Ctrl+C
+	                  </button>
+	                  <button
+	                    className="btn danger"
+	                    onClick={() => {
+	                      sendControl("kill");
+	                      setShowControls(false);
+	                    }}
+	                  >
+	                    Kill
+	                  </button>
+	                </div>
+	                <div className="help">Ctrl+C sends SIGINT. Kill sends SIGKILL to the tool process.</div>
+	              </div>
             </div>
           </div>
         </div>
