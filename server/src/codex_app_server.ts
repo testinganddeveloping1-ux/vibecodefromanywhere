@@ -1,9 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
-import WebSocket from "ws";
 
 type JsonRpcId = number | string;
-type JsonRpcResponse = { id: JsonRpcId; result?: unknown; error?: unknown };
 type JsonRpcNotification = { method: string; params?: unknown };
 type JsonRpcServerRequest = { id: JsonRpcId; method: string; params?: unknown };
 
@@ -31,8 +29,7 @@ function looksLikeJson(s: string): boolean {
 export class CodexAppServer extends EventEmitter {
   private readonly opts: CodexAppServerOptions;
   private child: ChildProcessWithoutNullStreams | null = null;
-  private ws: WebSocket | null = null;
-  private url: string | null = null;
+  private ready = false;
 
   private startPromise: Promise<void> | null = null;
   private stopping = false;
@@ -45,13 +42,15 @@ export class CodexAppServer extends EventEmitter {
     { resolve: (v: any) => void; reject: (e: any) => void; timer: any }
   >();
 
+  private stdoutBuf = "";
+
   constructor(opts: CodexAppServerOptions) {
     super();
     this.opts = opts;
   }
 
   isReady(): boolean {
-    return Boolean(this.ws && this.ws.readyState === WebSocket.OPEN);
+    return Boolean(this.child && this.ready);
   }
 
   async ensureStarted(): Promise<void> {
@@ -67,8 +66,71 @@ export class CodexAppServer extends EventEmitter {
 
   async call<T = any>(method: string, params: unknown): Promise<T> {
     await this.ensureStarted();
-    const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("codex_app_server_not_ready");
+    return await this.callInternal<T>(method, params);
+  }
+
+  notify(method: string, params: unknown): void {
+    this.send({ method, params });
+  }
+
+  respond(id: JsonRpcId, result: unknown): void {
+    this.send({ id, result });
+  }
+
+  respondError(id: JsonRpcId, error: unknown): void {
+    this.send({ id, error });
+  }
+
+  stop(): void {
+    this.stopping = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+
+    this.rejectAllPending(new Error("codex_app_server_stopped"));
+
+    const child = this.child;
+    this.child = null;
+    this.ready = false;
+    this.startPromise = null;
+    this.reconnectAttempt = 0;
+    this.stdoutBuf = "";
+
+    try {
+      child?.kill("SIGTERM");
+    } catch {
+      // ignore
+    }
+  }
+
+  private rejectAllPending(err: any) {
+    for (const rec of this.pending.values()) {
+      try {
+        clearTimeout(rec.timer);
+      } catch {
+        // ignore
+      }
+      try {
+        rec.reject(err);
+      } catch {
+        // ignore
+      }
+    }
+    this.pending.clear();
+  }
+
+  private send(payload: any): void {
+    const child = this.child;
+    if (!child || !child.stdin || (child.stdin as any).destroyed) return;
+    try {
+      child.stdin.write(JSON.stringify(payload) + "\n");
+    } catch {
+      // ignore
+    }
+  }
+
+  private async callInternal<T = any>(method: string, params: unknown): Promise<T> {
+    const child = this.child;
+    if (!child || !child.stdin || (child.stdin as any).destroyed) throw new Error("codex_app_server_not_ready");
 
     const id = this.nextId++;
     const payload = { id, method, params } as any;
@@ -81,7 +143,7 @@ export class CodexAppServer extends EventEmitter {
       }, timeoutMs).unref?.();
       this.pending.set(id, { resolve, reject, timer });
       try {
-        ws.send(JSON.stringify(payload));
+        child.stdin.write(JSON.stringify(payload) + "\n");
       } catch (e) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -90,75 +152,10 @@ export class CodexAppServer extends EventEmitter {
     });
   }
 
-  notify(method: string, params: unknown): void {
-    const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    try {
-      ws.send(JSON.stringify({ method, params }));
-    } catch {
-      // ignore
-    }
-  }
-
-  respond(id: JsonRpcId, result: unknown): void {
-    const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    try {
-      ws.send(JSON.stringify({ id, result }));
-    } catch {
-      // ignore
-    }
-  }
-
-  respondError(id: JsonRpcId, error: unknown): void {
-    const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    try {
-      ws.send(JSON.stringify({ id, error }));
-    } catch {
-      // ignore
-    }
-  }
-
-  stop(): void {
-    this.stopping = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
-
-    for (const rec of this.pending.values()) {
-      try {
-        clearTimeout(rec.timer);
-      } catch {
-        // ignore
-      }
-      try {
-        rec.reject(new Error("codex_app_server_stopped"));
-      } catch {
-        // ignore
-      }
-    }
-    this.pending.clear();
-
-    try {
-      this.ws?.close();
-    } catch {
-      // ignore
-    }
-    this.ws = null;
-
-    try {
-      this.child?.kill("SIGTERM");
-    } catch {
-      // ignore
-    }
-    this.child = null;
-    this.url = null;
-    this.startPromise = null;
-    this.reconnectAttempt = 0;
-  }
-
   private async startInternal(): Promise<void> {
     this.stopping = false;
+    this.ready = false;
+    this.stdoutBuf = "";
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
 
@@ -171,9 +168,9 @@ export class CodexAppServer extends EventEmitter {
       // ignore
     }
     this.child = null;
-    this.url = null;
 
-    const args = [...(this.opts.codexArgs ?? []), "app-server", "--listen", "ws://127.0.0.1:0"];
+    // Stdio is the supported transport for production. (WebSocket is experimental/unsupported.)
+    const args = [...(this.opts.codexArgs ?? []), "app-server"];
 
     const inheritedEnv: Record<string, string> = {
       ...(process.env as any),
@@ -184,140 +181,51 @@ export class CodexAppServer extends EventEmitter {
     delete (inheritedEnv as any).CODEX_CI;
 
     const child = spawn(this.opts.codexCommand, args, {
-      // Keep stdio piped so Node drains buffers and we can safely parse stderr.
-      // Using "ignore" can result in `stdin/stdout` being null which complicates typing.
       stdio: ["pipe", "pipe", "pipe"],
       env: inheritedEnv,
     });
     this.child = child;
 
-    // Drain stdout to avoid backpressure blocking the child if it writes there.
     try {
       child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (_d: string) => {
-        // ignore
-      });
+    } catch {
+      // ignore
+    }
+    try {
+      child.stderr.setEncoding("utf8");
     } catch {
       // ignore
     }
 
-    child.stderr.setEncoding("utf8");
-    let stderrBuf = "";
-    const urlPromise = new Promise<string>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("codex_app_server_start_timeout")), 7000).unref?.();
-      child.stderr.on("data", (d: string) => {
-        stderrBuf += d;
-        if (stderrBuf.length > 20_000) stderrBuf = stderrBuf.slice(-20_000);
-        const m = stderrBuf.match(/listening on:\s*(ws:\/\/[^\s]+)/);
-        if (m?.[1]) {
-          try {
-            clearTimeout(t);
-          } catch {
-            // ignore
-          }
-          resolve(m[1]);
-        }
-      });
-      child.on("error", (e) => {
-        try {
-          clearTimeout(t);
-        } catch {
-          // ignore
-        }
-        reject(e);
-      });
-      child.on("exit", (code, sig) => {
-        try {
-          clearTimeout(t);
-        } catch {
-          // ignore
-        }
-        reject(new Error(`codex_app_server_exit:${code ?? "null"}:${sig ?? "null"}`));
-      });
+    child.stdout.on("data", (d: string) => this.onStdoutData(d));
+    child.stderr.on("data", (d: string) => {
+      const s = String(d ?? "").trim();
+      if (!s) return;
+      log("codex app-server stderr", { line: s.slice(0, 520) });
     });
 
-    let url = "";
-    try {
-      url = await urlPromise;
-    } catch (e: any) {
-      log("codex app-server failed to start", { message: String(e?.message ?? e) });
-      throw e;
-    }
-
-    this.url = url;
-    log("codex app-server listening", { url });
-
-    await this.connectWs(url);
-    await this.initialize();
-  }
-
-  private async connectWs(url: string): Promise<void> {
-    const log = this.opts.log ?? (() => {});
-    try {
-      this.ws?.close();
-    } catch {
-      // ignore
-    }
-    this.ws = null;
-
-    const ws = new WebSocket(url, {
-      perMessageDeflate: false,
-      handshakeTimeout: 6000,
-    });
-    this.ws = ws;
-
-    ws.on("message", (data) => this.onWsMessage(data));
-
-    ws.on("close", () => {
+    const handleDisconnect = (reason: string) => {
       if (this.stopping) return;
-      log("codex app-server ws closed");
+      log("codex app-server disconnected", { reason });
+      this.ready = false;
+      this.rejectAllPending(new Error(`codex_app_server_disconnected:${reason}`));
       this.scheduleReconnect();
-    });
+    };
 
-    ws.on("error", (e) => {
-      if (this.stopping) return;
-      log("codex app-server ws error", { message: String((e as any)?.message ?? e) });
-      try {
-        ws.close();
-      } catch {
-        // ignore
-      }
-    });
+    child.on("error", (e) => handleDisconnect(String((e as any)?.message ?? e)));
+    child.on("exit", (code, sig) => handleDisconnect(`exit:${code ?? "null"}:${sig ?? "null"}`));
 
-    await new Promise<void>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("codex_app_server_ws_timeout")), 6000).unref?.();
-      ws.on("open", () => {
-        try {
-          clearTimeout(t);
-        } catch {
-          // ignore
-        }
-        resolve();
-      });
-      ws.on("error", (e) => {
-        try {
-          clearTimeout(t);
-        } catch {
-          // ignore
-        }
-        reject(e);
-      });
-    });
-  }
-
-  private async initialize(): Promise<void> {
-    // App-server requires initialize. We opt into experimental API so we can handle
-    // request_user_input and other structured UI events.
-    const res: any = await this.call("initialize", {
+    // Initialize handshake:
+    // - initialize request
+    // - initialized notification
+    const res: any = await this.callInternal("initialize", {
       clientInfo: { name: "fromyourphone", title: "FromYourPhone", version: "0.1.0" },
       capabilities: { experimentalApi: true },
     });
-    // LSP-style handshake: acknowledge initialize.
-    try {
-      this.notify("initialized", {});
-    } catch {
-      // ignore
-    }
+    this.notify("initialized", {});
+    this.ready = true;
+    this.reconnectAttempt = 0;
+
     try {
       this.emit("ready", res);
     } catch {
@@ -325,19 +233,33 @@ export class CodexAppServer extends EventEmitter {
     }
   }
 
-  private onWsMessage(data: WebSocket.RawData) {
-    const raw = data.toString();
-    if (!looksLikeJson(raw)) {
-      // Defensive: ignore any log lines or non-JSON payloads.
-      return;
-    }
-    let msg: any = null;
-    try {
-      msg = JSON.parse(raw);
-    } catch {
-      return;
-    }
+  private onStdoutData(d: string) {
+    const chunk = String(d ?? "");
+    if (!chunk) return;
+    this.stdoutBuf += chunk;
+    if (this.stdoutBuf.length > 8_000_000) this.stdoutBuf = this.stdoutBuf.slice(-4_000_000);
 
+    // JSONL: one message per line
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const nl = this.stdoutBuf.indexOf("\n");
+      if (nl < 0) break;
+      const line = this.stdoutBuf.slice(0, nl);
+      this.stdoutBuf = this.stdoutBuf.slice(nl + 1);
+      const raw = line.trim();
+      if (!raw) continue;
+      if (!looksLikeJson(raw)) continue;
+      let msg: any = null;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      this.onRpcMessage(msg);
+    }
+  }
+
+  private onRpcMessage(msg: any) {
     // JSON-RPC response
     if (msg && Object.prototype.hasOwnProperty.call(msg, "id") && !Object.prototype.hasOwnProperty.call(msg, "method")) {
       const id = msg.id;
@@ -402,3 +324,4 @@ export class CodexAppServer extends EventEmitter {
     }, delay);
   }
 }
+
