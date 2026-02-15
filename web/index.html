@@ -13,10 +13,136 @@
     <style>
       /* Prevent flash of white on load */
       html, body { background: #050608; }
+      /* Inline boot UI so you never get a "blank background" if JS fails. */
+      .boot {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 28px;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        color: rgba(240, 245, 255, 0.92);
+        background:
+          radial-gradient(900px 600px at 20% 18%, rgba(245, 166, 35, 0.10), transparent 60%),
+          radial-gradient(900px 600px at 80% 82%, rgba(59, 130, 246, 0.08), transparent 60%),
+          #050608;
+      }
+      .bootCard {
+        width: min(420px, 100%);
+        border-radius: 16px;
+        border: 1px solid rgba(255,255,255,0.06);
+        background: rgba(18, 22, 32, 0.86);
+        box-shadow: 0 18px 50px rgba(0,0,0,0.44);
+        padding: 18px 18px 16px;
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+      }
+      .bootTop { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+      .bootLogo {
+        width: 38px; height: 38px;
+        border-radius: 10px;
+        background: #f5a623;
+        display: flex; align-items: center; justify-content: center;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-weight: 800;
+        font-size: 12px;
+        color: #050608;
+        flex-shrink: 0;
+      }
+      .bootTitle {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-weight: 700;
+        font-size: 18px;
+        margin: 0;
+      }
+      .bootSub { margin-top: 4px; color: rgba(184, 198, 220, 0.92); font-size: 13px; line-height: 1.5; }
+      .bootHint { margin-top: 10px; color: rgba(110, 127, 152, 0.92); font-size: 12px; line-height: 1.45; }
+      .bootErr {
+        margin-top: 12px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid rgba(239, 68, 68, 0.22);
+        background: rgba(239, 68, 68, 0.08);
+        color: rgba(255, 226, 226, 0.95);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+        display: none;
+      }
+      .bootPill {
+        display: inline-block;
+        margin-top: 10px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.08);
+        background: rgba(255,255,255,0.05);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+        color: rgba(229, 234, 244, 0.92);
+      }
     </style>
   </head>
   <body>
+    <div id="boot" class="boot">
+      <div class="bootCard">
+        <div class="bootTop">
+          <div class="bootLogo">FYP</div>
+          <div>
+            <div class="bootTitle">FromYourPhone</div>
+            <div id="bootSub" class="bootSub">Loading UI...</div>
+          </div>
+        </div>
+        <div class="bootHint">
+          If this stays blank: hard refresh, open in Chrome/Safari (not an in-app browser), and confirm you opened the host IP (not 127.0.0.1).
+        </div>
+        <div id="bootErr" class="bootErr"></div>
+        <div class="bootPill" id="bootUrl"></div>
+      </div>
+    </div>
     <div id="root"></div>
+    <script>
+      (() => {
+        const boot = document.getElementById("boot");
+        const root = document.getElementById("root");
+        const sub = document.getElementById("bootSub");
+        const err = document.getElementById("bootErr");
+        const url = document.getElementById("bootUrl");
+        if (url) url.textContent = String(window.location.href || "");
+
+        const showErr = (msg) => {
+          if (!err) return;
+          err.style.display = "block";
+          err.textContent = "UI failed to start.\n\n" + String(msg || "unknown error");
+          if (sub) sub.textContent = "Startup error";
+        };
+
+        window.addEventListener("error", (e) => {
+          try { showErr(e && (e.message || (e.error && e.error.message) || e.error) ); } catch {}
+        });
+        window.addEventListener("unhandledrejection", (e) => {
+          try { showErr(e && (e.reason && (e.reason.message || e.reason)) ); } catch {}
+        });
+
+        window.__FYP_BOOT_OK = () => {
+          try { boot && boot.remove(); } catch {}
+        };
+
+        setTimeout(() => {
+          try {
+            const hasUi = root && root.children && root.children.length > 0;
+            if (!hasUi && sub) sub.textContent = "Still loading...";
+            if (!hasUi) {
+              showErr("No UI mounted. This usually means the JS bundle failed to load or crashed at startup.");
+            } else {
+              window.__FYP_BOOT_OK();
+            }
+          } catch (e) {
+            showErr(e && e.message ? e.message : String(e));
+          }
+        }, 2200);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

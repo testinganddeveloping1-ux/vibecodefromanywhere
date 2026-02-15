@@ -330,10 +330,32 @@ main().catch(() => {});
   ];
   const webRoot = webRootCandidates.find((p) => fs.existsSync(p)) ?? webRootCandidates[1]!;
   if (fs.existsSync(webRoot)) {
-    await app.register(staticPlugin, { root: webRoot, prefix: "/", decorateReply: false });
+    await app.register(staticPlugin, {
+      root: webRoot,
+      prefix: "/",
+      decorateReply: false,
+      setHeaders: (res, filePath) => {
+        try {
+          const p = String(filePath ?? "");
+          // Avoid "blank screen after update" due to stale cached index.html pointing to old hashed assets.
+          if (p.endsWith(`${path.sep}index.html`)) {
+            res.setHeader("cache-control", "no-store");
+            return;
+          }
+          // Cache Vite-hashed assets aggressively.
+          if (p.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader("cache-control", "public, max-age=31536000, immutable");
+            return;
+          }
+        } catch {
+          // ignore
+        }
+      },
+    });
     app.setNotFoundHandler(async (_req, reply) => {
       const indexPath = path.join(webRoot, "index.html");
-      reply.type("text/html").send(fs.readFileSync(indexPath, "utf8"));
+      // Same cache policy as static handler: always fetch the latest index.html so hashed assets stay in sync.
+      reply.header("cache-control", "no-store").type("text/html").send(fs.readFileSync(indexPath, "utf8"));
     });
   }
 

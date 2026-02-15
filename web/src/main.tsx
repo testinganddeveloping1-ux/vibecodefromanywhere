@@ -14,3 +14,13 @@ createRoot(document.getElementById("root")!).render(
     <App />
   </React.StrictMode>,
 );
+
+// Tell the inline boot screen that React mounted successfully.
+try {
+  const fn = (window as any).__FYP_BOOT_OK;
+  if (typeof fn === "function") {
+    requestAnimationFrame(() => requestAnimationFrame(() => fn()));
+  }
+} catch {
+  // ignore
+}
