@@ -18,10 +18,23 @@ import type {
   WorkspaceItem,
 } from "./types";
 import { api } from "./lib/api";
-import { dirsFromText, formatEventLine, formatInputForDisplay, normalizeEvent } from "./lib/text";
-import { FencedMessage } from "./components/FencedMessage";
-import { IconFolder, IconInbox, IconPlus, IconSettings, IconTerminal } from "./components/icons";
+import { groupByRecent, treeLabel } from "./lib/grouping";
+import { dirsFromText, normalizeEvent } from "./lib/text";
+import { lsGet, lsRemove, lsSet } from "./lib/storage";
+import { HeaderBar } from "./components/HeaderBar";
+import { ConnectingScreen, UnlockScreen } from "./components/LoginScreens";
+import { BottomNav } from "./components/BottomNav";
+import { PinnedSlotsBar } from "./components/PinnedSlotsBar";
+import { HistoryBar } from "./components/HistoryBar";
+import { TerminalAssistOverlay } from "./components/TerminalAssistOverlay";
+import { CodexNativeThreadView } from "./components/CodexNativeThreadView";
 import { ToolChip } from "./components/ToolChip";
+import { PickerModal } from "./modals/PickerModal";
+import { ConfigModal } from "./modals/ConfigModal";
+import { ModelPickerModal } from "./modals/ModelPickerModal";
+import { ToolChatModal } from "./modals/ToolChatModal";
+import { LogModal } from "./modals/LogModal";
+import { ControlsModal } from "./modals/ControlsModal";
 
 export function App() {
   const [authed, setAuthed] = useState<"unknown" | "yes" | "no">("unknown");
@@ -38,32 +51,24 @@ export function App() {
   const [advanced, setAdvanced] = useState(false);
 
   const [selectedWorkspaceKey, setSelectedWorkspaceKey] = useState<string | null>(() => {
-    try {
-      const raw = typeof window !== "undefined" ? window.localStorage.getItem("fyp_ws") : null;
-      return raw ? String(raw) : null;
-    } catch {
-      return null;
-    }
+    const raw = lsGet("fyp_ws");
+    return raw ? String(raw) : null;
   });
   const [selectedTreePath, setSelectedTreePath] = useState<string>(() => {
-    try {
-      const ws = typeof window !== "undefined" ? window.localStorage.getItem("fyp_ws") : null;
-      const mapRaw = typeof window !== "undefined" ? window.localStorage.getItem("fyp_tree_map") : null;
-      if (ws && mapRaw) {
-        try {
-          const m = JSON.parse(mapRaw) as any;
-          const v = m && typeof m === "object" ? m[String(ws)] : null;
-          if (typeof v === "string") return v;
-        } catch {
-          // ignore
-        }
+    const ws = lsGet("fyp_ws");
+    const mapRaw = lsGet("fyp_tree_map");
+    if (ws && mapRaw) {
+      try {
+        const m = JSON.parse(mapRaw) as any;
+        const v = m && typeof m === "object" ? m[String(ws)] : null;
+        if (typeof v === "string") return v;
+      } catch {
+        // ignore
       }
-      // Back-compat fallback (old single-key value).
-      const raw = typeof window !== "undefined" ? window.localStorage.getItem("fyp_tree") : null;
-      return raw ? String(raw) : "";
-    } catch {
-      return "";
     }
+    // Back-compat fallback (old single-key value).
+    const raw = lsGet("fyp_tree");
+    return raw ? String(raw) : "";
   });
   const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([]);
   const [workspaceQuery, setWorkspaceQuery] = useState("");
@@ -87,22 +92,14 @@ export function App() {
   const [codexNativeDiff, setCodexNativeDiff] = useState<string | null>(null);
 
   const [slotCfg, setSlotCfg] = useState<{ slots: 3 | 4 | 6 }>(() => {
-    try {
-      const raw = typeof window !== "undefined" ? window.localStorage.getItem("fyp_slots") : null;
-      const n = raw ? Number(raw) : 3;
-      return { slots: n === 6 ? 6 : n === 4 ? 4 : 3 };
-    } catch {
-      return { slots: 3 };
-    }
+    const raw = lsGet("fyp_slots");
+    const n = raw ? Number(raw) : 3;
+    return { slots: n === 6 ? 6 : n === 4 ? 4 : 3 };
   });
   const [autoPinNew, setAutoPinNew] = useState<boolean>(() => {
-    try {
-      const raw = typeof window !== "undefined" ? window.localStorage.getItem("fyp_autopin") : null;
-      if (raw == null) return true;
-      return raw === "1" || raw === "true" || raw === "yes";
-    } catch {
-      return true;
-    }
+    const raw = lsGet("fyp_autopin");
+    if (raw == null) return true;
+    return raw === "1" || raw === "true" || raw === "yes";
   });
 
   const [codexOpt, setCodexOpt] = useState({
@@ -216,22 +213,14 @@ export function App() {
   const [globalWsState, setGlobalWsState] = useState<"closed" | "connecting" | "open">("closed");
   const [online, setOnline] = useState<boolean>(() => (typeof navigator !== "undefined" ? navigator.onLine : true));
   const [fontSize, setFontSize] = useState<number>(() => {
-    try {
-      const v = typeof window !== "undefined" ? window.localStorage.getItem("fyp_font") : null;
-      const n = v ? Number(v) : 15;
-      return Number.isFinite(n) ? Math.min(22, Math.max(11, n)) : 15;
-    } catch {
-      return 15;
-    }
+    const v = lsGet("fyp_font");
+    const n = v ? Number(v) : 15;
+    return Number.isFinite(n) ? Math.min(22, Math.max(11, n)) : 15;
   });
   const [lineHeight, setLineHeight] = useState<number>(() => {
-    try {
-      const v = typeof window !== "undefined" ? window.localStorage.getItem("fyp_lh") : null;
-      const n = v ? Number(v) : 1.32;
-      return Number.isFinite(n) ? Math.min(1.6, Math.max(1.1, n)) : 1.32;
-    } catch {
-      return 1.32;
-    }
+    const v = lsGet("fyp_lh");
+    const n = v ? Number(v) : 1.32;
+    return Number.isFinite(n) ? Math.min(1.6, Math.max(1.1, n)) : 1.32;
   });
 
   const orderedProfiles = useMemo(() => {
@@ -608,36 +597,28 @@ export function App() {
   }, [authed]);
 
   useEffect(() => {
-    try {
-      if (selectedWorkspaceKey) window.localStorage.setItem("fyp_ws", selectedWorkspaceKey);
-      else window.localStorage.removeItem("fyp_ws");
-    } catch {
-      // ignore
-    }
+    if (selectedWorkspaceKey) lsSet("fyp_ws", selectedWorkspaceKey);
+    else lsRemove("fyp_ws");
   }, [selectedWorkspaceKey]);
 
   useEffect(() => {
-    try {
-      // Back-compat: store last chosen tree path.
-      if (selectedTreePath) window.localStorage.setItem("fyp_tree", selectedTreePath);
-      else window.localStorage.removeItem("fyp_tree");
+    // Back-compat: store last chosen tree path.
+    if (selectedTreePath) lsSet("fyp_tree", selectedTreePath);
+    else lsRemove("fyp_tree");
 
-      // Preferred: store per-workspace selection for git workspaces.
-      if (!selectedWorkspaceKey || selectedWorkspaceKey.startsWith("dir:")) return;
-      const raw = window.localStorage.getItem("fyp_tree_map");
-      let m: any = {};
-      try {
-        m = raw ? JSON.parse(raw) : {};
-      } catch {
-        m = {};
-      }
-      if (!m || typeof m !== "object") m = {};
-      if (selectedTreePath) m[String(selectedWorkspaceKey)] = selectedTreePath;
-      else delete m[String(selectedWorkspaceKey)];
-      window.localStorage.setItem("fyp_tree_map", JSON.stringify(m));
+    // Preferred: store per-workspace selection for git workspaces.
+    if (!selectedWorkspaceKey || selectedWorkspaceKey.startsWith("dir:")) return;
+    const raw = lsGet("fyp_tree_map");
+    let m: any = {};
+    try {
+      m = raw ? JSON.parse(raw) : {};
     } catch {
-      // ignore
+      m = {};
     }
+    if (!m || typeof m !== "object") m = {};
+    if (selectedTreePath) m[String(selectedWorkspaceKey)] = selectedTreePath;
+    else delete m[String(selectedWorkspaceKey)];
+    lsSet("fyp_tree_map", JSON.stringify(m));
   }, [selectedWorkspaceKey, selectedTreePath]);
 
   useEffect(() => {
@@ -653,7 +634,7 @@ export function App() {
 
     let saved = "";
     try {
-      const raw = window.localStorage.getItem("fyp_tree_map");
+      const raw = lsGet("fyp_tree_map");
       if (raw) {
         const m = JSON.parse(raw) as any;
         const v = m && typeof m === "object" ? m[String(selectedWorkspaceKey)] : null;
@@ -798,19 +779,11 @@ export function App() {
   }, [selectedWorkspaceKey, workspaces, authed]);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem("fyp_slots", String(slotCfg.slots));
-    } catch {
-      // ignore
-    }
+    lsSet("fyp_slots", String(slotCfg.slots));
   }, [slotCfg]);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem("fyp_autopin", autoPinNew ? "1" : "0");
-    } catch {
-      // ignore
-    }
+    lsSet("fyp_autopin", autoPinNew ? "1" : "0");
   }, [autoPinNew]);
 
   useEffect(() => {
@@ -844,11 +817,7 @@ export function App() {
   useEffect(() => {
     if (!term.current) return;
     term.current.options.fontSize = fontSize;
-    try {
-      window.localStorage.setItem("fyp_font", String(fontSize));
-    } catch {
-      // ignore
-    }
+    lsSet("fyp_font", String(fontSize));
     setTimeout(() => {
       try {
         fit.current?.fit();
@@ -862,11 +831,7 @@ export function App() {
   useEffect(() => {
     if (!term.current) return;
     term.current.options.lineHeight = lineHeight;
-    try {
-      window.localStorage.setItem("fyp_lh", String(lineHeight));
-    } catch {
-      // ignore
-    }
+    lsSet("fyp_lh", String(lineHeight));
     setTimeout(() => {
       try {
         fit.current?.fit();
@@ -1779,63 +1744,6 @@ export function App() {
     }
   }
 
-  function renderPinnedBar() {
-    const slots = slotCfg.slots;
-    return (
-      <div className="pinBar">
-        {Array.from({ length: slots }).map((_, idx) => {
-          const slot = idx + 1;
-          const s = pinnedBySlot[slot] ?? null;
-          const on = s?.id && s.id === activeId;
-          return (
-            <div
-              key={slot}
-              className={`pinSlot ${on ? "pinOn" : ""} ${s ? "pinFilled" : "pinEmpty"}`}
-              role="button"
-              tabIndex={0}
-              onClick={() => {
-                if (s?.id) openSession(s.id);
-                else setTab("workspace");
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  if (s?.id) openSession(s.id);
-                  else setTab("workspace");
-                }
-              }}
-              aria-label={s?.id ? `Pinned session ${slot}` : `Empty slot ${slot}`}
-            >
-              <div className="pinTop">
-                <span className="pinIdx mono">{slot}</span>
-                {s ? <span className="chip chipOn">{s.tool}</span> : <span className="chip">empty</span>}
-                <div className="spacer" />
-                {s ? (
-                  <button
-                    className="pinX"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      togglePin(s.id);
-                    }}
-                  >
-                    Unpin
-                  </button>
-                ) : null}
-	              </div>
-	              <div className="pinMain mono">{s ? (s.label ? s.label : s.profileId) : "Tap to open Workspace"}</div>
-	              {s?.attention && s.attention > 0 ? (
-	                <div className="pinBadgeRow">
-	                  <span className="badge">{s.attention} waiting</span>
-	                </div>
-	              ) : null}
-	              {s?.preview ? <div className="pinSub mono">{s.preview}</div> : null}
-	            </div>
-	          );
-	        })}
-      </div>
-    );
-  }
-
   async function loadPicker(pathStr?: string, opts?: { showHidden?: boolean }) {
     const p = pathStr ?? pickPath ?? "";
     const showHidden = typeof opts?.showHidden === "boolean" ? opts.showHidden : pickShowHidden;
@@ -1916,15 +1824,6 @@ export function App() {
     }
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [modelList]);
-
-  const filteredModels = useMemo(() => {
-    const prov = String(modelProvider || "").trim();
-    const q = String(modelQuery || "").trim().toLowerCase();
-    let items = modelList;
-    if (prov) items = items.filter((m) => String(m).startsWith(prov + "/"));
-    if (q) items = items.filter((m) => String(m).toLowerCase().includes(q));
-    return items;
-  }, [modelList, modelProvider, modelQuery]);
 
   const codexNativeMessages = useMemo(() => {
     const thread = codexNativeThread;
@@ -2020,104 +1919,47 @@ export function App() {
     return out;
   }, [codexNativeThread]);
 
-  if (authed === "unknown") return (
-    <div className="login">
-      <div style={{ textAlign: "center" }}>
-        <div className="logo" style={{ width: 48, height: 48, fontSize: 14, margin: "0 auto 12px" }}>FYP</div>
-        <div className="muted" style={{ fontSize: 13 }}>Connecting...</div>
-      </div>
-    </div>
-  );
+  if (authed === "unknown") return <ConnectingScreen />;
 
   if (authed === "no") {
     return (
-      <div className="login">
-        <div className="loginCard">
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
-            <div className="logo" style={{ width: 38, height: 38, fontSize: 12 }}>FYP</div>
-            <div className="loginTitle">FromYourPhone</div>
-          </div>
-          <div className="loginSub">Scan the QR code or paste the token from the host terminal.</div>
-          <input
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            placeholder="token..."
-            autoCapitalize="none"
-            autoCorrect="off"
-          />
-          <div className="loginActions">
-            <button
-              className="btn primary"
-              onClick={() => {
-                const u = new URL(window.location.href);
-                u.searchParams.set("token", token.trim());
-                window.location.href = u.toString();
-              }}
-            >
-              Unlock
-            </button>
-            <button className="btn" onClick={() => window.location.reload()}>
-              Retry
-            </button>
-          </div>
-          <div className="loginHint">Or pair with a short code (from Settings on an already-auth’d device).</div>
-          <div className="loginActions" style={{ marginTop: 10 }}>
-            <input
-              value={pairCode}
-              onChange={(e) => setPairCode(e.target.value)}
-              placeholder="pair code (8 chars)"
-              autoCapitalize="characters"
-              autoCorrect="off"
-            />
-            <button
-              className="btn"
-              onClick={async () => {
-                setPairMsg(null);
-                try {
-                  await api("/api/auth/pair/claim", {
-                    method: "POST",
-                    headers: { "content-type": "application/json" },
-                    body: JSON.stringify({ code: pairCode }),
-                  });
-                  window.location.reload();
-                } catch (e: any) {
-                  setPairMsg(typeof e?.message === "string" ? e.message : "pair failed");
-                }
-              }}
-            >
-              Pair
-            </button>
-          </div>
-          {pairMsg ? <div className="loginHint">{pairMsg}</div> : null}
-          <div className="loginHint">Token is stored as an httpOnly cookie after first use.</div>
-        </div>
-      </div>
+      <UnlockScreen
+        token={token}
+        setToken={setToken}
+        pairCode={pairCode}
+        setPairCode={setPairCode}
+        pairMsg={pairMsg}
+        onUnlock={() => {
+          const u = new URL(window.location.href);
+          u.searchParams.set("token", token.trim());
+          window.location.href = u.toString();
+        }}
+        onRetry={() => window.location.reload()}
+        onPair={async () => {
+          setPairMsg(null);
+          try {
+            await api("/api/auth/pair/claim", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ code: pairCode }),
+            });
+            window.location.reload();
+          } catch (e: any) {
+            setPairMsg(typeof e?.message === "string" ? e.message : "pair failed");
+          }
+        }}
+      />
     );
   }
 
   return (
     <div className="shell">
-      <header className="hdr">
-        <div className="hdrLeft">
-          <div className="logo">FYP</div>
-          <div className="hdrText">
-            <div className="hdrTitle">FromYourPhone</div>
-            <div className="hdrMeta">
-              <span className={`chip ${online && globalWsState === "open" ? "chipOn" : ""}`}>
-                {!online ? "offline" : globalWsState === "open" ? "live" : globalWsState === "connecting" ? "reconnecting" : "disconnected"}
-              </span>
-              {activeSession ? (
-                <span className="chip mono" style={{ fontSize: 10 }}>{activeSession.tool}</span>
-              ) : null}
-            </div>
-          </div>
-        </div>
-        <div className="hdrRight">
-          <button className="btn ghost" onClick={() => setTab("settings")} aria-label="Settings" style={{ padding: "8px 10px" }}>
-            <IconSettings />
-          </button>
-        </div>
-      </header>
+      <HeaderBar
+        online={online}
+        globalWsState={globalWsState}
+        activeSession={activeSession}
+        onOpenSettings={() => setTab("settings")}
+      />
 
       <main className="stage">
         <section className="viewRun" hidden={tab !== "run"} aria-hidden={tab !== "run"}>
@@ -2136,7 +1978,14 @@ export function App() {
             </div>
           ) : (
             <div className="run">
-              {renderPinnedBar()}
+              <PinnedSlotsBar
+                slots={slotCfg.slots}
+                activeId={activeId}
+                pinnedBySlot={pinnedBySlot}
+                onOpenSession={openSession}
+                onOpenWorkspace={() => setTab("workspace")}
+                onTogglePin={togglePin}
+              />
               <div className="runBar">
                 <div className="runInfo">
                   <div className={`dot ${activeSession?.running ? "dotOn" : "dotOff"}`}>
@@ -2222,122 +2071,33 @@ export function App() {
 
               <div className="termPanel" ref={runSurfaceRef}>
                 {activeIsCodexNative ? (
-                  <div className="nativeChat" ref={nativeChatRef}>
-                    <div className="nativeHead">
-                      <span className="chip chipOn">codex native</span>
-                      <span className="mono nativeMeta">{String(activeSession?.toolSessionId ?? "").slice(0, 12)}</span>
-                      <div className="spacer" />
-                      {codexNativeLoading ? <span className="chip mono">loading</span> : null}
-                    </div>
-                    {codexNativeMsg ? <div className="nativeError mono">{codexNativeMsg}</div> : null}
-                    <div className="nativeMsgs">
-                      {codexNativeMessages.length === 0 && !codexNativeLive ? (
-                        <div className="nativeEmpty">
-                          <div className="help">No messages yet. Send something below.</div>
-                        </div>
-                      ) : null}
-                      {codexNativeMessages.map((m) => (
-                        <div
-                          key={m.id}
-                          className={`bubbleRow ${m.role === "user" ? "bubbleUser" : "bubbleAssistant"}`}
-                        >
-                          <div className="bubble">
-                            <div className="bubbleKind mono">{m.kind}</div>
-                            <FencedMessage text={m.text} />
-                          </div>
-                        </div>
-                      ))}
-                      {codexNativeLive ? (
-                        <div className="bubbleRow bubbleAssistant">
-                          <div className="bubble">
-                            <div className="bubbleKind mono">{codexNativeLive.kind}</div>
-                            <FencedMessage text={codexNativeLive.text} />
-                          </div>
-                        </div>
-                      ) : null}
-                      {codexNativeDiff ? (
-                        <details className="nativeDiff">
-                          <summary className="mono">Diff</summary>
-                          <pre className="mdCode">
-                            <code>{codexNativeDiff}</code>
-                          </pre>
-                        </details>
-                      ) : null}
-                    </div>
-                  </div>
+                  <CodexNativeThreadView
+                    threadId={String(activeSession?.toolSessionId ?? "")}
+                    loading={codexNativeLoading}
+                    error={codexNativeMsg}
+                    messages={codexNativeMessages}
+                    live={codexNativeLive}
+                    diff={codexNativeDiff}
+                    innerRef={nativeChatRef}
+                  />
                 ) : (
                   <>
                     <div className="term" ref={termRef} />
                     {!activeAttention && tuiAssist ? (
-                      <div className="assistOverlay" aria-label="Terminal assist">
-                        <div className="assistCard">
-                          <div className="assistHead">
-                            <span className="chip">assist</span>
-                            <span className="mono assistTitle">{tuiAssist.title}</span>
-                            <div className="spacer" />
-                            <button
-                              className="btn ghost"
-                              onClick={() => {
-                                dismissedAssistSig.current = String(tuiAssist.signature ?? "");
-                                setTuiAssist(null);
-                              }}
-                            >
-                              Hide
-                            </button>
-                          </div>
-                          {tuiAssist.body ? <div className="assistBody mono">{tuiAssist.body}</div> : null}
-                          <div className="assistActions">
-                            {(tuiAssist.options ?? []).slice(0, 12).map((o) => {
-                              const label = String(o.label ?? "");
-                              const low = label.toLowerCase();
-                              const isNav = low === "up" || low === "down" || low === "tab" || low === "shift+tab" || low === "esc";
-                              const isEnter = low === "enter";
-                              const cls = isEnter ? "btn primary" : isNav ? "btn ghost" : "btn";
-                              return (
-                                <button key={o.id} className={cls} onClick={() => sendRaw(String(o.send ?? ""))}>
-                                  {label}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      </div>
+                      <TerminalAssistOverlay
+                        assist={tuiAssist}
+                        onHide={() => {
+                          dismissedAssistSig.current = String(tuiAssist.signature ?? "");
+                          setTuiAssist(null);
+                        }}
+                        onSend={(send) => sendRaw(send)}
+                      />
                     ) : null}
                   </>
                 )}
               </div>
 
-              {events.length ? (
-                <div className="historyBar">
-                  <span className="chip mono">recent</span>
-                  <div className="historyScroll">
-                    {events
-                      .filter(
-                        (e) =>
-                          e.kind === "input" ||
-                          e.kind === "interrupt" ||
-                          e.kind === "stop" ||
-                          e.kind === "kill" ||
-                          e.kind === "inbox.respond" ||
-                          e.kind === "inbox.dismiss",
-                      )
-                      .slice(-8)
-                      .map((e) => (
-                        <div key={e.id} className={`historyItem ${e.kind === "input" ? "historyInput" : "historyAction"}`}>
-                          <span className="mono">
-                            {e.kind === "input"
-                              ? formatInputForDisplay(e.data?.text ?? "").slice(0, 44)
-                              : e.kind === "inbox.respond"
-                                ? `INBOX:${String(e.data?.optionId ?? "").slice(0, 6) || "OK"}`
-                                : e.kind === "inbox.dismiss"
-                                  ? "INBOX:DISMISS"
-                                  : e.kind.toUpperCase()}
-                          </span>
-                        </div>
-                      ))}
-                  </div>
-                </div>
-              ) : null}
+              <HistoryBar events={events} />
 
               <div className="compose">
                 <textarea
@@ -2529,29 +2289,13 @@ export function App() {
 	                    <div className="row" style={{ padding: 0 }}>
 	                      <div className="list">
 	                        {(() => {
-	                          const map = new Map<string, SessionRow[]>();
-	                          for (const s of w.sessions ?? []) {
-	                            const k = String(s.treePath || s.cwd || w.root || "unknown");
-	                            const arr = map.get(k) ?? [];
-	                            arr.push(s);
-	                            map.set(k, arr);
-	                          }
-	                          const groups = Array.from(map.entries())
-	                            .map(([k, sess]) => ({
-	                              key: k,
-	                              last: Math.max(0, ...sess.map((s) => Number(s.updatedAt ?? 0))),
-	                              sessions: sess.sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0)),
-	                            }))
-	                            .sort((a, b) => b.last - a.last);
-
-	                          const labelForTree = (treePath: string): string => {
-	                            if (!w.isGit) return "dir";
-	                            if (treePath === w.root) return "main";
-	                            const wt = trees.find((t) => t.path === treePath) ?? null;
-	                            if (wt?.branch) return wt.branch.replace(/^refs\/heads\//, "");
-	                            if (wt?.detached) return "detached";
-	                            return "tree";
-	                          };
+	                          const groups = groupByRecent(
+	                            w.sessions ?? [],
+	                            (s) => String(s.treePath || s.cwd || w.root || "unknown"),
+	                            (s) => Number(s.updatedAt ?? 0),
+	                          );
+	                          const labelForTree = (treePath: string): string =>
+	                            treeLabel({ isGit: w.isGit, root: String(w.root || ""), trees }, treePath);
 
 	                          return groups.map((g) => (
 	                            <div key={g.key}>
@@ -2559,7 +2303,7 @@ export function App() {
 	                                <span className="chip">{labelForTree(g.key)}</span>
 	                                <span className="mono groupPath">{g.key}</span>
 	                              </div>
-	                              {g.sessions.map((s) => {
+	                              {g.items.map((s) => {
 	                                const isPinned =
 	                                  typeof s.pinnedSlot === "number" && Number.isFinite(s.pinnedSlot) && s.pinnedSlot >= 1 && s.pinnedSlot <= 6;
 	                                return (
@@ -2632,33 +2376,18 @@ export function App() {
                           }
                           return best || p;
                         };
-
-                        const map = new Map<string, ToolSessionSummary[]>();
-                        for (const ts of items) {
-                          if (!ts?.cwd) continue;
-                          if (wsRoot && !isUnder(ts.cwd, wsRoot)) continue;
-                          const k = pickTreeRoot(String(ts.cwd));
-                          const arr = map.get(k) ?? [];
-                          arr.push(ts);
-                          map.set(k, arr);
-                        }
-
-                        const groups = Array.from(map.entries())
-                          .map(([k, sess]) => ({
-                            key: k,
-                            last: Math.max(0, ...sess.map((s) => Number(s.updatedAt ?? 0))),
-                            sessions: sess.sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0)),
-                          }))
-                          .sort((a, b) => b.last - a.last);
-
-                        const labelForTree = (treePath: string): string => {
-                          if (!w.isGit) return "dir";
-                          if (treePath === w.root) return "main";
-                          const wt = trees.find((t) => t.path === treePath) ?? null;
-                          if (wt?.branch) return wt.branch.replace(/^refs\/heads\//, "");
-                          if (wt?.detached) return "detached";
-                          return "tree";
-                        };
+                        const filtered = items.filter((ts) => {
+                          if (!ts?.cwd) return false;
+                          if (wsRoot && !isUnder(ts.cwd, wsRoot)) return false;
+                          return true;
+                        });
+                        const groups = groupByRecent(
+                          filtered,
+                          (ts) => pickTreeRoot(String(ts.cwd)),
+                          (ts) => Number(ts.updatedAt ?? 0),
+                        );
+                        const labelForTree = (treePath: string): string =>
+                          treeLabel({ isGit: w.isGit, root: String(w.root || ""), trees }, treePath);
 
                         return (
                           <>
@@ -2692,7 +2421,7 @@ export function App() {
                                       <span className="chip">{labelForTree(g.key)}</span>
                                       <span className="mono groupPath">{g.key}</span>
                                     </div>
-                                    {g.sessions.map((ts) => (
+                                    {g.items.map((ts) => (
                                       <div
                                         key={ts.id}
                                         className="listRow listRowDiv"
@@ -3281,509 +3010,159 @@ export function App() {
         ) : null}
       </main>
 
-      <nav className="nav">
-        <button className={`navBtn ${tab === "run" ? "navOn" : ""}`} onClick={() => setTab("run")}>
-          <IconTerminal />
-          <span className="navLabel">Terminal</span>
-        </button>
-        <button className={`navBtn ${tab === "workspace" ? "navOn" : ""}`} onClick={() => setTab("workspace")}>
-          <IconFolder />
-          <span className="navLabel">Projects</span>
-        </button>
-        <button className={`navBtn ${tab === "inbox" ? "navOn" : ""}`} onClick={() => {
+      <BottomNav
+        tab={tab}
+        inboxCount={workspaceInboxCount}
+        onSetTab={setTab}
+        onOpenInbox={() => {
           refreshInbox({ workspaceKey: selectedWorkspaceKey });
           setTab("inbox");
-        }}>
-          <IconInbox />
-          <span className="navLabel">Inbox</span>
-          {workspaceInboxCount > 0 ? <span className="navBadge">{workspaceInboxCount}</span> : null}
-        </button>
-        <button className={`navBtn ${tab === "new" ? "navOn" : ""}`} onClick={() => setTab("new")}>
-          <IconPlus />
-          <span className="navLabel">New</span>
-        </button>
-      </nav>
+        }}
+      />
 
-      {showPicker ? (
-        <div className="modalOverlay" role="dialog" aria-modal="true">
-          <div className="modal">
-            <div className="modalHead">
-              <b>Pick Workspace Folder</b>
-              <span className="chip mono">{pickPath || ""}</span>
-              <div className="spacer" />
-              <button className="btn" onClick={() => setShowPicker(false)}>
-                Close
-              </button>
-              <button
-                className="btn primary"
-                onClick={() => {
-                  setCwd(pickPath);
-                  setShowPicker(false);
-                  setToast("Workspace selected");
-                }}
-              >
-                Use
-              </button>
-            </div>
-            <div className="modalBody">
-              <div className="inline">
-                <input value={pickPath} onChange={(e) => setPickPath(e.target.value)} placeholder="/path/to/workspace" autoCapitalize="none" autoCorrect="off" />
-                <button className="btn" onClick={() => loadPicker(pickPath)}>
-                  Go
-                </button>
-                {pickParent ? (
-                  <button className="btn" onClick={() => loadPicker(pickParent)}>
-                    Up
-                  </button>
-                ) : null}
-                <button
-                  className={`btn ${pickShowHidden ? "primary" : "ghost"}`}
-                  onClick={async () => {
-                    const next = !pickShowHidden;
-                    setPickShowHidden(next);
-                    await loadPicker(pickPath, { showHidden: next });
-                  }}
-                >
-                  {pickShowHidden ? "Hide dotfolders" : "Show dotfolders"}
-                </button>
-              </div>
-              <div className="list">
-                {pickEntries.map((e) => (
-                  <button className="listRow" key={e.path} onClick={() => e.kind === "dir" && loadPicker(e.path)}>
-                    <div className="listLeft">
-                      <span className="chip">{e.kind}</span>
-                      <div className="listText">
-                        <div className="listTitle">{e.name}</div>
-                        <div className="listSub mono">{e.path}</div>
-                      </div>
-                    </div>
-                    <div className="listRight">{e.kind === "dir" ? ">" : ""}</div>
-                  </button>
-                ))}
-              </div>
-              <div className="help">Dot-folders are hidden by default. Use the toggle above for `.worktrees`, `.git`, etc.</div>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <PickerModal
+        open={showPicker}
+        path={pickPath}
+        parent={pickParent}
+        entries={pickEntries}
+        showHidden={pickShowHidden}
+        onClose={() => setShowPicker(false)}
+        onUse={(p) => {
+          setCwd(p);
+          setShowPicker(false);
+          setToast("Workspace selected");
+        }}
+        onSetPath={setPickPath}
+        onGo={(p) => loadPicker(p)}
+        onUp={(p) => loadPicker(p)}
+        onToggleHidden={async (next) => {
+          setPickShowHidden(next);
+          await loadPicker(pickPath, { showHidden: next });
+        }}
+      />
 
-      {showConfig ? (
-        <div className="modalOverlay" role="dialog" aria-modal="true">
-          <div className="modal">
-            <div className="modalHead">
-              <b>config.toml</b>
-              <span className="chip">live profiles</span>
-              <div className="spacer" />
-              <button className="btn" onClick={() => setShowConfig(false)}>
-                Close
-              </button>
-              <button className="btn primary" onClick={saveConfig}>
-                Save
-              </button>
-            </div>
-            <div className="modalBody">
-              <textarea className="codebox" value={configToml} onChange={(e) => setConfigToml(e.target.value)} />
-              <div className="help">{configMsg ? configMsg : "Tip: use tool-native fields, not startup macros."}</div>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <ConfigModal
+        open={showConfig}
+        toml={configToml}
+        msg={configMsg}
+        onChange={setConfigToml}
+        onClose={() => setShowConfig(false)}
+        onSave={saveConfig}
+      />
+      <ModelPickerModal
+        open={showModelPicker}
+        providers={modelProviders}
+        provider={modelProvider}
+        query={modelQuery}
+        models={modelList}
+        loading={modelLoading}
+        msg={modelListMsg}
+        selectedModel={String(opencodeOpt.model || "").trim()}
+        onClose={() => setShowModelPicker(false)}
+        onProviderChange={setModelProvider}
+        onQueryChange={setModelQuery}
+        onReload={async () => {
+          await loadOpenCodeModels({ provider: "" });
+          setToast("Loaded models");
+        }}
+        onRefresh={async () => {
+          await loadOpenCodeModels({ provider: "", refresh: true });
+          setToast("Refreshed models");
+        }}
+        onClear={() => {
+          setOpenCodeOpt((p) => ({ ...p, model: "" }));
+          setToast("Model cleared");
+          setShowModelPicker(false);
+        }}
+        onSelect={(s) => {
+          setOpenCodeOpt((p) => ({ ...p, model: s }));
+          setToast(`Selected: ${s}`);
+          setShowModelPicker(false);
+        }}
+      />
 
-      {showModelPicker ? (
-        <div className="modalOverlay" role="dialog" aria-modal="true">
-          <div className="modal">
-            <div className="modalHead">
-              <b>OpenCode Models</b>
-              <span className="chip mono">{modelList.length}</span>
-              <div className="spacer" />
-              <button className="btn" onClick={() => setShowModelPicker(false)}>
-                Close
-              </button>
-            </div>
-            <div className="modalBody">
-              <div className="grid2">
-                <div className="field">
-                  <label>Provider</label>
-                  <select value={modelProvider} onChange={(e) => setModelProvider(e.target.value)}>
-                    <option value="">All providers</option>
-                    {modelProviders.map((p) => (
-                      <option key={p} value={p}>
-                        {p}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="field">
-                  <label>Search</label>
-                  <input
-                    value={modelQuery}
-                    onChange={(e) => setModelQuery(e.target.value)}
-                    placeholder="glm, kimi, gpt-5, ... (filter)"
-                    autoCapitalize="none"
-                    autoCorrect="off"
-                  />
-                </div>
-                <div className="runBtns span2" style={{ marginTop: 10 }}>
-                  <button
-                    className="btn"
-                    disabled={modelLoading}
-                    onClick={async () => {
-                      await loadOpenCodeModels({ provider: "" });
-                      setToast("Loaded models");
-                    }}
-                  >
-                    Reload
-                  </button>
-                  <button
-                    className="btn primary"
-                    disabled={modelLoading}
-                    onClick={async () => {
-                      await loadOpenCodeModels({ provider: "", refresh: true });
-                      setToast("Refreshed models");
-                    }}
-                  >
-                    Refresh
-                  </button>
-                  <button
-                    className="btn ghost"
-                    onClick={() => {
-                      setOpenCodeOpt((p) => ({ ...p, model: "" }));
-                      setToast("Model cleared");
-                      setShowModelPicker(false);
-                    }}
-                  >
-                    Clear
-                  </button>
-                </div>
-              </div>
-              {modelListMsg ? <div className="help mono">{modelListMsg}</div> : null}
-              <div className="help">
-                Model IDs are <span className="mono">provider/model</span>. If a provider needs credentials, configure it on the host (try{" "}
-                <span className="mono">opencode auth</span>).
-              </div>
+      <ToolChatModal
+        open={showToolChat}
+        session={toolChatSession}
+        messages={toolChatMessages}
+        loading={toolChatLoading}
+        msg={toolChatMsg}
+        limit={toolChatLimit}
+        onClose={() => setShowToolChat(false)}
+        onOlder={() => {
+          if (!toolChatSession) return;
+          return openToolChat(toolChatSession.tool, toolChatSession.id, { limit: Math.min(5000, toolChatLimit * 2), keep: true });
+        }}
+        onAll={() => {
+          if (!toolChatSession) return;
+          return openToolChat(toolChatSession.tool, toolChatSession.id, { limit: 5000, keep: true });
+        }}
+        onRefresh={() => {
+          if (!toolChatSession) return;
+          return openToolChat(toolChatSession.tool, toolChatSession.id, { refresh: true, limit: toolChatLimit, keep: true });
+        }}
+        onResume={() => {
+          if (!toolChatSession) return;
+          return startFromToolSession(toolChatSession, "resume");
+        }}
+        onFork={() => {
+          if (!toolChatSession) return;
+          return startFromToolSession(toolChatSession, "fork");
+        }}
+      />
 
-              <div className="list">
-                {filteredModels.slice(0, 240).map((m) => {
-                  const s = String(m);
-                  const idx = s.indexOf("/");
-                  const prov = idx > 0 ? s.slice(0, idx) : "model";
-                  const name = idx > 0 ? s.slice(idx + 1) : s;
-                  const selected = String(opencodeOpt.model || "").trim() === s;
-                  return (
-                    <button
-                      className={`listRow ${selected ? "listRowOn" : ""}`}
-                      key={s}
-                      onClick={() => {
-                        setOpenCodeOpt((p) => ({ ...p, model: s }));
-                        setToast(`Selected: ${s}`);
-                        setShowModelPicker(false);
-                      }}
-                    >
-                      <div className="listLeft">
-                        <span className={`chip ${selected ? "chipOn" : ""}`}>{prov}</span>
-                        <div className="listText">
-                          <div className="listTitle mono">{name}</div>
-                          <div className="listSub mono">{s}</div>
-                        </div>
-                      </div>
-                      <div className="listRight mono">{selected ? "selected" : ""}</div>
-                    </button>
-                  );
-                })}
-              </div>
-              <div className="help mono">
-                {filteredModels.length > 240 ? `Showing 240 of ${filteredModels.length}. Refine provider/search.` : `Showing ${filteredModels.length}.`}
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <LogModal open={showLog} events={events} onClose={() => setShowLog(false)} />
 
-      {showToolChat ? (
-        <div className="modalOverlay" role="dialog" aria-modal="true">
-          <div className="modal modalChat">
-            <div className="modalHead">
-              <b>Chat History</b>
-              {toolChatSession ? <span className="chip chipOn">{toolChatSession.tool}</span> : <span className="chip">loading</span>}
-              {toolChatSession?.id ? <span className="chip mono">{toolChatSession.id.slice(0, 8)}</span> : null}
-              <span className="chip mono">{toolChatMessages.length}/{toolChatLimit}</span>
-              <div className="spacer" />
-              {toolChatSession ? (
-                <>
-                  <button
-                    className="btn"
-                    onClick={() => openToolChat(toolChatSession.tool, toolChatSession.id, { limit: Math.min(5000, toolChatLimit * 2), keep: true })}
-                    disabled={toolChatLoading || toolChatLimit >= 5000 || toolChatMessages.length < toolChatLimit}
-                  >
-                    Older
-                  </button>
-                  <button
-                    className="btn ghost"
-                    onClick={() => openToolChat(toolChatSession.tool, toolChatSession.id, { limit: 5000, keep: true })}
-                    disabled={toolChatLoading || toolChatLimit >= 5000 || toolChatMessages.length < toolChatLimit}
-                  >
-                    All
-                  </button>
-                  <button
-                    className="btn"
-                    onClick={() => openToolChat(toolChatSession.tool, toolChatSession.id, { refresh: true, limit: toolChatLimit, keep: true })}
-                    disabled={toolChatLoading}
-                  >
-                    Refresh
-                  </button>
-                  <button className="btn primary" onClick={() => startFromToolSession(toolChatSession, "resume")} disabled={toolChatLoading}>
-                    Resume
-                  </button>
-                  <button className="btn ghost" onClick={() => startFromToolSession(toolChatSession, "fork")} disabled={toolChatLoading}>
-                    Fork
-                  </button>
-                </>
-              ) : null}
-              <button className="btn" onClick={() => setShowToolChat(false)}>
-                Close
-              </button>
-            </div>
-            <div className="modalBody">
-              {toolChatSession?.cwd ? <div className="help mono">{toolChatSession.cwd}</div> : null}
-              {toolChatMsg ? <div className="help mono">{toolChatMsg}</div> : null}
-              {toolChatLoading ? <div className="help">Loading chat...</div> : null}
-              {toolChatSession && !toolChatLoading ? (
-                toolChatMessages.length >= toolChatLimit && toolChatLimit < 5000 ? (
-                  <div className="help">Showing the last {toolChatMessages.length} messages. Tap Older (or All) to load more.</div>
-                ) : (
-                  <div className="help">Full chat history loaded for this session.</div>
-                )
-              ) : null}
-              <div className="chatList">
-                {toolChatMessages.map((m, idx) => (
-                  <div key={idx} className={`chatMsg ${m.role === "user" ? "chatUser" : "chatAssistant"}`}>
-                    <div className="chatMeta mono">
-                      {m.role} · {new Date(m.ts).toLocaleString()}
-                    </div>
-                    <div className="chatText">
-                      <FencedMessage text={m.text} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {showLog ? (
-        <div className="modalOverlay" role="dialog" aria-modal="true">
-          <div className="modal">
-            <div className="modalHead">
-              <b>Session Log</b>
-              <span className="chip">{events.length}</span>
-              <div className="spacer" />
-              <button className="btn" onClick={() => setShowLog(false)}>
-                Close
-              </button>
-            </div>
-            <div className="modalBody">
-              <div className="list">
-                {events.slice(-200).map((e) => (
-                  <div key={e.id} className="listRow" style={{ cursor: "default" }}>
-                    <div className="listLeft">
-                      <span className="chip">{e.kind}</span>
-                      <div className="listText">
-                        <div className="listTitle mono">
-                          {formatEventLine(e).slice(0, 320)}
-                        </div>
-                        <div className="listSub mono">{new Date(e.ts).toLocaleString()}</div>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div className="help">This includes your inputs plus actions (interrupt/stop/kill) and approval decisions.</div>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {showControls ? (
-        <div className="modalOverlay" role="dialog" aria-modal="true">
-          <div className="modal">
-            <div className="modalHead">
-              <b>Controls</b>
-              {activeSession ? <span className="chip mono">{activeSession.tool}</span> : null}
-              <div className="spacer" />
-              <button className="btn" onClick={() => setShowControls(false)}>
-                Close
-              </button>
-	            </div>
-	            <div className="modalBody">
-                <div className="row">
-                  <div className="cardTitle">Views</div>
-                  <div className="runBtns" style={{ marginTop: 10 }}>
-                    <button
-                      className="btn"
-                      onClick={() => {
-                        setShowControls(false);
-                        setShowLog(true);
-                      }}
-                    >
-                      Log
-                    </button>
-                    <button
-                      className="btn"
-                      onClick={() => {
-                        const t = activeSession?.tool ?? null;
-                        const sid = String(activeSession?.toolSessionId ?? "");
-                        if ((t !== "codex" && t !== "claude") || !sid) {
-                          setToast("Chat history not linked yet");
-                          return;
-                        }
-                        setShowControls(false);
-                        openToolChat(t, sid);
-                      }}
-                    >
-                      Chat
-                    </button>
-                  </div>
-                  <div className="help">Tool-native chat history is stored by Codex/Claude on this host.</div>
-                </div>
-	              <div className="row">
-	                <div className="cardTitle">Session</div>
-	                <div className="field" style={{ marginTop: 10 }}>
-	                  <label>Label</label>
-	                  <input
-	                    value={labelDraft}
-	                    onChange={(e) => setLabelDraft(e.target.value)}
-	                    placeholder="optional name (e.g. api-fix, auth, ui)"
-	                    autoCapitalize="none"
-	                    autoCorrect="off"
-	                  />
-	                </div>
-	                <div className="runBtns" style={{ marginTop: 10 }}>
-	                  <button
-	                    className="btn primary"
-	                    onClick={async () => {
-	                      if (!activeSession?.id) return;
-	                      try {
-	                        await setSessionMeta(activeSession.id, { label: labelDraft.trim() ? labelDraft.trim() : null });
-	                        setToast("Saved label");
-	                        setShowControls(false);
-	                        refreshSessions();
-	                        refreshWorkspaces();
-	                      } catch (e: any) {
-	                        setToast(typeof e?.message === "string" ? e.message : "failed to save label");
-	                      }
-	                    }}
-	                  >
-	                    Save
-	                  </button>
-	                  <button className="btn ghost" onClick={() => setLabelDraft("")}>
-	                    Clear label
-	                  </button>
-	                </div>
-	                <div className="help">Labels show on pinned slots and in the Workspace list.</div>
-	              </div>
-		              <div className="row">
-		                <div className="cardTitle">Terminal</div>
-		                <div className="runBtns" style={{ marginTop: 10 }}>
-		                  <button className="btn ghost" onClick={() => setFontSize((n) => Math.max(11, n - 1))}>
-		                    A-
-		                  </button>
-		                  <button className="btn ghost" onClick={() => setFontSize((n) => Math.min(22, n + 1))}>
-		                    A+
-		                  </button>
-		                  <button className="btn" onClick={() => fit.current?.fit()}>
-		                    Fit
-		                  </button>
-		                </div>
-		                <div className="runBtns" style={{ marginTop: 10 }}>
-		                  <button
-		                    className={`btn ${lineHeight <= 1.26 ? "primary" : "ghost"}`}
-		                    onClick={() => setLineHeight(1.24)}
-		                  >
-		                    Tight
-		                  </button>
-		                  <button
-		                    className={`btn ${lineHeight > 1.26 && lineHeight < 1.38 ? "primary" : "ghost"}`}
-		                    onClick={() => setLineHeight(1.32)}
-		                  >
-		                    Normal
-		                  </button>
-		                  <button
-		                    className={`btn ${lineHeight >= 1.38 ? "primary" : "ghost"}`}
-		                    onClick={() => setLineHeight(1.44)}
-		                  >
-		                    Loose
-		                  </button>
-		                </div>
-	                  <div className="runBtns" style={{ marginTop: 10 }}>
-	                    <button className="btn" onClick={copyTermSelection}>
-	                      Copy
-	                    </button>
-	                    <button className="btn" onClick={pasteClipboardToTerm}>
-                      Paste
-                    </button>
-                  </div>
-                  <div className="runBtns" style={{ marginTop: 10 }}>
-                    <button className="btn" onClick={() => sendRaw("\u001b")}>
-                      Esc
-                    </button>
-                    <button className="btn" onClick={() => sendRaw("\t")}>
-                      Tab
-                    </button>
-                    <button className="btn" onClick={() => sendRaw("\u001b[Z")}>
-                      Shift+Tab
-                    </button>
-                    <button className="btn" onClick={() => sendRaw("\r")}>
-                      Enter
-                    </button>
-                  </div>
-                  <div className="runBtns" style={{ marginTop: 10 }}>
-                    <button className="btn" onClick={() => sendRaw("\u001b[D")}>
-                      Left
-                    </button>
-                    <button className="btn" onClick={() => sendRaw("\u001b[A")}>
-                      Up
-                    </button>
-                    <button className="btn" onClick={() => sendRaw("\u001b[B")}>
-                      Down
-                    </button>
-                    <button className="btn" onClick={() => sendRaw("\u001b[C")}>
-                      Right
-                    </button>
-	                  </div>
-	                  <div className="help">Spacing can fix overlapping text on some mobile browsers.</div>
-	                  <div className="help">Copy uses terminal selection. Paste reads from clipboard (works best on HTTPS or localhost).</div>
-	                  <div className="help">Use these keys for TUI menus (permissions, mode picker, etc.).</div>
-		              </div>
-	              <div className="row">
-	                <div className="cardTitle">Process</div>
-	                <div className="runBtns" style={{ marginTop: 10 }}>
-	                  <button
-	                    className="btn danger"
-	                    disabled={!activeSession?.id || Boolean(activeSession?.running)}
-	                    onClick={() => {
-	                      if (!activeSession?.id) return;
-	                      removeSession(activeSession.id);
-	                    }}
-	                  >
-	                    Remove session
-	                  </button>
-	                  <button
-	                    className="btn danger"
-	                    onClick={() => {
-	                      sendControl("kill");
-	                      setShowControls(false);
-	                    }}
-	                  >
-	                    Kill
-	                  </button>
-	                </div>
-	                <div className="help">Kill sends SIGKILL. Remove deletes this FromYourPhone session from local history.</div>
-	              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <ControlsModal
+        open={showControls}
+        activeSession={activeSession}
+        labelDraft={labelDraft}
+        setLabelDraft={setLabelDraft}
+        fontSize={fontSize}
+        setFontSize={setFontSize}
+        lineHeight={lineHeight}
+        setLineHeight={setLineHeight}
+        onClose={() => setShowControls(false)}
+        onOpenLog={() => {
+          setShowControls(false);
+          setShowLog(true);
+        }}
+        onOpenChat={() => {
+          const t = activeSession?.tool ?? null;
+          const sid = String(activeSession?.toolSessionId ?? "");
+          if ((t !== "codex" && t !== "claude") || !sid) {
+            setToast("Chat history not linked yet");
+            return;
+          }
+          setShowControls(false);
+          openToolChat(t, sid);
+        }}
+        onSaveLabel={async () => {
+          if (!activeSession?.id) return;
+          try {
+            await setSessionMeta(activeSession.id, { label: labelDraft.trim() ? labelDraft.trim() : null });
+            setToast("Saved label");
+            setShowControls(false);
+            refreshSessions();
+            refreshWorkspaces();
+          } catch (e: any) {
+            setToast(typeof e?.message === "string" ? e.message : "failed to save label");
+          }
+        }}
+        onClearLabel={() => setLabelDraft("")}
+        onFit={() => fit.current?.fit()}
+        onCopy={copyTermSelection}
+        onPaste={pasteClipboardToTerm}
+        onSendRaw={sendRaw}
+        onRemoveSession={() => {
+          if (!activeSession?.id) return;
+          removeSession(activeSession.id);
+        }}
+        onKill={() => {
+          sendControl("kill");
+          setShowControls(false);
+        }}
+      />
 
       {toast ? <div className="toast mono">{toast}</div> : null}
     </div>
