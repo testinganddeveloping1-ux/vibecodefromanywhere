@@ -70,6 +70,9 @@ npm install --no-fund --no-audit
 echo "Building..."
 npm run build
 
+# Ensure the installed CLI is executable when invoked via the global `fromyourphone` symlink.
+chmod +x "$APP_DIR/dist/cli.js" 2>/dev/null || true
+
 echo "Linking global CLI (best-effort)..."
 if npm link >/dev/null 2>&1; then
   echo ""
@@ -85,4 +88,3 @@ else
   echo "  export PATH=\"$HOME/.npm-global/bin:\$PATH\""
   echo "  cd \"$APP_DIR\" && npm link"
 fi
-

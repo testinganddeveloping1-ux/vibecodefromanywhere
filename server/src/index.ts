@@ -129,7 +129,6 @@ let pairUrl = "";
 try {
   const r = await fetch(`http://127.0.0.1:${cfg.server.port}/api/auth/pair/start?token=${encodeURIComponent(cfg.auth.token)}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
   });
   if (r.ok) {
     const j = (await r.json()) as any;

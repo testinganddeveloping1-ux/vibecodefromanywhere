@@ -276,22 +276,6 @@ async function main() {
   process.on("SIGINT", () => forward("SIGINT"));
   process.on("SIGTERM", () => forward("SIGTERM"));
 
-  // Best-effort: print a QR after a brief delay, once config exists.
-  setTimeout(() => {
-    try {
-      if (!fs.existsSync(configPath())) return;
-      const cfg = readConfig();
-      const { url } = getAdminUrl(cfg);
-      console.log("\nScan to open on your phone:\n" + url + "\n");
-      qrcode.generate(url, { small: true });
-      console.log("\nTip (encrypted, no port forwarding): use Tailscale and run:");
-      console.log("  tailscale serve https / http://127.0.0.1:" + (cfg.server?.port ?? 7337));
-      console.log("");
-    } catch {
-      // ignore
-    }
-  }, 1200);
-
   child.on("exit", (code) => process.exit(code ?? 0));
 }
 

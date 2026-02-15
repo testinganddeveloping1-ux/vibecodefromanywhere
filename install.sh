@@ -28,6 +28,7 @@ fi
 
 npm install --no-fund --no-audit
 npm run build
+chmod +x dist/cli.js 2>/dev/null || true
 
 echo ""
 if [ "$GLOBAL" -eq 1 ]; then
