@@ -7,6 +7,7 @@ export type StoreSessionRow = {
   id: string;
   tool: ToolId;
   profileId: string;
+  transport: string;
   toolSessionId: string | null;
   cwd: string | null;
   workspaceKey: string | null;
@@ -50,6 +51,7 @@ export function createStore(baseDir: string) {
       id TEXT PRIMARY KEY,
       tool TEXT NOT NULL,
       profileId TEXT NOT NULL,
+      transport TEXT,
       toolSessionId TEXT,
       cwd TEXT,
       workspaceKey TEXT,
@@ -127,9 +129,10 @@ export function createStore(baseDir: string) {
   addCol("treePath", "treePath TEXT");
   addCol("label", "label TEXT");
   addCol("pinnedSlot", "pinnedSlot INTEGER");
+  addCol("transport", "transport TEXT");
 
   const stmtCreateSession = db.prepare(
-    "INSERT INTO sessions (id, tool, profileId, toolSessionId, cwd, workspaceKey, workspaceRoot, treePath, label, pinnedSlot, createdAt, updatedAt, exitCode, signal) VALUES (@id, @tool, @profileId, @toolSessionId, @cwd, @workspaceKey, @workspaceRoot, @treePath, @label, @pinnedSlot, @createdAt, @updatedAt, NULL, NULL)",
+    "INSERT INTO sessions (id, tool, profileId, transport, toolSessionId, cwd, workspaceKey, workspaceRoot, treePath, label, pinnedSlot, createdAt, updatedAt, exitCode, signal) VALUES (@id, @tool, @profileId, @transport, @toolSessionId, @cwd, @workspaceKey, @workspaceRoot, @treePath, @label, @pinnedSlot, @createdAt, @updatedAt, NULL, NULL)",
   );
   const stmtListSessions = db.prepare("SELECT * FROM sessions ORDER BY createdAt DESC");
   const stmtGetSession = db.prepare("SELECT * FROM sessions WHERE id = ?");
@@ -259,6 +262,7 @@ export function createStore(baseDir: string) {
     id: string;
     tool: ToolId;
     profileId: string;
+    transport?: string;
     toolSessionId?: string | null;
     cwd: string | null;
     workspaceKey?: string | null;
@@ -270,6 +274,7 @@ export function createStore(baseDir: string) {
     const now = Date.now();
     stmtCreateSession.run({
       ...input,
+      transport: input.transport ?? "pty",
       toolSessionId: input.toolSessionId ?? null,
       workspaceKey: input.workspaceKey ?? null,
       workspaceRoot: input.workspaceRoot ?? null,
@@ -282,12 +287,15 @@ export function createStore(baseDir: string) {
   }
 
   function listSessions(): StoreSessionRow[] {
-    return stmtListSessions.all() as any;
+    const rows = stmtListSessions.all() as any[];
+    return rows.map((r) => ({ ...r, transport: String(r.transport ?? "pty") })) as any;
   }
 
   function getSession(id: string): StoreSessionRow | null {
     const row = stmtGetSession.get(id) as any;
-    return row ?? null;
+    if (!row) return null;
+    row.transport = String(row.transport ?? "pty");
+    return row as any;
   }
 
   function setSessionMeta(input: {
@@ -528,6 +536,11 @@ export function createStore(baseDir: string) {
     stmtAttentionUpdateStatus.run(status, Date.now(), id);
   }
 
+  function updateAttentionItem(id: number, input: { title: string; body: string; options: any }) {
+    const now = Date.now();
+    stmtAttentionTouchAndUpdate.run(now, input.title, input.body, JSON.stringify(input.options ?? []), id);
+  }
+
   function addAttentionAction(input: { attentionId: number; sessionId: string; action: string; data: any }) {
     stmtAttentionActionInsert.run(input.attentionId, input.sessionId, Date.now(), input.action, JSON.stringify(input.data ?? {}));
   }
@@ -571,6 +584,7 @@ export function createStore(baseDir: string) {
     listInbox,
     getAttentionItem,
     setAttentionStatus,
+    updateAttentionItem,
     addAttentionAction,
     getOpenAttentionCounts,
     doctor,

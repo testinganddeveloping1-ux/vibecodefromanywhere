@@ -771,6 +771,95 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 }
 .xterm .xterm-viewport { border-radius: var(--r-sm); }
 
+/* ---- Codex Native (Structured Thread) ---- */
+.nativeChat {
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.nativeHead {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  background: linear-gradient(to bottom, rgba(6, 8, 16, 0.92), rgba(6, 8, 16, 0.55), rgba(6, 8, 16, 0));
+}
+.nativeMeta {
+  font-size: 11px;
+  color: var(--ink2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46vw;
+}
+.nativeError {
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.08);
+  border-radius: var(--r-md);
+  padding: 10px;
+  color: rgba(255, 220, 220, 0.95);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+.nativeMsgs {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 90px; /* room for the composer */
+}
+.nativeEmpty {
+  padding: 10px 4px;
+}
+.bubbleRow {
+  display: flex;
+}
+.bubbleUser {
+  justify-content: flex-end;
+}
+.bubbleAssistant {
+  justify-content: flex-start;
+}
+.bubble {
+  max-width: 92%;
+  border-radius: var(--r-md);
+  border: 1px solid var(--edge);
+  background: rgba(255, 255, 255, 0.04);
+  padding: 10px 10px 8px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22);
+}
+.bubbleUser .bubble {
+  border-color: rgba(245, 166, 35, 0.22);
+  background: rgba(245, 166, 35, 0.10);
+}
+.bubbleKind {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(184, 198, 220, 0.82);
+  margin-bottom: 6px;
+}
+.nativeDiff {
+  border-radius: var(--r-md);
+  border: 1px solid var(--edge);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 10px 10px 8px;
+}
+.nativeDiff summary {
+  cursor: pointer;
+  color: var(--ink2);
+  font-size: 12px;
+}
+.nativeDiff .mdCode {
+  margin-top: 10px;
+}
+
 /* ---- TUI Assist (Floating Touch Overlay) ---- */
 .assistOverlay {
   position: absolute;

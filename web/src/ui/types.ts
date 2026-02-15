@@ -7,6 +7,7 @@ export type SessionRow = {
   id: string;
   tool: ToolId;
   profileId: string;
+  transport?: string;
   toolSessionId?: string | null;
   cwd?: string | null;
   workspaceKey?: string | null;
@@ -86,4 +87,3 @@ export type Doctor = {
 
 export type EventItem = { id: number; ts: number; kind: string; data: any };
 export type RecentWorkspace = { path: string; lastUsed: number };
-

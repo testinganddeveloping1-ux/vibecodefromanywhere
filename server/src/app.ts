@@ -23,6 +23,7 @@ import { resolveGitForPath, listGitWorktrees } from "./git.js";
 import { nanoid } from "nanoid";
 import { createHash, randomUUID } from "node:crypto";
 import { ToolSessionIndex } from "./tool_sessions.js";
+import { CodexAppServer } from "./codex_app_server.js";
 
 export type AppConfig = {
   token: string;
@@ -361,6 +362,34 @@ main().catch(() => {});
     }
   };
 
+  // Codex App Server (structured protocol) for "Native" Codex sessions.
+  // We start it on-demand when the first native session is created.
+  const codexApp = new CodexAppServer({
+    codexCommand: tools.codex.command,
+    codexArgs: tools.codex.args,
+    log: (msg, data) => log(msg, data),
+  });
+  const codexNativeThreadToSession = new Map<string, string>(); // threadId -> FYP sessionId
+  const codexNativeThreadRun = new Map<string, { running: boolean; turnId: string | null }>(); // threadId -> status
+  const codexNativeThreadMeta = new Map<string, { model: string; modelProvider: string; reasoningEffort: string | null }>(); // threadId -> meta
+  const codexNativeRpcByAttentionId = new Map<number, { requestId: any; method: string }>(); // attentionId -> rpc
+  const codexNativeUserInputByAttentionId = new Map<
+    number,
+    { requestId: any; threadId: string; questions: any[]; idx: number; answers: Record<string, string[]> }
+  >();
+
+  // Restore thread->session mapping after a server restart so native sessions keep working.
+  try {
+    for (const s of store.listSessions()) {
+      const transport = String((s as any).transport ?? "pty");
+      if (s.tool === "codex" && transport === "codex-app-server" && s.toolSessionId) {
+        codexNativeThreadToSession.set(String(s.toolSessionId), s.id);
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   // Buffer DB writes for output chunks so heavy terminal output doesn't stall the UI.
   const outputBuf = new Map<string, { chunks: string[]; bytes: number; timer: any }>();
   function flushOutput(sessionId: string) {
@@ -429,6 +458,198 @@ main().catch(() => {});
       // ignore
     }
   }
+
+  function broadcastSession(sessionId: string, payload: unknown) {
+    const set = sockets.get(sessionId);
+    if (!set) return;
+    for (const sock of set) wsSend(sock, payload);
+  }
+
+  function codexNativeSessionIdForThread(threadId: string): string | null {
+    return codexNativeThreadToSession.get(threadId) ?? null;
+  }
+
+  function touchCodexNativePreview(sessionId: string, chunk: string) {
+    try {
+      updateLastLine(sessionId, chunk);
+    } catch {
+      // ignore
+    }
+  }
+
+  codexApp.on("notification", (n: any) => {
+    const method = typeof n?.method === "string" ? n.method : "";
+    const p = (n?.params ?? null) as any;
+
+    // Most Codex notifications include threadId. Some include a nested thread object.
+    const threadId =
+      typeof p?.threadId === "string"
+        ? p.threadId
+        : typeof p?.thread?.id === "string"
+          ? p.thread.id
+          : "";
+    if (!threadId) return;
+    const sessionId = codexNativeSessionIdForThread(threadId);
+    if (!sessionId) return;
+
+    if (method === "turn/started") {
+      const turnId = typeof p?.turn?.id === "string" ? p.turn.id : typeof p?.turnId === "string" ? p.turnId : null;
+      codexNativeThreadRun.set(threadId, { running: true, turnId });
+      broadcastGlobal({ type: "sessions.changed" });
+      broadcastGlobal({ type: "workspaces.changed" });
+      broadcastSession(sessionId, { type: "codex.native.turn", event: "started", threadId, turnId, turn: p?.turn ?? null, ts: Date.now() });
+      return;
+    }
+
+    if (method === "turn/completed") {
+      const turnId = typeof p?.turn?.id === "string" ? p.turn.id : typeof p?.turnId === "string" ? p.turnId : null;
+      codexNativeThreadRun.set(threadId, { running: false, turnId: null });
+      broadcastGlobal({ type: "sessions.changed" });
+      broadcastGlobal({ type: "workspaces.changed" });
+      broadcastSession(sessionId, { type: "codex.native.turn", event: "completed", threadId, turnId, turn: p?.turn ?? null, ts: Date.now() });
+      return;
+    }
+
+    if (method === "item/agentMessage/delta" && typeof p?.delta === "string") {
+      touchCodexNativePreview(sessionId, p.delta);
+      broadcastSession(sessionId, { type: "codex.native.delta", kind: "agent", ...p, ts: Date.now() });
+      return;
+    }
+    if (method === "item/plan/delta" && typeof p?.delta === "string") {
+      touchCodexNativePreview(sessionId, p.delta);
+      broadcastSession(sessionId, { type: "codex.native.delta", kind: "plan", ...p, ts: Date.now() });
+      return;
+    }
+    if (method === "item/reasoning/textDelta" && typeof p?.delta === "string") {
+      touchCodexNativePreview(sessionId, p.delta);
+      broadcastSession(sessionId, { type: "codex.native.delta", kind: "reasoning", ...p, ts: Date.now() });
+      return;
+    }
+    if (method === "turn/diff/updated" && typeof p?.diff === "string") {
+      broadcastSession(sessionId, { type: "codex.native.diff", threadId, turnId: p?.turnId ?? null, diff: p.diff, ts: Date.now() });
+      return;
+    }
+
+    // Forward a small subset of other structured notifications for debugging and UI sync.
+    if (
+      method === "thread/name/updated" ||
+      method === "thread/tokenUsage/updated" ||
+      method === "item/started" ||
+      method === "item/completed"
+    ) {
+      broadcastSession(sessionId, { type: "codex.native.notification", method, params: p, ts: Date.now() });
+    }
+  });
+
+  codexApp.on("request", (r: any) => {
+    const id = (r?.id ?? null) as any;
+    const method = typeof r?.method === "string" ? r.method : "";
+    const p = (r?.params ?? null) as any;
+    if (!method) return;
+    const threadId = typeof p?.threadId === "string" ? p.threadId : "";
+    if (!threadId) return;
+    const sessionId = codexNativeSessionIdForThread(threadId);
+    if (!sessionId) return;
+
+    // Command execution approval
+    if (method === "item/commandExecution/requestApproval") {
+      const cmd = typeof p?.command === "string" ? p.command : "";
+      const reason = typeof p?.reason === "string" ? p.reason : "";
+      const turnId = typeof p?.turnId === "string" ? p.turnId : "";
+      const itemId = typeof p?.itemId === "string" ? p.itemId : "";
+      const signature = `${sessionId}|codex.native.exec_approval|${threadId}|${turnId}|${itemId}`;
+      const title = cmd ? "Codex approval: Run command" : "Codex approval: Run command";
+      const body = cmd ? `$ ${cmd}` : reason ? reason : "Codex wants to run a command.";
+      // Response shape per Codex App Server spec:
+      // - accept: { decision:"accept", acceptSettings:{ forSession:boolean } }
+      // - decline: { decision:"decline" }
+      const options: any[] = [
+        { id: "y", label: "Allow once", rpc: { requestId: id, result: { decision: "accept", acceptSettings: { forSession: false } } } },
+        { id: "a", label: "Allow for session", rpc: { requestId: id, result: { decision: "accept", acceptSettings: { forSession: true } } } },
+        { id: "n", label: "Deny", rpc: { requestId: id, result: { decision: "decline" } } },
+      ];
+
+      const created = store.createAttentionItem({
+        sessionId,
+        kind: "codex.native.approval.exec",
+        severity: "danger",
+        title,
+        body,
+        signature,
+        options,
+      });
+      const attentionId = created.ok ? created.id : created.existingId ?? -1;
+      if (attentionId !== -1) codexNativeRpcByAttentionId.set(attentionId, { requestId: id, method });
+      broadcastGlobal({ type: "inbox.changed", sessionId });
+      return;
+    }
+
+    // File change approval
+    if (method === "item/fileChange/requestApproval") {
+      const reason = typeof p?.reason === "string" ? p.reason : "";
+      const turnId = typeof p?.turnId === "string" ? p.turnId : "";
+      const itemId = typeof p?.itemId === "string" ? p.itemId : "";
+      const signature = `${sessionId}|codex.native.file_approval|${threadId}|${turnId}|${itemId}`;
+      const title = "Codex approval: Apply edits";
+      const body = reason ? reason : "Codex produced file edits and is asking to apply them.";
+      const options: any[] = [
+        { id: "y", label: "Accept", rpc: { requestId: id, result: { decision: "accept" } } },
+        { id: "n", label: "Decline", rpc: { requestId: id, result: { decision: "decline" } } },
+      ];
+
+      const created = store.createAttentionItem({
+        sessionId,
+        kind: "codex.native.approval.file",
+        severity: "warn",
+        title,
+        body,
+        signature,
+        options,
+      });
+      const attentionId = created.ok ? created.id : created.existingId ?? -1;
+      if (attentionId !== -1) codexNativeRpcByAttentionId.set(attentionId, { requestId: id, method });
+      broadcastGlobal({ type: "inbox.changed", sessionId });
+      return;
+    }
+
+    // request_user_input (touch UI)
+    if (method === "tool/requestUserInput" || method === "item/tool/requestUserInput") {
+      const questions = Array.isArray(p?.questions) ? p.questions : [];
+      const turnId = typeof p?.turnId === "string" ? p.turnId : "";
+      const itemId = typeof p?.itemId === "string" ? p.itemId : "";
+      const signature = `${sessionId}|codex.native.user_input|${threadId}|${turnId}|${itemId}`;
+
+      const q0 = questions[0] ?? null;
+      const qId = typeof q0?.id === "string" ? q0.id : "";
+      const qHeader = typeof q0?.header === "string" && q0.header ? q0.header : "Codex needs input";
+      const qText = typeof q0?.question === "string" && q0.question ? q0.question : "Select an option to continue.";
+      const rawOpts = Array.isArray(q0?.options) ? q0.options : [];
+
+      const options: any[] = rawOpts.length
+        ? rawOpts.slice(0, 10).map((o: any, idx: number) => ({
+            id: String(idx + 1),
+            label: String(o?.label ?? `Option ${idx + 1}`),
+            userInput: { questionId: qId, answers: [String(o?.label ?? "")] },
+          }))
+        : [{ id: "n", label: "Not supported (needs text input)", userInput: { questionId: qId, answers: [""] } }];
+
+      const created = store.createAttentionItem({
+        sessionId,
+        kind: "codex.native.user_input",
+        severity: "info",
+        title: qHeader,
+        body: qText,
+        signature,
+        options,
+      });
+      const attentionId = created.ok ? created.id : created.existingId ?? -1;
+      if (attentionId !== -1) {
+        codexNativeUserInputByAttentionId.set(attentionId, { requestId: id, threadId, questions, idx: 0, answers: {} });
+      }
+      broadcastGlobal({ type: "inbox.changed", sessionId });
+      return;
+    }
+  });
 
   function setAssist(sessionId: string, assist: any | null) {
     const sig = assist && typeof assist.signature === "string" ? assist.signature : "";
@@ -1026,6 +1247,7 @@ main().catch(() => {});
         id: s.id,
         tool: s.tool,
         profileId: s.profileId,
+        transport: s.transport ?? "pty",
         toolSessionId: s.toolSessionId ?? null,
         cwd: s.cwd,
         treePath: s.treePath,
@@ -1035,7 +1257,14 @@ main().catch(() => {});
         pinnedSlot: s.pinnedSlot,
         createdAt: s.createdAt,
         updatedAt: s.updatedAt,
-        running: sessions.getStatus(s.id)?.running ?? false,
+        running:
+          String(s.transport ?? "pty") === "pty"
+            ? sessions.getStatus(s.id)?.running ?? false
+            : String(s.transport ?? "pty") === "codex-app-server" && s.tool === "codex"
+              ? s.toolSessionId
+                ? codexNativeThreadRun.get(String(s.toolSessionId))?.running ?? false
+                : false
+              : false,
         attention: counts[s.id] ?? 0,
         preview: lastPreview.get(s.id)?.line ?? null,
       });
@@ -1154,6 +1383,38 @@ main().catch(() => {});
     return { ok: true, session: sess, messages: messages ?? [] };
   });
 
+  // Codex Native mode (Codex App Server): structured threads/turns for chat-first UIs.
+  app.get("/api/codex-native/threads", async (req, reply) => {
+    const q = (req.query ?? {}) as any;
+    const limit = Number(q?.limit ?? 80);
+    const cursor = typeof q?.cursor === "string" ? q.cursor : null;
+    const archived = q?.archived === "1" || q?.archived === "true" || q?.archived === "yes";
+    try {
+      await codexApp.ensureStarted();
+      const r: any = await codexApp.call("thread/list", {
+        cursor,
+        limit: Math.min(200, Math.max(10, Math.floor(limit || 80))),
+        archived: archived ? true : null,
+      });
+      return { ok: true, data: r?.data ?? [], nextCursor: r?.nextCursor ?? null };
+    } catch (e: any) {
+      return reply.code(400).send({ ok: false, error: "codex_native_unavailable", message: String(e?.message ?? e) });
+    }
+  });
+
+  app.get("/api/codex-native/threads/:id", async (req, reply) => {
+    const params = (req.params ?? {}) as any;
+    const threadId = typeof params.id === "string" ? String(params.id) : "";
+    if (!threadId) return reply.code(400).send({ ok: false, error: "bad_thread_id" });
+    try {
+      await codexApp.ensureStarted();
+      const r: any = await codexApp.call("thread/read", { threadId, includeTurns: true });
+      return { ok: true, thread: r?.thread ?? null };
+    } catch (e: any) {
+      return reply.code(400).send({ ok: false, error: "codex_native_unavailable", message: String(e?.message ?? e) });
+    }
+  });
+
   app.get("/api/inbox", async (req) => {
     const q = req.query as any;
     const limit = Number(q?.limit ?? 120);
@@ -1184,7 +1445,63 @@ main().catch(() => {});
     const opt = opts.find((o: any) => String(o?.id) === optionId) ?? null;
     const send = opt && typeof opt.send === "string" ? opt.send : "";
     const decision = opt && typeof opt.decision === "object" ? opt.decision : null;
-    if (!send && !decision) return reply.code(400).send({ error: "bad_option" });
+    const rpc = opt && typeof opt.rpc === "object" ? opt.rpc : null;
+    const userInput = opt && typeof opt.userInput === "object" ? opt.userInput : null;
+    if (!send && !decision && !rpc && !userInput) return reply.code(400).send({ error: "bad_option" });
+
+    if (userInput && String(item.kind || "").startsWith("codex.native.user_input")) {
+      const st = codexNativeUserInputByAttentionId.get(id);
+      if (!st) return reply.code(409).send({ error: "no_state" });
+
+      const qid = typeof (userInput as any)?.questionId === "string" ? String((userInput as any).questionId) : "";
+      const answersRaw = Array.isArray((userInput as any)?.answers) ? (userInput as any).answers : [];
+      const answers = answersRaw.map((x: any) => String(x ?? "")).filter(Boolean);
+      if (qid) st.answers[qid] = answers.length ? answers : [""]; // best-effort
+
+      st.idx = Math.min(st.questions.length, Math.max(0, (st.idx ?? 0) + 1));
+
+      const nextQ = st.idx < st.questions.length ? st.questions[st.idx] : null;
+      if (nextQ) {
+        const qHeader =
+          typeof nextQ?.header === "string" && nextQ.header ? String(nextQ.header) : "Codex needs input";
+        const qText =
+          typeof nextQ?.question === "string" && nextQ.question ? String(nextQ.question) : "Select an option to continue.";
+        const rawOpts = Array.isArray(nextQ?.options) ? nextQ.options : [];
+        const nextId = typeof nextQ?.id === "string" ? String(nextQ.id) : "";
+        const nextOptions: any[] = rawOpts.length
+          ? rawOpts.slice(0, 10).map((o: any, idx: number) => ({
+              id: String(idx + 1),
+              label: String(o?.label ?? `Option ${idx + 1}`),
+              userInput: { questionId: nextId, answers: [String(o?.label ?? "")] },
+            }))
+          : [{ id: "n", label: "Not supported (needs text input)", userInput: { questionId: nextId, answers: [""] } }];
+
+        try {
+          store.updateAttentionItem(id, { title: qHeader, body: qText, options: nextOptions });
+        } catch {
+          // ignore
+        }
+        broadcastGlobal({ type: "inbox.changed", sessionId: item.sessionId });
+        return { ok: true, pending: true };
+      }
+
+      // Completed: respond to Codex App Server.
+      const out: Record<string, { answers: string[] }> = {};
+      for (const [k, v] of Object.entries(st.answers)) out[k] = { answers: Array.isArray(v) ? v : [] };
+      try {
+        codexApp.respond(st.requestId, { answers: out });
+      } catch {
+        // ignore
+      }
+      codexNativeUserInputByAttentionId.delete(id);
+
+      const evId = store.appendEvent(item.sessionId, "inbox.respond", { attentionId: id, optionId, send: "" });
+      broadcastEvent(item.sessionId, { id: evId, ts: Date.now(), kind: "inbox.respond", data: { attentionId: id, optionId, send: "" } });
+      store.addAttentionAction({ attentionId: id, sessionId: item.sessionId, action: "respond", data: { optionId } });
+      store.setAttentionStatus(id, "sent");
+      broadcastGlobal({ type: "inbox.changed", sessionId: item.sessionId });
+      return { ok: true, event: { id: evId, ts: Date.now(), kind: "inbox.respond", data: { attentionId: id, optionId, send: "" } } };
+    }
 
     if (send) {
       try {
@@ -1197,6 +1514,16 @@ main().catch(() => {});
       const rec = claudeHookRequests.get(item.signature);
       if (rec) rec.decision = decision;
       else claudeHookRequests.set(item.signature, { sessionId: item.sessionId, attentionId: id, createdAt: Date.now(), decision, deliveredAt: null });
+    } else if (rpc) {
+      const rid = (rpc as any)?.requestId;
+      const result = (rpc as any)?.result ?? null;
+      if (rid == null || result == null) return reply.code(400).send({ error: "bad_rpc" });
+      try {
+        codexApp.respond(rid, result);
+      } catch (e: any) {
+        return reply.code(400).send({ error: "rpc_failed", message: String(e?.message ?? "rpc failed") });
+      }
+      codexNativeRpcByAttentionId.delete(id);
     }
 
     const evId = store.appendEvent(item.sessionId, "inbox.respond", { attentionId: id, optionId, send });
@@ -1224,7 +1551,14 @@ main().catch(() => {});
     const counts = store.getOpenAttentionCounts();
     return store.listSessions().map((s) => ({
       ...s,
-      running: sessions.getStatus(s.id)?.running ?? false,
+      running:
+        String(s.transport ?? "pty") === "pty"
+          ? sessions.getStatus(s.id)?.running ?? false
+          : String(s.transport ?? "pty") === "codex-app-server" && s.tool === "codex"
+            ? s.toolSessionId
+              ? codexNativeThreadRun.get(String(s.toolSessionId))?.running ?? false
+              : false
+            : false,
       attention: counts[s.id] ?? 0,
       preview: lastPreview.get(s.id)?.line ?? null,
     }));
@@ -1287,6 +1621,11 @@ main().catch(() => {});
       for (const [sig, r] of claudeHookRequests.entries()) {
         if (r.sessionId === id) claudeHookRequests.delete(sig);
       }
+      if (sess.tool === "codex" && String((sess as any).transport ?? "pty") === "codex-app-server" && sess.toolSessionId) {
+        codexNativeThreadToSession.delete(String(sess.toolSessionId));
+        codexNativeThreadRun.delete(String(sess.toolSessionId));
+        codexNativeThreadMeta.delete(String(sess.toolSessionId));
+      }
     } catch {
       // ignore
     }
@@ -1307,6 +1646,11 @@ main().catch(() => {});
     const toolAction = toolActionRaw === "resume" || toolActionRaw === "fork" ? toolActionRaw : null;
     const toolSessionId = typeof body.toolSessionId === "string" ? body.toolSessionId.trim() : "";
     const wantsToolSession = Boolean(toolAction && toolSessionId);
+    const transportRaw = typeof body.transport === "string" ? body.transport.trim() : "";
+    const transport =
+      tool === "codex" && (transportRaw === "codex-app-server" || transportRaw === "native" || transportRaw === "codex-native")
+        ? "codex-app-server"
+        : "pty";
 
     if ((toolActionRaw || toolSessionId) && !wantsToolSession) {
       return reply.code(400).send({ error: "bad_tool_session" });
@@ -1324,7 +1668,7 @@ main().catch(() => {});
     if (!(toolCaps as any).installed) return reply.code(400).send({ error: "tool_not_installed" });
 
     let toolSess: any | null = null;
-    if (wantsToolSession) {
+    if (wantsToolSession && !(tool === "codex" && transport === "codex-app-server")) {
       toolSess = toolIndex.get(tool as any, toolSessionId, { refresh: false }) ?? toolIndex.get(tool as any, toolSessionId, { refresh: true });
       if (!toolSess) return reply.code(404).send({ error: "tool_session_not_found" });
     }
@@ -1479,6 +1823,174 @@ main().catch(() => {});
     if (tool === "opencode" && cwd) built.args.unshift(cwd);
 
     const id = nanoid(12);
+
+    // Codex Native mode: use Codex App Server (structured protocol) instead of a PTY/TUI.
+    if (tool === "codex" && transport === "codex-app-server") {
+      let approvalPolicy: any = effectiveProfile?.codex?.askForApproval ?? null;
+      let sandbox: any = effectiveProfile?.codex?.sandbox ?? null;
+      if (effectiveProfile?.codex?.fullAuto) approvalPolicy = "never";
+      if (effectiveProfile?.codex?.bypassApprovalsAndSandbox) {
+        approvalPolicy = "never";
+        sandbox = "danger-full-access";
+      }
+
+      try {
+        await codexApp.ensureStarted();
+      } catch (e: any) {
+        return reply.code(400).send({ error: "codex_app_server_unavailable", message: String(e?.message ?? e) });
+      }
+
+      let resp: any = null;
+      try {
+        if (wantsToolSession) {
+          if (toolAction === "resume") {
+            resp = await codexApp.call("thread/resume", {
+              threadId: toolSessionId,
+              cwd,
+              approvalPolicy,
+              sandbox,
+              model: null,
+              modelProvider: null,
+              config: null,
+              baseInstructions: null,
+              developerInstructions: null,
+              personality: null,
+            });
+          } else {
+            resp = await codexApp.call("thread/fork", {
+              threadId: toolSessionId,
+              cwd,
+              approvalPolicy,
+              sandbox,
+              model: null,
+              modelProvider: null,
+              config: null,
+              baseInstructions: null,
+              developerInstructions: null,
+            });
+          }
+        } else {
+          resp = await codexApp.call("thread/start", {
+            cwd,
+            approvalPolicy,
+            sandbox,
+            model: null,
+            modelProvider: null,
+            config: null,
+            baseInstructions: null,
+            developerInstructions: null,
+            personality: null,
+            ephemeral: null,
+            dynamicTools: null,
+            experimentalRawEvents: false,
+          });
+        }
+      } catch (e: any) {
+        return reply.code(400).send({ error: "codex_native_failed", message: String(e?.message ?? e) });
+      }
+
+      const threadId = typeof resp?.thread?.id === "string" ? String(resp.thread.id) : "";
+      if (!threadId) return reply.code(500).send({ error: "codex_native_no_thread" });
+
+      codexNativeThreadToSession.set(threadId, id);
+      if (!codexNativeThreadRun.has(threadId)) codexNativeThreadRun.set(threadId, { running: false, turnId: null });
+      const model = typeof resp?.model === "string" ? String(resp.model) : "";
+      const modelProvider = typeof resp?.modelProvider === "string" ? String(resp.modelProvider) : "";
+      const reasoningEffort = typeof resp?.reasoningEffort === "string" ? String(resp.reasoningEffort) : null;
+      codexNativeThreadMeta.set(threadId, { model, modelProvider, reasoningEffort });
+
+      log("session created (codex native)", { id, tool, profileId, transport, cwd: cwd ?? null, threadId });
+
+      store.createSession({
+        id,
+        tool,
+        profileId,
+        transport: "codex-app-server",
+        toolSessionId: threadId,
+        cwd: cwd ?? null,
+        workspaceKey: null,
+        workspaceRoot: null,
+        treePath: null,
+      });
+
+      const createdEventId = store.appendEvent(id, "session.created", {
+        tool,
+        profileId,
+        transport: "codex-app-server",
+        cwd: cwd ?? null,
+        toolAction: wantsToolSession ? toolAction : null,
+        toolSessionId: wantsToolSession ? toolSessionId : threadId,
+        overrides: overrides ?? {},
+        savePreset,
+        workspaceKey: null,
+        workspaceRoot: null,
+        treePath: null,
+      });
+      broadcastEvent(id, { id: createdEventId, ts: Date.now(), kind: "session.created", data: { tool, profileId, cwd: cwd ?? null } });
+      broadcastGlobal({ type: "sessions.changed" });
+
+      if (cwd && savePreset) {
+        try {
+          store.upsertWorkspacePreset({ path: cwd, tool, profileId, overrides: overrides ?? {} });
+          broadcastGlobal({ type: "workspaces.changed" });
+        } catch {
+          // ignore
+        }
+      }
+
+      if (cwd) {
+        void (async () => {
+          let workspaceKey: string | null = null;
+          let workspaceRoot: string | null = null;
+          let treePath: string | null = null;
+          try {
+            const gr = await resolveGitForPath(cwd);
+            if (gr.ok) {
+              workspaceKey = gr.workspaceKey;
+              workspaceRoot = gr.workspaceRoot;
+              treePath = gr.treeRoot;
+            }
+          } catch {
+            // ignore
+          }
+
+          if (!workspaceKey && !workspaceRoot && !treePath) return;
+          try {
+            const cur = store.getSession(id);
+            if (!cur) return;
+            store.setSessionMeta({
+              id,
+              workspaceKey,
+              workspaceRoot,
+              treePath,
+              label: cur.label ?? null,
+            });
+            const evId = store.appendEvent(id, "session.git", { workspaceKey, workspaceRoot, treePath });
+            if (evId !== -1) {
+              broadcastEvent(id, {
+                id: evId,
+                ts: Date.now(),
+                kind: "session.git",
+                data: { workspaceKey, workspaceRoot, treePath },
+              });
+            }
+            broadcastGlobal({ type: "sessions.changed" });
+            broadcastGlobal({ type: "workspaces.changed" });
+
+            if (savePreset && workspaceKey) {
+              const presetPaths = new Set<string>([workspaceKey]);
+              if (workspaceRoot) presetPaths.add(workspaceRoot);
+              for (const pp of presetPaths) store.upsertWorkspacePreset({ path: pp, tool, profileId, overrides: overrides ?? {} });
+              broadcastGlobal({ type: "workspaces.changed" });
+            }
+          } catch {
+            // ignore
+          }
+        })();
+      }
+
+      return { id };
+    }
 
     // Claude Code: install PermissionRequest hook (session-local via --settings) so approvals show in Inbox.
     if (tool === "claude" && claudeHooksEnabled && caps.claude.supports.settings) {
@@ -1637,9 +2149,19 @@ main().catch(() => {});
     const id = (req.params as any).id as string;
     const s = store.getSession(id);
     if (!s) return reply.code(404).send({ error: "not found" });
+    const transport = String((s as any).transport ?? "pty");
+    const st = transport === "pty" ? sessions.getStatus(id) : null;
+    const running =
+      transport === "pty"
+        ? st?.running ?? false
+        : transport === "codex-app-server" && s.tool === "codex"
+          ? s.toolSessionId
+            ? codexNativeThreadRun.get(String(s.toolSessionId))?.running ?? false
+            : false
+          : false;
     return {
       ...s,
-      status: sessions.getStatus(id) ?? { running: false, pid: null, exitCode: s.exitCode, signal: s.signal },
+      status: st ?? { running, pid: null, exitCode: s.exitCode, signal: s.signal },
     };
   });
 
@@ -1690,37 +2212,120 @@ main().catch(() => {});
     if (!sess) return reply.code(404).send({ error: "not found" });
     const evId = store.appendEvent(id, "input", { text });
     broadcastEvent(id, { id: evId, ts: Date.now(), kind: "input", data: { text } });
-    sessions.write(id, text);
-    if (sess.tool === "codex" && !sess.toolSessionId && sess.cwd) {
-      scheduleCodexToolSessionLink(id, sess.cwd, Date.now());
+    const transport = String((sess as any).transport ?? "pty");
+    if (transport === "codex-app-server" && sess.tool === "codex") {
+      const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
+      if (!threadId) return reply.code(409).send({ error: "no_thread" });
+      // Ensure mapping exists for live notifications.
+      codexNativeThreadToSession.set(threadId, id);
+      try {
+        await codexApp.ensureStarted();
+      } catch (e: any) {
+        return reply.code(400).send({ error: "codex_app_server_unavailable", message: String(e?.message ?? e) });
+      }
+
+      let cleaned = String(text ?? "");
+      if (cleaned.endsWith("\r\n")) cleaned = cleaned.slice(0, -2);
+      else if (cleaned.endsWith("\r")) cleaned = cleaned.slice(0, -1);
+
+      const wantsPlan = String(sess.profileId ?? "").toLowerCase().includes("plan");
+      const meta = codexNativeThreadMeta.get(threadId) ?? null;
+      const collaborationMode =
+        wantsPlan && meta?.model
+          ? { mode: "plan", settings: { model: meta.model, reasoning_effort: null, developer_instructions: null } }
+          : null;
+
+      try {
+        const r: any = await codexApp.call("turn/start", {
+          threadId,
+          input: [{ type: "text", text: cleaned, text_elements: [] }],
+          collaborationMode,
+        });
+        const turnId = typeof r?.turn?.id === "string" ? String(r.turn.id) : null;
+        codexNativeThreadRun.set(threadId, { running: true, turnId });
+        broadcastGlobal({ type: "sessions.changed" });
+        broadcastGlobal({ type: "workspaces.changed" });
+      } catch (e: any) {
+        return reply.code(400).send({ error: "codex_native_failed", message: String(e?.message ?? e) });
+      }
+    } else {
+      sessions.write(id, text);
+      if (sess.tool === "codex" && !sess.toolSessionId && sess.cwd) {
+        scheduleCodexToolSessionLink(id, sess.cwd, Date.now());
+      }
     }
     return { ok: true, event: { id: evId, ts: Date.now(), kind: "input", data: { text } } };
   });
 
   app.post("/api/sessions/:id/interrupt", async (req, reply) => {
     const id = (req.params as any).id as string;
-    if (!store.getSession(id)) return reply.code(404).send({ error: "not found" });
+    const sess = store.getSession(id);
+    if (!sess) return reply.code(404).send({ error: "not found" });
     const evId = store.appendEvent(id, "interrupt", {});
     broadcastEvent(id, { id: evId, ts: Date.now(), kind: "interrupt", data: {} });
-    sessions.interrupt(id);
+    const transport = String((sess as any).transport ?? "pty");
+    if (transport === "codex-app-server" && sess.tool === "codex") {
+      const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
+      const turnId = threadId ? codexNativeThreadRun.get(threadId)?.turnId ?? null : null;
+      if (threadId && turnId) {
+        try {
+          await codexApp.ensureStarted();
+          await codexApp.call("turn/interrupt", { threadId, turnId });
+        } catch {
+          // ignore
+        }
+      }
+    } else {
+      sessions.interrupt(id);
+    }
     return { ok: true, event: { id: evId, ts: Date.now(), kind: "interrupt", data: {} } };
   });
 
   app.post("/api/sessions/:id/stop", async (req, reply) => {
     const id = (req.params as any).id as string;
-    if (!store.getSession(id)) return reply.code(404).send({ error: "not found" });
+    const sess = store.getSession(id);
+    if (!sess) return reply.code(404).send({ error: "not found" });
     const evId = store.appendEvent(id, "stop", {});
     broadcastEvent(id, { id: evId, ts: Date.now(), kind: "stop", data: {} });
-    sessions.stop(id);
+    const transport = String((sess as any).transport ?? "pty");
+    if (transport === "codex-app-server" && sess.tool === "codex") {
+      const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
+      const turnId = threadId ? codexNativeThreadRun.get(threadId)?.turnId ?? null : null;
+      if (threadId && turnId) {
+        try {
+          await codexApp.ensureStarted();
+          await codexApp.call("turn/interrupt", { threadId, turnId });
+        } catch {
+          // ignore
+        }
+      }
+    } else {
+      sessions.stop(id);
+    }
     return { ok: true, event: { id: evId, ts: Date.now(), kind: "stop", data: {} } };
   });
 
   app.post("/api/sessions/:id/kill", async (req, reply) => {
     const id = (req.params as any).id as string;
-    if (!store.getSession(id)) return reply.code(404).send({ error: "not found" });
+    const sess = store.getSession(id);
+    if (!sess) return reply.code(404).send({ error: "not found" });
     const evId = store.appendEvent(id, "kill", {});
     broadcastEvent(id, { id: evId, ts: Date.now(), kind: "kill", data: {} });
-    sessions.kill(id);
+    const transport = String((sess as any).transport ?? "pty");
+    if (transport === "codex-app-server" && sess.tool === "codex") {
+      const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
+      const turnId = threadId ? codexNativeThreadRun.get(threadId)?.turnId ?? null : null;
+      if (threadId && turnId) {
+        try {
+          await codexApp.ensureStarted();
+          await codexApp.call("turn/interrupt", { threadId, turnId });
+        } catch {
+          // ignore
+        }
+      }
+    } else {
+      sessions.kill(id);
+    }
     return { ok: true, event: { id: evId, ts: Date.now(), kind: "kill", data: {} } };
   });
 
@@ -1729,9 +2334,11 @@ main().catch(() => {});
     const body = (req.body ?? {}) as any;
     const cols = Number(body.cols);
     const rows = Number(body.rows);
-    if (!store.getSession(id)) return reply.code(404).send({ error: "not found" });
+    const sess = store.getSession(id);
+    if (!sess) return reply.code(404).send({ error: "not found" });
     if (!Number.isFinite(cols) || !Number.isFinite(rows)) return reply.code(400).send({ error: "invalid size" });
-    sessions.resize(id, cols, rows);
+    const transport = String((sess as any).transport ?? "pty");
+    if (transport === "pty") sessions.resize(id, cols, rows);
     return { ok: true };
   });
 
@@ -1756,7 +2363,8 @@ main().catch(() => {});
 
   app.get("/ws/sessions/:id", { websocket: true }, (socket: WebSocket, req) => {
     const id = (req.params as any).id as string;
-    if (!store.getSession(id)) {
+    const sess = store.getSession(id);
+    if (!sess) {
       try {
         socket.close();
       } catch {
@@ -1764,6 +2372,7 @@ main().catch(() => {});
       }
       return;
     }
+    const transport = String((sess as any).transport ?? "pty");
 
     const set = sockets.get(id) ?? new Set<WebSocket>();
     set.add(socket);
@@ -1794,33 +2403,109 @@ main().catch(() => {});
         if (msg?.type === "input" && typeof msg.text === "string") {
           const evId = store.appendEvent(id, "input", { text: msg.text });
           broadcastEvent(id, { id: evId, ts: Date.now(), kind: "input", data: { text: msg.text } });
-          sessions.write(id, msg.text);
-          try {
-            const sess = store.getSession(id);
-            if (sess && sess.tool === "codex" && !sess.toolSessionId && sess.cwd) {
-              scheduleCodexToolSessionLink(id, sess.cwd, Date.now());
+          if (transport === "codex-app-server" && sess.tool === "codex") {
+            const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
+            if (threadId) codexNativeThreadToSession.set(threadId, id);
+            let cleaned = String(msg.text ?? "");
+            if (cleaned.endsWith("\r\n")) cleaned = cleaned.slice(0, -2);
+            else if (cleaned.endsWith("\r")) cleaned = cleaned.slice(0, -1);
+            const wantsPlan = String(sess.profileId ?? "").toLowerCase().includes("plan");
+            const meta = threadId ? codexNativeThreadMeta.get(threadId) ?? null : null;
+            const collaborationMode =
+              wantsPlan && meta?.model
+                ? { mode: "plan", settings: { model: meta.model, reasoning_effort: null, developer_instructions: null } }
+                : null;
+            void (async () => {
+              if (!threadId) return;
+              try {
+                await codexApp.ensureStarted();
+                const r: any = await codexApp.call("turn/start", {
+                  threadId,
+                  input: [{ type: "text", text: cleaned, text_elements: [] }],
+                  collaborationMode,
+                });
+                const turnId = typeof r?.turn?.id === "string" ? String(r.turn.id) : null;
+                codexNativeThreadRun.set(threadId, { running: true, turnId });
+                broadcastGlobal({ type: "sessions.changed" });
+                broadcastGlobal({ type: "workspaces.changed" });
+              } catch {
+                // ignore
+              }
+            })();
+          } else {
+            sessions.write(id, msg.text);
+            try {
+              const cur = store.getSession(id);
+              if (cur && cur.tool === "codex" && !cur.toolSessionId && cur.cwd) {
+                scheduleCodexToolSessionLink(id, cur.cwd, Date.now());
+              }
+            } catch {
+              // ignore
             }
-          } catch {
-            // ignore
           }
         }
         if (msg?.type === "resize" && Number.isFinite(msg.cols) && Number.isFinite(msg.rows)) {
-          sessions.resize(id, msg.cols, msg.rows);
+          if (transport === "pty") sessions.resize(id, msg.cols, msg.rows);
         }
         if (msg?.type === "interrupt") {
           const evId = store.appendEvent(id, "interrupt", {});
           broadcastEvent(id, { id: evId, ts: Date.now(), kind: "interrupt", data: {} });
-          sessions.interrupt(id);
+          if (transport === "codex-app-server" && sess.tool === "codex") {
+            const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
+            const turnId = threadId ? codexNativeThreadRun.get(threadId)?.turnId ?? null : null;
+            if (threadId && turnId) {
+              void (async () => {
+                try {
+                  await codexApp.ensureStarted();
+                  await codexApp.call("turn/interrupt", { threadId, turnId });
+                } catch {
+                  // ignore
+                }
+              })();
+            }
+          } else {
+            sessions.interrupt(id);
+          }
         }
         if (msg?.type === "stop") {
           const evId = store.appendEvent(id, "stop", {});
           broadcastEvent(id, { id: evId, ts: Date.now(), kind: "stop", data: {} });
-          sessions.stop(id);
+          if (transport === "codex-app-server" && sess.tool === "codex") {
+            const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
+            const turnId = threadId ? codexNativeThreadRun.get(threadId)?.turnId ?? null : null;
+            if (threadId && turnId) {
+              void (async () => {
+                try {
+                  await codexApp.ensureStarted();
+                  await codexApp.call("turn/interrupt", { threadId, turnId });
+                } catch {
+                  // ignore
+                }
+              })();
+            }
+          } else {
+            sessions.stop(id);
+          }
         }
         if (msg?.type === "kill") {
           const evId = store.appendEvent(id, "kill", {});
           broadcastEvent(id, { id: evId, ts: Date.now(), kind: "kill", data: {} });
-          sessions.kill(id);
+          if (transport === "codex-app-server" && sess.tool === "codex") {
+            const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
+            const turnId = threadId ? codexNativeThreadRun.get(threadId)?.turnId ?? null : null;
+            if (threadId && turnId) {
+              void (async () => {
+                try {
+                  await codexApp.ensureStarted();
+                  await codexApp.call("turn/interrupt", { threadId, turnId });
+                } catch {
+                  // ignore
+                }
+              })();
+            }
+          } else {
+            sessions.kill(id);
+          }
         }
       } catch {
         // ignore
@@ -1862,6 +2547,11 @@ main().catch(() => {});
 
   app.addHook("onClose", async () => {
     for (const sid of outputBuf.keys()) flushOutput(sid);
+    try {
+      codexApp.stop();
+    } catch {
+      // ignore
+    }
     sessions.dispose();
     store.close();
   });

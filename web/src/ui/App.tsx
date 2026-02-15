@@ -79,6 +79,13 @@ export function App() {
   const [toolChatMsg, setToolChatMsg] = useState<string | null>(null);
   const [toolChatLimit, setToolChatLimit] = useState<number>(240);
 
+  // Codex Native (app-server) thread view
+  const [codexNativeThread, setCodexNativeThread] = useState<any | null>(null);
+  const [codexNativeLoading, setCodexNativeLoading] = useState(false);
+  const [codexNativeMsg, setCodexNativeMsg] = useState<string | null>(null);
+  const [codexNativeLive, setCodexNativeLive] = useState<{ kind: string; threadId: string; turnId: string; itemId: string; text: string } | null>(null);
+  const [codexNativeDiff, setCodexNativeDiff] = useState<string | null>(null);
+
   const [slotCfg, setSlotCfg] = useState<{ slots: 3 | 4 | 6 }>(() => {
     try {
       const raw = typeof window !== "undefined" ? window.localStorage.getItem("fyp_slots") : null;
@@ -99,6 +106,7 @@ export function App() {
   });
 
   const [codexOpt, setCodexOpt] = useState({
+    transport: "codex-app-server",
     sandbox: "",
     askForApproval: "",
     fullAuto: false,
@@ -127,6 +135,8 @@ export function App() {
     () => (activeId ? sessions.find((s) => s.id === activeId) ?? null : null),
     [activeId, sessions],
   );
+  const activeIsCodexNative =
+    activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
   const activeWorkspaceKey = (activeSession?.workspaceKey ?? selectedWorkspaceKey ?? null) as string | null;
   const pinnedBySlot = useMemo(() => {
     const out: Record<number, SessionRow> = {};
@@ -182,15 +192,18 @@ export function App() {
   const [modelLoading, setModelLoading] = useState(false);
 
   const termRef = useRef<HTMLDivElement | null>(null);
+  const runSurfaceRef = useRef<HTMLDivElement | null>(null);
   const term = useRef<XTermTerminal | null>(null);
   const fit = useRef<XTermFitAddon | null>(null);
   const roRef = useRef<ResizeObserver | null>(null);
   const termInit = useRef<Promise<void> | null>(null);
+  const nativeChatRef = useRef<HTMLDivElement | null>(null);
   const ws = useRef<WebSocket | null>(null);
   const globalWs = useRef<WebSocket | null>(null);
   const connectedSessionId = useRef<string | null>(null);
   const pendingInputBySession = useRef<Record<string, string[]>>({});
   const termOutBuf = useRef<{ chunks: string[]; bytes: number; timer: any } | null>(null);
+  const termReplay = useRef<{ sessionId: string | null; inProgress: boolean }>({ sessionId: null, inProgress: false });
   const selectedWorkspaceKeyRef = useRef<string | null>(null);
   const activeIdRef = useRef<string | null>(null);
   const tabRef = useRef<TabId>("workspace");
@@ -876,19 +889,64 @@ export function App() {
     const id = activeId;
     (async () => {
       try {
+        const isCodexNative =
+          activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
+
+        // Codex Native: load structured thread + connect session socket for live deltas.
+        if (isCodexNative) {
+          termReplay.current = { sessionId: null, inProgress: false };
+          setCodexNativeDiff(null);
+          setCodexNativeLive(null);
+          setCodexNativeThread(null);
+          setCodexNativeMsg(null);
+          setEvents([]);
+          if (!(connectedSessionId.current === id && ws.current && ws.current.readyState === WebSocket.OPEN)) {
+            connectWs(id);
+          }
+          const threadId = typeof activeSession?.toolSessionId === "string" ? String(activeSession.toolSessionId) : "";
+          if (threadId) await loadCodexNativeThread(threadId);
+          await loadSessionEvents(id);
+          return;
+        }
+
+        // PTY: replay transcript + events, then stream live output.
         await ensureTerminalReady();
         if (cancelled) return;
-        if (connectedSessionId.current === id && ws.current && ws.current.readyState === WebSocket.OPEN) return;
+        termReplay.current = { sessionId: id, inProgress: true };
         setEvents([]);
-        connectWs(id);
+        if (!(connectedSessionId.current === id && ws.current && ws.current.readyState === WebSocket.OPEN)) {
+          connectWs(id);
+        }
+        await Promise.all([loadSessionEvents(id), loadSessionTranscriptToTerm(id)]);
       } catch {
         // ignore
+      } finally {
+        if (termReplay.current.sessionId === id) {
+          termReplay.current.inProgress = false;
+          flushTermOutput();
+        }
       }
     })();
     return () => {
       cancelled = true;
+      if (termReplay.current.sessionId === id) termReplay.current.inProgress = false;
     };
-  }, [tab, activeId]);
+  }, [tab, activeId, activeSession?.tool, activeSession?.transport, activeSession?.toolSessionId]);
+
+  useEffect(() => {
+    if (tab !== "run") return;
+    if (!activeIsCodexNative) return;
+    const el = nativeChatRef.current;
+    if (!el) return;
+    const t = setTimeout(() => {
+      try {
+        el.scrollTop = el.scrollHeight;
+      } catch {
+        // ignore
+      }
+    }, 30);
+    return () => clearTimeout(t);
+  }, [tab, activeIsCodexNative, codexNativeThread, codexNativeLive?.text, codexNativeDiff]);
 
   useEffect(() => {
     if (tab !== "run") return;
@@ -922,7 +980,7 @@ export function App() {
     // Swipe left/right on the terminal area to switch pinned sessions.
     // This keeps the UI fast and uncluttered on mobile.
     if (tab !== "run") return;
-    const el = termRef.current;
+    const el = runSurfaceRef.current ?? termRef.current;
     if (!el) return;
     let startX = 0;
     let startY = 0;
@@ -978,6 +1036,46 @@ export function App() {
     });
   }
 
+  async function loadSessionEvents(sessionId: string) {
+    try {
+      const r = await api<{ items: any[] }>(`/api/sessions/${encodeURIComponent(sessionId)}/events?limit=220`);
+      const rows = Array.isArray((r as any)?.items) ? (r as any).items : [];
+      const parsed = rows.map(normalizeEvent).filter(Boolean) as EventItem[];
+      setEvents(parsed);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function loadSessionTranscriptToTerm(sessionId: string) {
+    try {
+      const r = await api<{ items: { chunk: string }[] }>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/transcript?limit=1200`,
+      );
+      const rows = Array.isArray((r as any)?.items) ? (r as any).items : [];
+      const chunks = rows.map((x: any) => (typeof x?.chunk === "string" ? x.chunk : "")).filter(Boolean);
+      if (!chunks.length) return;
+
+      // Write in batches so mobile browsers stay responsive.
+      const joined = chunks.join("");
+      const batchSize = 24_000;
+      for (let i = 0; i < joined.length; i += batchSize) {
+        if (activeIdRef.current !== sessionId) return;
+        term.current?.write(joined.slice(i, i + batchSize));
+        // Yield to the browser event loop.
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((res) => setTimeout(res, 0));
+      }
+      try {
+        (term.current as any)?.scrollToBottom?.();
+      } catch {
+        // ignore
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   function flushTermOutput() {
     const rec = termOutBuf.current;
     if (!rec || rec.chunks.length === 0) return;
@@ -1000,6 +1098,15 @@ export function App() {
     rec.chunks.push(chunk);
     rec.bytes += chunk.length;
     termOutBuf.current = rec;
+    if (termReplay.current.inProgress) {
+      // During transcript replay we buffer live output but avoid flushing so history
+      // doesn't interleave with the replayed scrollback.
+      if (rec.bytes > 900_000 && rec.chunks.length > 220) {
+        rec.chunks = rec.chunks.slice(-220);
+        rec.bytes = rec.chunks.reduce((n, s) => n + s.length, 0);
+      }
+      return;
+    }
     if (rec.bytes > 96_000 || rec.chunks.length > 120) {
       flushTermOutput();
       return;
@@ -1038,16 +1145,20 @@ export function App() {
     ws.current = null;
 
     connectedSessionId.current = id;
-    try {
-      if (termOutBuf.current?.timer) clearTimeout(termOutBuf.current.timer);
-    } catch {
-      // ignore
+    // Only reset the terminal on an intentional session switch (attempt=0).
+    // During reconnects we keep the current scrollback so the UI doesn't "blink" or lose history.
+    if (attempt === 0) {
+      try {
+        if (termOutBuf.current?.timer) clearTimeout(termOutBuf.current.timer);
+      } catch {
+        // ignore
+      }
+      termOutBuf.current = null;
+      term.current?.reset();
+      term.current?.write("\u001b[2J\u001b[H");
+      dismissedAssistSig.current = "";
+      setTuiAssist(null);
     }
-    termOutBuf.current = null;
-    term.current?.reset();
-    term.current?.write("\u001b[2J\u001b[H");
-    dismissedAssistSig.current = "";
-    setTuiAssist(null);
 
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const s = new WebSocket(`${proto}://${window.location.host}/ws/sessions/${id}`);
@@ -1058,6 +1169,38 @@ export function App() {
         if (ws.current !== s) return; // stale socket after a fast session switch
         const msg = JSON.parse(String(ev.data));
         if (msg?.type === "pong") return;
+        if (msg?.type === "codex.native.delta" && typeof msg?.delta === "string") {
+          const kind = typeof msg?.kind === "string" ? msg.kind : "agent";
+          const threadId = typeof msg?.threadId === "string" ? msg.threadId : "";
+          const turnId = typeof msg?.turnId === "string" ? msg.turnId : "";
+          const itemId = typeof msg?.itemId === "string" ? msg.itemId : "";
+          const delta = String(msg.delta ?? "");
+          if (delta) {
+            setCodexNativeLive((prev) => {
+              if (!prev || prev.threadId !== threadId || prev.turnId !== turnId || prev.itemId !== itemId || prev.kind !== kind) {
+                return { kind, threadId, turnId, itemId, text: delta };
+              }
+              return { ...prev, text: prev.text + delta };
+            });
+          }
+          return;
+        }
+        if (msg?.type === "codex.native.diff" && typeof msg?.diff === "string") {
+          setCodexNativeDiff(String(msg.diff ?? ""));
+          return;
+        }
+        if (msg?.type === "codex.native.turn" && typeof msg?.event === "string") {
+          const threadId = typeof msg?.threadId === "string" ? msg.threadId : "";
+          if (msg.event === "started") {
+            setCodexNativeLive(null);
+            setCodexNativeDiff(null);
+          }
+          if (msg.event === "completed" && threadId) {
+            setCodexNativeLive(null);
+            void loadCodexNativeThread(threadId);
+          }
+          return;
+        }
         if (msg.type === "output" && typeof msg.chunk === "string") queueTermOutput(msg.chunk);
         if (msg.type === "assist") {
           const a = (msg?.assist ?? null) as any;
@@ -1305,12 +1448,13 @@ export function App() {
       setToast("No active session");
       return;
     }
+    const isCodexNative = activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
     const suffix = (() => {
       const pid = activeSession?.profileId ?? "";
       const p = pid ? profiles.find((x) => x.id === pid) ?? null : null;
       return typeof p?.sendSuffix === "string" ? p.sendSuffix : "\r";
     })();
-    const full = text + suffix;
+    const full = isCodexNative ? text : text + suffix;
 
     if (ws.current && ws.current.readyState === WebSocket.OPEN && connectedSessionId.current === activeId) {
       ws.current.send(JSON.stringify({ type: "input", text: full }));
@@ -1340,7 +1484,7 @@ export function App() {
     }
   }
 
-	  async function startSessionWith(input: { tool: ToolId; profileId: string; cwd?: string; overrides?: any; savePreset?: boolean; toolAction?: "resume" | "fork"; toolSessionId?: string }) {
+	  async function startSessionWith(input: { tool: ToolId; profileId: string; transport?: string; cwd?: string; overrides?: any; savePreset?: boolean; toolAction?: "resume" | "fork"; toolSessionId?: string }) {
 	    try {
 	      const res = await api<{ id: string }>("/api/sessions", {
 	        method: "POST",
@@ -1348,6 +1492,7 @@ export function App() {
 	        body: JSON.stringify({
 	          tool: input.tool,
 	          profileId: input.profileId,
+	          transport: input.transport,
 	          cwd: input.cwd,
 	          toolAction: input.toolAction,
 	          toolSessionId: input.toolSessionId,
@@ -1399,6 +1544,7 @@ export function App() {
     await startSessionWith({
       tool,
       profileId,
+      transport: tool === "codex" ? String((codexOpt as any).transport ?? "pty") : undefined,
       cwd: cwd.trim() ? cwd.trim() : undefined,
       overrides,
       savePreset,
@@ -1477,6 +1623,21 @@ export function App() {
     }
   }
 
+  async function loadCodexNativeThread(threadId: string) {
+    if (!threadId) return;
+    setCodexNativeMsg(null);
+    setCodexNativeLoading(true);
+    try {
+      const r = await api<{ ok: true; thread: any }>(`/api/codex-native/threads/${encodeURIComponent(threadId)}`);
+      setCodexNativeThread((r as any)?.thread ?? null);
+    } catch (e: any) {
+      setCodexNativeThread(null);
+      setCodexNativeMsg(typeof e?.message === "string" ? e.message : "failed to load Codex thread");
+    } finally {
+      setCodexNativeLoading(false);
+    }
+  }
+
   async function startFromToolSession(ts: ToolSessionSummary, action: "resume" | "fork") {
     try {
       // Prefer per-workspace defaults (tool-native settings and approvals) if present.
@@ -1496,6 +1657,7 @@ export function App() {
       await startSessionWith({
         tool: ts.tool as any,
         profileId: pid,
+        transport: ts.tool === "codex" ? String((codexOpt as any).transport ?? "pty") : undefined,
         cwd: ts.cwd,
         overrides,
         savePreset: false,
@@ -1764,6 +1926,100 @@ export function App() {
     return items;
   }, [modelList, modelProvider, modelQuery]);
 
+  const codexNativeMessages = useMemo(() => {
+    const thread = codexNativeThread;
+    if (!thread) return [] as { id: string; role: "user" | "assistant"; kind: string; text: string }[];
+
+    const out: { id: string; role: "user" | "assistant"; kind: string; text: string }[] = [];
+    const seen = new Set<string>();
+
+    const textFrom = (v: any, depth = 0): string => {
+      if (depth > 4) return "";
+      if (v == null) return "";
+      if (typeof v === "string") return v;
+      if (Array.isArray(v)) return v.map((x) => textFrom(x, depth + 1)).join("");
+      if (typeof v !== "object") return "";
+      if (typeof (v as any).text === "string") return String((v as any).text);
+      if (typeof (v as any).delta === "string") return String((v as any).delta);
+      const te = (v as any).text_elements;
+      if (Array.isArray(te)) return te.map((x: any) => (typeof x?.text === "string" ? x.text : "")).join("");
+      const c = (v as any).content;
+      if (Array.isArray(c)) return c.map((x: any) => textFrom(x, depth + 1)).join("");
+      if (typeof c === "string") return c;
+      return "";
+    };
+
+    const push = (m: { id: string; role: "user" | "assistant"; kind: string; text: string }) => {
+      const text = String(m.text ?? "").trimEnd();
+      if (!text) return;
+      const sig = `${m.role}|${m.kind}|${m.id}|${text.slice(0, 140)}`;
+      if (seen.has(sig)) return;
+      seen.add(sig);
+      out.push({ ...m, text });
+    };
+
+    const turns = Array.isArray((thread as any).turns) ? ((thread as any).turns as any[]) : [];
+    for (const turn of turns) {
+      const turnId = typeof turn?.id === "string" ? String(turn.id) : "";
+
+      const input = Array.isArray(turn?.input) ? (turn.input as any[]) : [];
+      for (let i = 0; i < input.length; i++) {
+        const it = input[i];
+        if (it && typeof it === "object" && it.type === "text" && typeof it.text === "string") {
+          push({ id: `${turnId}:in:${i}`, role: "user", kind: "input", text: String(it.text) });
+        }
+      }
+
+      const items = Array.isArray(turn?.items)
+        ? (turn.items as any[])
+        : Array.isArray(turn?.output)
+          ? (turn.output as any[])
+          : Array.isArray(turn?.messages)
+            ? (turn.messages as any[])
+            : [];
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (!item || typeof item !== "object") continue;
+        const type = typeof item.type === "string" ? String(item.type) : typeof (item as any).kind === "string" ? String((item as any).kind) : "";
+        const itemId = typeof item.id === "string" ? String(item.id) : `${turnId || "turn"}:${i}`;
+
+        if (type === "userMessage") {
+          push({ id: itemId, role: "user", kind: "user", text: textFrom((item as any).text ?? (item as any).content ?? item) });
+          continue;
+        }
+        if (type === "agentMessage") {
+          push({ id: itemId, role: "assistant", kind: "assistant", text: textFrom((item as any).text ?? (item as any).content ?? item) });
+          continue;
+        }
+        if (type === "plan") {
+          push({ id: itemId, role: "assistant", kind: "plan", text: textFrom((item as any).text ?? (item as any).content ?? item) });
+          continue;
+        }
+        if (type === "commandExecution") {
+          const cmd = typeof (item as any).command === "string" ? String((item as any).command) : "";
+          const status = typeof (item as any).status === "string" ? String((item as any).status) : "";
+          const t = cmd ? `$ ${cmd}${status ? `\n[${status}]` : ""}` : textFrom(item);
+          push({ id: itemId, role: "assistant", kind: "command", text: t });
+          continue;
+        }
+        if (type === "fileChange") {
+          const pathsRaw = Array.isArray((item as any).paths)
+            ? (item as any).paths
+            : Array.isArray((item as any).files)
+              ? (item as any).files.map((f: any) => f?.path)
+              : [];
+          const paths = pathsRaw.map((x: any) => String(x ?? "")).filter(Boolean);
+          const t = paths.length ? `Edits:\n- ${paths.join("\n- ")}` : textFrom(item);
+          push({ id: itemId, role: "assistant", kind: "edits", text: t });
+          continue;
+        }
+      }
+    }
+
+    return out;
+  }, [codexNativeThread]);
+
   if (authed === "unknown") return (
     <div className="login">
       <div style={{ textAlign: "center" }}>
@@ -1902,20 +2158,36 @@ export function App() {
 	                </div>
 	                <div className="runBtns">
 	                  <button className="btn" onClick={() => sendControl("interrupt")}>Ctrl+C</button>
-	                  <button
-	                    className="btn"
-	                    onClick={() => {
-	                      const t = activeSession?.tool ?? null;
-	                      const sid = String(activeSession?.toolSessionId ?? "");
-	                      if ((t !== "codex" && t !== "claude") || !sid) {
-	                        setToast("Chat history not linked yet");
-	                        return;
-	                      }
-	                      openToolChat(t, sid);
-	                    }}
-	                  >
-	                    Chat
-	                  </button>
+	                  {!activeIsCodexNative ? (
+	                    <button
+	                      className="btn"
+	                      onClick={() => {
+	                        const t = activeSession?.tool ?? null;
+	                        const sid = String(activeSession?.toolSessionId ?? "");
+	                        if ((t !== "codex" && t !== "claude") || !sid) {
+	                          setToast("Chat history not linked yet");
+	                          return;
+	                        }
+	                        openToolChat(t, sid);
+	                      }}
+	                    >
+	                      Chat
+	                    </button>
+	                  ) : (
+	                    <button
+	                      className="btn"
+	                      onClick={() => {
+	                        const threadId = String(activeSession?.toolSessionId ?? "");
+	                        if (!threadId) {
+	                          setToast("No thread id");
+	                          return;
+	                        }
+	                        void loadCodexNativeThread(threadId);
+	                      }}
+	                    >
+	                      Reload
+	                    </button>
+	                  )}
 	                  <button className="btn ghost" onClick={() => setShowControls(true)}>More</button>
 	                </div>
 	              </div>
@@ -1948,43 +2220,91 @@ export function App() {
                 </div>
               ) : null}
 
-              <div className="termPanel">
-                <div className="term" ref={termRef} />
-                {!activeAttention && tuiAssist ? (
-                  <div className="assistOverlay" aria-label="Terminal assist">
-                    <div className="assistCard">
-                      <div className="assistHead">
-                        <span className="chip">assist</span>
-                        <span className="mono assistTitle">{tuiAssist.title}</span>
-                        <div className="spacer" />
-                        <button
-                          className="btn ghost"
-                          onClick={() => {
-                            dismissedAssistSig.current = String(tuiAssist.signature ?? "");
-                            setTuiAssist(null);
-                          }}
+              <div className="termPanel" ref={runSurfaceRef}>
+                {activeIsCodexNative ? (
+                  <div className="nativeChat" ref={nativeChatRef}>
+                    <div className="nativeHead">
+                      <span className="chip chipOn">codex native</span>
+                      <span className="mono nativeMeta">{String(activeSession?.toolSessionId ?? "").slice(0, 12)}</span>
+                      <div className="spacer" />
+                      {codexNativeLoading ? <span className="chip mono">loading</span> : null}
+                    </div>
+                    {codexNativeMsg ? <div className="nativeError mono">{codexNativeMsg}</div> : null}
+                    <div className="nativeMsgs">
+                      {codexNativeMessages.length === 0 && !codexNativeLive ? (
+                        <div className="nativeEmpty">
+                          <div className="help">No messages yet. Send something below.</div>
+                        </div>
+                      ) : null}
+                      {codexNativeMessages.map((m) => (
+                        <div
+                          key={m.id}
+                          className={`bubbleRow ${m.role === "user" ? "bubbleUser" : "bubbleAssistant"}`}
                         >
-                          Hide
-                        </button>
-                      </div>
-                      {tuiAssist.body ? <div className="assistBody mono">{tuiAssist.body}</div> : null}
-                      <div className="assistActions">
-                        {(tuiAssist.options ?? []).slice(0, 12).map((o) => {
-                          const label = String(o.label ?? "");
-                          const low = label.toLowerCase();
-                          const isNav = low === "up" || low === "down" || low === "tab" || low === "shift+tab" || low === "esc";
-                          const isEnter = low === "enter";
-                          const cls = isEnter ? "btn primary" : isNav ? "btn ghost" : "btn";
-                          return (
-                            <button key={o.id} className={cls} onClick={() => sendRaw(String(o.send ?? ""))}>
-                              {label}
-                            </button>
-                          );
-                        })}
-                      </div>
+                          <div className="bubble">
+                            <div className="bubbleKind mono">{m.kind}</div>
+                            <FencedMessage text={m.text} />
+                          </div>
+                        </div>
+                      ))}
+                      {codexNativeLive ? (
+                        <div className="bubbleRow bubbleAssistant">
+                          <div className="bubble">
+                            <div className="bubbleKind mono">{codexNativeLive.kind}</div>
+                            <FencedMessage text={codexNativeLive.text} />
+                          </div>
+                        </div>
+                      ) : null}
+                      {codexNativeDiff ? (
+                        <details className="nativeDiff">
+                          <summary className="mono">Diff</summary>
+                          <pre className="mdCode">
+                            <code>{codexNativeDiff}</code>
+                          </pre>
+                        </details>
+                      ) : null}
                     </div>
                   </div>
-                ) : null}
+                ) : (
+                  <>
+                    <div className="term" ref={termRef} />
+                    {!activeAttention && tuiAssist ? (
+                      <div className="assistOverlay" aria-label="Terminal assist">
+                        <div className="assistCard">
+                          <div className="assistHead">
+                            <span className="chip">assist</span>
+                            <span className="mono assistTitle">{tuiAssist.title}</span>
+                            <div className="spacer" />
+                            <button
+                              className="btn ghost"
+                              onClick={() => {
+                                dismissedAssistSig.current = String(tuiAssist.signature ?? "");
+                                setTuiAssist(null);
+                              }}
+                            >
+                              Hide
+                            </button>
+                          </div>
+                          {tuiAssist.body ? <div className="assistBody mono">{tuiAssist.body}</div> : null}
+                          <div className="assistActions">
+                            {(tuiAssist.options ?? []).slice(0, 12).map((o) => {
+                              const label = String(o.label ?? "");
+                              const low = label.toLowerCase();
+                              const isNav = low === "up" || low === "down" || low === "tab" || low === "shift+tab" || low === "esc";
+                              const isEnter = low === "enter";
+                              const cls = isEnter ? "btn primary" : isNav ? "btn ghost" : "btn";
+                              return (
+                                <button key={o.id} className={cls} onClick={() => sendRaw(String(o.send ?? ""))}>
+                                  {label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+                  </>
+                )}
               </div>
 
               {events.length ? (
@@ -2186,7 +2506,15 @@ export function App() {
                                     <button
                                       key={p.id}
                                       className={p.danger ? "btn danger" : "btn"}
-                                      onClick={() => startSessionWith({ tool: tp.tool, profileId: p.id, cwd: base, savePreset: false })}
+                                      onClick={() =>
+                                        startSessionWith({
+                                          tool: tp.tool,
+                                          profileId: p.id,
+                                          transport: tp.tool === "codex" ? String((codexOpt as any).transport ?? "pty") : undefined,
+                                          cwd: base,
+                                          savePreset: false,
+                                        })
+                                      }
                                     >
                                       {p.label}
                                     </button>
