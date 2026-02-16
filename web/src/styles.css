@@ -102,7 +102,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 
 /* ==== App Shell ==== */
 #root { position: relative; z-index: 1; height: 100%; }
-.app { height: 100%; display: flex; flex-direction: column; }
+.app { height: 100%; display: flex; flex-direction: column; min-height: 0; }
 .shell {
   height: 100%;
   display: flex;
@@ -110,6 +110,9 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   padding-bottom: calc(var(--nav-h) + var(--safe-b));
   position: relative;
   z-index: 1;
+  /* Prevent body scroll; tabs manage their own scrolling. */
+  min-height: 0;
+  overflow: hidden;
 }
 
 /* ==== Header ==== */
@@ -249,9 +252,9 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 }
 
 @keyframes fadeIn {
-  from { opacity: 0; transform: translateY(3px); }
-  /* Avoid leaving a transform active at rest (can cause canvas/text rendering glitches on iOS). */
-  to { opacity: 1; transform: none; }
+  /* Avoid transforms entirely; they can trigger canvas/text rendering glitches on iOS (xterm). */
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 /* ==== Buttons ==== */
@@ -528,9 +531,12 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   cursor: pointer;
   transition: background var(--t-fast) ease;
   min-height: 54px;
+  /* Make scroll gestures start reliably even on interactive rows. */
+  touch-action: pan-y;
 }
 .listRow:first-child { border-top: 0; }
 .listRow:active { background: rgba(255, 255, 255, 0.025); }
+.listRowDiv { touch-action: pan-y; }
 .listLeft {
   display: flex;
   align-items: center;

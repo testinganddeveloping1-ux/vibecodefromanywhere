@@ -1004,6 +1004,7 @@ export function App() {
     const el = runSurfaceRef.current ?? termRef.current;
     if (!el) return;
     let pointerId: number | null = null;
+    let touchId: number | null = null;
     let startX = 0;
     let startY = 0;
     let lastY = 0;
@@ -1011,15 +1012,30 @@ export function App() {
     let scrollRemainderPx = 0;
 
     const linePx = () => Math.min(46, Math.max(10, fontSize * lineHeight));
+    const inTerminal = (target: EventTarget | null): boolean => {
+      const t = termRef.current;
+      if (!t) return false;
+      if (!target) return false;
+      // Allow gestures only when the touch starts inside the xterm container.
+      // This avoids breaking taps on overlays (like the TUI assist buttons).
+      try {
+        return t.contains(target as any);
+      } catch {
+        return false;
+      }
+    };
 
     const reset = () => {
       pointerId = null;
+      touchId = null;
       mode = "pending";
       scrollRemainderPx = 0;
     };
 
     const onDown = (e: PointerEvent) => {
       if (e.pointerType === "mouse") return;
+      if (touchId != null) return; // touch fallback is active
+      if (!inTerminal(e.target)) return;
       // Capture-phase listeners (see addEventListener options below) ensure we get touch input
       // even if xterm attaches its own handlers and stops propagation.
       try {
@@ -1035,6 +1051,7 @@ export function App() {
       scrollRemainderPx = 0;
       // Prevent xterm selection on touch. We handle focus on tap in onUp.
       try {
+        term.current?.clearSelection();
         e.preventDefault();
       } catch {
         // ignore
@@ -1048,6 +1065,7 @@ export function App() {
 
     const onMove = (e: PointerEvent) => {
       if (e.pointerType === "mouse") return;
+      if (touchId != null) return; // touch fallback is active
       if (pointerId == null || e.pointerId !== pointerId) return;
 
       const dxTotal = e.clientX - startX;
@@ -1071,6 +1089,11 @@ export function App() {
       // Disable xterm selection drag; we implement scrollback ourselves.
       e.preventDefault();
       e.stopPropagation();
+      try {
+        term.current?.clearSelection();
+      } catch {
+        // ignore
+      }
 
       const dy = e.clientY - lastY;
       lastY = e.clientY;
@@ -1090,6 +1113,7 @@ export function App() {
 
     const onUp = (e: PointerEvent) => {
       if (e.pointerType === "mouse") return;
+      if (touchId != null) return; // touch fallback is active
       if (pointerId == null || e.pointerId !== pointerId) return;
 
       const dx = e.clientX - startX;
@@ -1127,6 +1151,7 @@ export function App() {
 
     const onCancel = (e: PointerEvent) => {
       if (e.pointerType === "mouse") return;
+      if (touchId != null) return; // touch fallback is active
       if (pointerId == null || e.pointerId !== pointerId) return;
       try {
         (el as any).releasePointerCapture?.(e.pointerId);
@@ -1142,11 +1167,156 @@ export function App() {
     el.addEventListener("pointermove", onMove, { passive: false, capture: true });
     el.addEventListener("pointerup", onUp, { passive: false, capture: true });
     el.addEventListener("pointercancel", onCancel, { passive: true, capture: true });
+
+    // iOS Safari still has edge-cases where xterm consumes touch events before pointer
+    // listeners fire. Add a touch fallback specifically for mobile.
+    const isIOS = (() => {
+      try {
+        return /iPad|iPhone|iPod/.test(navigator.userAgent || "");
+      } catch {
+        return false;
+      }
+    })();
+
+    const findTouch = (list: TouchList): Touch | null => {
+      if (touchId == null) return null;
+      for (let i = 0; i < list.length; i++) {
+        const t = list.item(i);
+        if (t && t.identifier === touchId) return t;
+      }
+      return null;
+    };
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (!isIOS) return;
+      if (pointerId != null) return;
+      if (e.touches.length !== 1) return;
+      if (!inTerminal(e.target)) return;
+      const t0 = e.touches.item(0);
+      if (!t0) return;
+      touchId = t0.identifier;
+      startX = t0.clientX;
+      startY = t0.clientY;
+      lastY = t0.clientY;
+      mode = "pending";
+      scrollRemainderPx = 0;
+      try {
+        e.stopPropagation();
+        term.current?.clearSelection();
+      } catch {
+        // ignore
+      }
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (!isIOS) return;
+      if (touchId == null) return;
+      const t0 = findTouch(e.touches);
+      if (!t0) return;
+      const dxTotal = t0.clientX - startX;
+      const dyTotal = t0.clientY - startY;
+      const ax = Math.abs(dxTotal);
+      const ay = Math.abs(dyTotal);
+
+      if (mode === "pending") {
+        if (ay > 10 && ay > ax * 1.15) mode = "scroll";
+        else if (ax > 70 && ax > ay * 1.15) mode = "swipe";
+      }
+
+      if (mode !== "scroll") {
+        if (mode === "swipe") {
+          try {
+            e.preventDefault();
+            e.stopPropagation();
+          } catch {
+            // ignore
+          }
+        }
+        return;
+      }
+
+      try {
+        e.preventDefault();
+        e.stopPropagation();
+      } catch {
+        // ignore
+      }
+
+      try {
+        term.current?.clearSelection();
+      } catch {
+        // ignore
+      }
+
+      const dy = t0.clientY - lastY;
+      lastY = t0.clientY;
+      const px = dy + scrollRemainderPx;
+      const lp = linePx();
+      const lines = Math.trunc(px / lp);
+      scrollRemainderPx = px - lines * lp;
+      if (!lines) return;
+      try {
+        term.current?.scrollLines(-lines);
+      } catch {
+        // ignore
+      }
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+      if (!isIOS) return;
+      if (touchId == null) return;
+      const t0 = findTouch(e.changedTouches);
+      if (!t0) {
+        // If our tracked touch ended but wasn't in changedTouches for some reason, reset when no touches remain.
+        if (e.touches.length === 0) reset();
+        return;
+      }
+      const dx = t0.clientX - startX;
+      const dy = t0.clientY - startY;
+      const ax = Math.abs(dx);
+      const ay = Math.abs(dy);
+      const wasTap = mode === "pending" && ax < 8 && ay < 8;
+      const wasSwipe = (mode === "swipe" || mode === "pending") && ax >= 60 && ax > ay * 1.2;
+      reset();
+
+      if (wasTap) {
+        try {
+          term.current?.focus();
+        } catch {
+          // ignore
+        }
+      }
+
+      if (!wasSwipe) return;
+      if (!activeId) return;
+      if (pinnedOrder.length < 2) return;
+      const idx = pinnedOrder.indexOf(activeId);
+      if (idx < 0) return;
+      const dir = dx < 0 ? 1 : -1;
+      const next = (idx + dir + pinnedOrder.length) % pinnedOrder.length;
+      const id = pinnedOrder[next];
+      if (id) openSession(id);
+    };
+
+    const onTouchCancel = (e: TouchEvent) => {
+      if (!isIOS) return;
+      if (touchId == null) return;
+      if (e.touches.length === 0) reset();
+    };
+
+    el.addEventListener("touchstart", onTouchStart, { passive: true, capture: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
+    el.addEventListener("touchend", onTouchEnd, { passive: true, capture: true });
+    el.addEventListener("touchcancel", onTouchCancel, { passive: true, capture: true });
     return () => {
       el.removeEventListener("pointerdown", onDown, { capture: true } as any);
       el.removeEventListener("pointermove", onMove, { capture: true } as any);
       el.removeEventListener("pointerup", onUp, { capture: true } as any);
       el.removeEventListener("pointercancel", onCancel, { capture: true } as any);
+      el.removeEventListener("touchstart", onTouchStart as any, { capture: true } as any);
+      el.removeEventListener("touchmove", onTouchMove as any, { capture: true } as any);
+      el.removeEventListener("touchend", onTouchEnd as any, { capture: true } as any);
+      el.removeEventListener("touchcancel", onTouchCancel as any, { capture: true } as any);
     };
   }, [tab, activeId, pinnedOrder, slotCfg, activeIsCodexNative, fontSize, lineHeight]);
 
