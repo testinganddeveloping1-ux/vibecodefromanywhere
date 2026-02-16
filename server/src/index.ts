@@ -110,8 +110,6 @@ if (await probeExistingServer(probePort)) {
       qrcode.generate(pairUrl, { small: true });
       console.log(`\nFallback (manual): Token link (long)`);
       console.log(`${adminUrl}\n`);
-      const showTokenQr = process.env.FYP_SHOW_TOKEN_QR === "1" || process.env.FYP_SHOW_TOKEN_QR === "true";
-      if (showTokenQr) qrcode.generate(adminUrl, { small: true });
     } else {
       console.log(`\nScan on phone: Token link`);
       console.log(`${adminUrl}\n`);
@@ -213,8 +211,6 @@ if (isLoopbackBind(cfg.server.bind)) {
     qrcode.generate(pairUrl, { small: true });
     console.log(`\nFallback (manual): Token link (long)`);
     console.log(`${adminUrl}\n`);
-    const showTokenQr = process.env.FYP_SHOW_TOKEN_QR === "1" || process.env.FYP_SHOW_TOKEN_QR === "true";
-    if (showTokenQr) qrcode.generate(adminUrl, { small: true });
   } else {
     console.log(`\nScan on phone: Token link`);
     console.log(`${adminUrl}\n`);

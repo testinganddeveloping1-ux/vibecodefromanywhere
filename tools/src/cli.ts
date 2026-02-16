@@ -31,6 +31,11 @@ function localIp(): string | null {
   return null;
 }
 
+function isLoopbackBind(bind: string): boolean {
+  const b = String(bind ?? "").trim().toLowerCase();
+  return b === "127.0.0.1" || b === "::1" || b === "localhost";
+}
+
 function readConfig(): any {
   const p = configPath();
   const raw = fs.readFileSync(p, "utf8");
@@ -66,6 +71,35 @@ function getAdminUrl(cfg: any): { host: string; port: number; url: string } {
   const host = bind === "0.0.0.0" ? localIp() ?? "127.0.0.1" : bind;
   const url = `http://${host}:${port}/?token=${encodeURIComponent(token)}`;
   return { host, port, url };
+}
+
+async function startPairUrl(host: string, port: number, token: string): Promise<string> {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/api/auth/pair/start?token=${encodeURIComponent(token)}`, { method: "POST" });
+    if (!r.ok) return "";
+    const j = (await r.json().catch(() => null)) as any;
+    const code = typeof j?.code === "string" ? j.code : "";
+    if (!code) return "";
+    return `http://${host}:${port}/?pair=${encodeURIComponent(code)}`;
+  } catch {
+    return "";
+  }
+}
+
+async function printRemoteAccess(host: string, port: number, token: string): Promise<void> {
+  const adminUrl = `http://${host}:${port}/?token=${encodeURIComponent(token)}`;
+  const pairUrl = await startPairUrl(host, port, token);
+  if (pairUrl) {
+    console.log("\nScan on phone (recommended): Pair link");
+    console.log(pairUrl + "\n");
+    qrcode.generate(pairUrl, { small: true });
+    console.log("\nFallback (manual): Token link");
+    console.log(adminUrl + "\n");
+    return;
+  }
+  console.log("\nPair endpoint unavailable, using token link:");
+  console.log(adminUrl + "\n");
+  qrcode.generate(adminUrl, { small: true });
 }
 
 function usage() {
@@ -245,9 +279,17 @@ async function main() {
       const cfg = readConfig();
       if (await probeExistingServer(cfg)) {
         const { host, port, url } = getAdminUrl(cfg);
+        const bind = String(cfg?.server?.bind ?? "127.0.0.1");
+        const token = String(cfg?.auth?.token ?? "");
         console.log(`Already running: http://${host}:${port}`);
-        console.log(url + "\n");
-        qrcode.generate(url, { small: true });
+        if (isLoopbackBind(bind)) {
+          console.log(`\nLocal-only mode (bind ${bind}).`);
+          console.log(`Open on this computer:\n  ${url}\n`);
+          console.log("To use on your phone over WiFi, restart with:");
+          console.log("  fromyourphone start --lan\n");
+        } else {
+          await printRemoteAccess(host, port, token);
+        }
         return;
       }
     } catch {

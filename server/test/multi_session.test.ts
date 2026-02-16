@@ -109,5 +109,50 @@ describe("multi session", () => {
     await app.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }, 15_000);
-});
 
+  test("force-removing one session does not break other sessions", async () => {
+    const { app, dir } = await testApp();
+
+    const mk = async () => {
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/sessions",
+        headers: { authorization: "Bearer t123", "content-type": "application/json" },
+        payload: JSON.stringify({ tool: "codex", profileId: "codex.default", savePreset: false }),
+      });
+      expect(created.statusCode).toBe(200);
+      return JSON.parse(created.payload).id as string;
+    };
+
+    const a = await mk();
+    const b = await mk();
+    expect(a).not.toBe(b);
+
+    const del = await app.inject({
+      method: "DELETE",
+      url: `/api/sessions/${encodeURIComponent(a)}?force=1`,
+      headers: { authorization: "Bearer t123" },
+    });
+    expect(del.statusCode).toBe(200);
+    expect(JSON.parse(del.payload)?.ok).toBe(true);
+
+    const afterA = await app.inject({
+      method: "GET",
+      url: `/api/sessions/${encodeURIComponent(a)}`,
+      headers: { authorization: "Bearer t123" },
+    });
+    expect(afterA.statusCode).toBe(404);
+
+    const afterB = await app.inject({
+      method: "GET",
+      url: `/api/sessions/${encodeURIComponent(b)}`,
+      headers: { authorization: "Bearer t123" },
+    });
+    expect(afterB.statusCode).toBe(200);
+    const bodyB = JSON.parse(afterB.payload) as any;
+    expect(bodyB?.id).toBe(b);
+
+    await app.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }, 15_000);
+});

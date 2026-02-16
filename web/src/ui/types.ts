@@ -18,6 +18,7 @@ export type SessionRow = {
   createdAt?: number;
   updatedAt?: number;
   running?: boolean;
+  closing?: boolean;
   attention?: number;
   preview?: string | null;
 };
@@ -74,7 +75,19 @@ export type ToolSessionSummary = {
   gitBranch: string | null;
 };
 
-export type ToolSessionMessage = { role: "user" | "assistant"; ts: number; text: string };
+export type ToolSessionMessageBlock = {
+  type: "text" | "thinking" | "tool_use" | "tool_result";
+  text: string;
+  name?: string;
+  callId?: string;
+};
+
+export type ToolSessionMessage = {
+  role: "user" | "assistant";
+  ts: number;
+  text: string;
+  blocks?: ToolSessionMessageBlock[];
+};
 
 export type Doctor = {
   app?: {

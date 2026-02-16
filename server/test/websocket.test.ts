@@ -172,4 +172,55 @@ describe("websockets", () => {
     await app.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  test("session delete emits closing and closed before websocket closes", async () => {
+    const { app, dir } = await testApp();
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/sessions",
+      headers: { authorization: "Bearer t123", "content-type": "application/json" },
+      payload: JSON.stringify({ tool: "codex", profileId: "codex.default", savePreset: false }),
+    });
+    expect(created.statusCode).toBe(200);
+    const id = JSON.parse(created.payload).id as string;
+    expect(typeof id).toBe("string");
+
+    const types: string[] = [];
+    let wsClosed = false;
+    const ws = await (app as any).injectWS(`/ws/sessions/${encodeURIComponent(id)}`, { headers: { authorization: "Bearer t123" } });
+    ws.on("message", (raw: any) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg?.type) types.push(String(msg.type));
+      } catch {
+        // ignore
+      }
+    });
+    ws.on("close", () => {
+      wsClosed = true;
+    });
+
+    const del = await app.inject({
+      method: "DELETE",
+      url: `/api/sessions/${encodeURIComponent(id)}?force=1`,
+      headers: { authorization: "Bearer t123" },
+    });
+    expect(del.statusCode).toBe(200);
+    expect(JSON.parse(del.payload)?.ok).toBe(true);
+
+    await waitFor(() => types.includes("session.closing"), 5000);
+    await waitFor(() => types.includes("session.closed"), 5000);
+    await waitFor(() => wsClosed, 5000);
+
+    const after = await app.inject({
+      method: "GET",
+      url: `/api/sessions/${encodeURIComponent(id)}`,
+      headers: { authorization: "Bearer t123" },
+    });
+    expect(after.statusCode).toBe(404);
+
+    await app.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }, 15_000);
 });

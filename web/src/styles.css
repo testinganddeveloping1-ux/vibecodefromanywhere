@@ -60,6 +60,16 @@
   --hdr-h: 42px;
   --safe-b: env(safe-area-inset-bottom, 0px);
   --safe-t: env(safe-area-inset-top, 0px);
+  /* Soft keyboard inset (VisualViewport driven). */
+  --kb: 0px;
+  /* Space reserved for the bottom nav (hidden when keyboard is open). */
+  --nav-space: var(--nav-h);
+}
+
+/* When the on-screen keyboard is open, hide the bottom nav so the terminal and
+   composer remain usable on small screens. */
+:root[data-kb="1"] {
+  --nav-space: 0px;
 }
 
 /* ==== Reset ==== */
@@ -78,7 +88,7 @@ body {
   -moz-osx-font-smoothing: grayscale;
   overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
-  user-select: none;
+  user-select: auto;
   /* Allow normal panning/scrolling on touch devices. Specific regions can override. */
   touch-action: pan-x pan-y;
 }
@@ -107,7 +117,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   height: 100%;
   display: flex;
   flex-direction: column;
-  padding-bottom: calc(var(--nav-h) + var(--safe-b));
+  padding-bottom: calc(var(--nav-space) + var(--safe-b) + var(--kb));
   position: relative;
   z-index: 1;
   /* Prevent body scroll; tabs manage their own scrolling. */
@@ -159,13 +169,20 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 /* ==== Bottom Navigation ==== */
 .nav {
   position: fixed;
-  left: 0; right: 0; bottom: 0;
+  left: 0; right: 0; bottom: var(--kb);
   z-index: 40;
   display: flex;
   gap: 2px;
   padding: 4px 12px calc(4px + var(--safe-b));
   background: var(--bg0);
   border-top: 1px solid var(--edge);
+  transition: transform var(--t-mid) var(--ease), opacity var(--t-mid) var(--ease);
+}
+
+:root[data-kb="1"] .nav {
+  transform: translateY(120%);
+  opacity: 0;
+  pointer-events: none;
 }
 .navBtn {
   flex: 1;
@@ -235,10 +252,14 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   overscroll-behavior-y: contain;
   touch-action: pan-y;
   padding: var(--sp-md) var(--sp-md);
+  padding-bottom: var(--sp-md);
   display: flex;
   flex-direction: column;
   gap: var(--sp-md);
   animation: fadeIn var(--t-mid) var(--ease);
+}
+.stage > .view > .card {
+  flex-shrink: 0;
 }
 /* Terminal tab — fills stage, no scroll */
 .stage > .viewRun {
@@ -247,7 +268,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   display: flex;
   flex-direction: column;
   padding: 4px 6px;
-  gap: 4px;
+  padding-bottom: 6px;
+  gap: 6px;
   animation: fadeIn var(--t-mid) var(--ease);
 }
 
@@ -502,6 +524,15 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 
 /* ==== List Rows ==== */
 .list { padding: 0; }
+.list { touch-action: pan-y; }
+.listScrollWorkspace,
+.listScrollSessions,
+.listScrollToolSessions {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
+}
 .groupHdr {
   padding: var(--sp-sm) var(--sp-lg);
   display: flex;
@@ -701,6 +732,10 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   border: none;
 }
 .runBtn:active { transform: scale(0.88); background: var(--surface2); }
+.runBtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 .runAlert {
   display: inline-flex;
   align-items: center;
@@ -811,14 +846,15 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   overscroll-behavior-y: contain;
   flex: 1;
   min-height: 0;
+  z-index: 1;
 }
 .termPanelNative {
   /* Native chat view should scroll normally. */
   touch-action: pan-y;
 }
 .termPanelPty {
-  /* Terminal view: we implement touch scroll + swipe in JS so text selection doesn't eat gestures. */
-  touch-action: none;
+  /* Let browser-native vertical scrolling work if custom handlers don't activate. */
+  touch-action: pan-y;
 }
 .term {
   height: 100%;
@@ -828,7 +864,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 /* xterm.js touch scrolling support (mobile) */
 .termPanel .xterm-viewport {
   -webkit-overflow-scrolling: touch;
-  touch-action: none;
+  touch-action: pan-y;
   background: transparent !important;
   overflow-y: auto !important;
   overflow-x: hidden !important;
@@ -839,6 +875,19 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .termPanel .xterm {
   width: 100% !important;
   height: 100% !important;
+  font-variant-ligatures: none;
+  text-rendering: optimizeSpeed;
+}
+.termPanelPty .xterm,
+.termPanelPty .xterm * {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.termPanelPty {
+  -webkit-touch-callout: none;
+}
+.termPanelPty .xterm-selection div {
+  background: rgba(148, 163, 184, 0.10) !important;
 }
 .termPanel .xterm-screen canvas {
   max-width: 100%;
@@ -906,6 +955,18 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .bubbleUser .bubble {
   background: var(--accent-dim);
   border: 1px solid rgba(245, 166, 35, 0.15);
+}
+.bubbleThinking {
+  border: 1px solid rgba(245, 166, 35, 0.24);
+  background: rgba(245, 166, 35, 0.09);
+}
+.bubbleToolUse {
+  border: 1px solid rgba(59, 130, 246, 0.26);
+  background: rgba(59, 130, 246, 0.10);
+}
+.bubbleToolResult {
+  border: 1px solid rgba(34, 197, 94, 0.26);
+  background: rgba(34, 197, 94, 0.10);
 }
 .bubbleKind {
   font-size: 10px;
@@ -1043,11 +1104,15 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   align-items: flex-end;
   flex-shrink: 0;
   position: relative;
+  margin-top: 4px;
+  margin-bottom: 4px;
+  z-index: 8;
+  pointer-events: auto;
 }
 .compose textarea {
   flex: 1;
   resize: none;
-  min-height: 38px;
+  min-height: 40px;
   max-height: 100px;
   padding: 9px 40px 9px 12px;
   border-radius: var(--r-lg);
@@ -1058,11 +1123,17 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   line-height: 1.4;
   color: var(--ink);
   transition: border-color var(--t-fast) ease;
-  touch-action: pan-y;
+  touch-action: auto;
   -webkit-overflow-scrolling: touch;
+  pointer-events: auto;
+  position: relative;
+  z-index: 1;
 }
 .compose textarea:focus {
   border-color: var(--edge-focus);
+}
+.compose textarea:disabled {
+  opacity: 0.62;
 }
 .composeSend {
   position: absolute;
@@ -1078,8 +1149,24 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   cursor: pointer;
   border: none;
   transition: transform var(--t-fast) ease;
+  z-index: 5;
 }
 .composeSend:active { transform: scale(0.85); }
+.composeSend:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+}
+
+@media (max-width: 767px) {
+  /* Avoid nested scrolling on phones. Nested overflow regions are unreliable on iOS. */
+  .listScrollWorkspace,
+  .listScrollSessions,
+  .listScrollToolSessions {
+    max-height: none;
+    overflow: visible;
+  }
+}
 
 /* ==== Chat Modal ==== */
 .modalChat { max-width: 920px; }
@@ -1111,14 +1198,88 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   font-size: 13px;
   line-height: 1.55;
   color: var(--ink);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chatBlock {
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  border: 1px solid var(--edge2);
+  background: var(--bg1);
+}
+.chatBlockHead,
+.chatBlockSummary {
+  font-size: 11px;
+  color: var(--ink2);
+  margin-bottom: 6px;
+}
+.chatBlockSummary {
+  cursor: pointer;
+  list-style: none;
+}
+.chatBlockSummary::-webkit-details-marker { display: none; }
+.chatBlockText {
+  border-color: transparent;
+  background: transparent;
+  padding: 0;
+}
+.chatBlockThinking {
+  border-color: rgba(245, 166, 35, 0.28);
+  background: rgba(245, 166, 35, 0.10);
+}
+.chatBlockToolUse {
+  border-color: rgba(59, 130, 246, 0.30);
+  background: rgba(59, 130, 246, 0.10);
+}
+.chatBlockToolResult {
+  border-color: rgba(34, 197, 94, 0.30);
+  background: rgba(34, 197, 94, 0.10);
+}
+.chatBlockBody {
+  min-width: 0;
 }
 
 /* ==== Markdown ==== */
 .md { display: block; }
 .mdText {
-  white-space: pre-wrap;
   word-break: break-word;
 }
+.mdP {
+  margin: 0 0 8px 0;
+  white-space: pre-wrap;
+}
+.mdP:last-child { margin-bottom: 0; }
+.mdH1, .mdH2, .mdH3, .mdH4, .mdH5, .mdH6 {
+  font-weight: 700;
+  line-height: 1.35;
+  margin: 0 0 8px 0;
+}
+.mdH1 { font-size: 19px; }
+.mdH2 { font-size: 17px; }
+.mdH3 { font-size: 16px; }
+.mdH4, .mdH5, .mdH6 { font-size: 14px; }
+.mdUl, .mdOl {
+  margin: 0 0 8px 0;
+  padding-left: 20px;
+}
+.mdLi { margin: 2px 0; }
+.mdQuote {
+  margin: 0 0 8px 0;
+  padding: 6px 10px;
+  border-left: 3px solid var(--faint);
+  color: var(--ink2);
+  background: rgba(255, 255, 255, 0.03);
+}
+.mdInlineCode {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+}
+.mdStrong { font-weight: 700; }
+.mdEm { font-style: italic; }
 .mdCode {
   margin: 8px 0;
   padding: 10px 12px;
@@ -1461,6 +1622,7 @@ pre.mdCode[data-lang]::before {
   white-space: nowrap;
   z-index: 60;
   animation: toastIn var(--t-mid) var(--ease);
+  pointer-events: none;
 }
 @keyframes toastIn {
   from { opacity: 0; transform: translateX(-50%) translateY(8px); }
@@ -1504,7 +1666,7 @@ pre.mdCode[data-lang]::before {
 
 /* ==== Selection ==== */
 ::selection {
-  background: rgba(245, 166, 35, 0.25);
+  background: rgba(148, 163, 184, 0.22);
   color: var(--ink);
 }
 
@@ -1520,7 +1682,7 @@ pre.mdCode[data-lang]::before {
   .hdr { padding: 2px var(--sp-sm); min-height: 34px; }
   .navBtn { min-height: 34px; padding: 3px; }
   .navLabel { display: none; }
-  .shell { padding-bottom: calc(42px + var(--safe-b)); }
+  .shell { padding-bottom: calc(var(--nav-space) + var(--safe-b) + var(--kb)); }
   .compose textarea { min-height: 32px; }
 }
 

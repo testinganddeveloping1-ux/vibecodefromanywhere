@@ -1,6 +1,49 @@
 import React from "react";
-import type { ToolSessionMessage, ToolSessionSummary } from "../types";
+import type { ToolSessionMessage, ToolSessionMessageBlock, ToolSessionSummary } from "../types";
 import { FencedMessage } from "../components/FencedMessage";
+
+function renderBlock(block: ToolSessionMessageBlock, idx: number) {
+  const key = `${block.type}-${block.callId ?? ""}-${idx}`;
+  if (block.type === "thinking") {
+    return (
+      <details key={key} className="chatBlock chatBlockThinking">
+        <summary className="chatBlockSummary mono">Thinking</summary>
+        <div className="chatBlockBody">
+          <FencedMessage text={block.text} />
+        </div>
+      </details>
+    );
+  }
+  if (block.type === "tool_use") {
+    return (
+      <div key={key} className="chatBlock chatBlockToolUse">
+        <div className="chatBlockHead mono">
+          Tool call{block.name ? ` · ${block.name}` : ""}{block.callId ? ` · ${block.callId.slice(0, 10)}` : ""}
+        </div>
+        <div className="chatBlockBody">
+          <FencedMessage text={block.text} />
+        </div>
+      </div>
+    );
+  }
+  if (block.type === "tool_result") {
+    return (
+      <details key={key} className="chatBlock chatBlockToolResult">
+        <summary className="chatBlockSummary mono">
+          Tool result{block.callId ? ` · ${block.callId.slice(0, 10)}` : ""}
+        </summary>
+        <div className="chatBlockBody">
+          <FencedMessage text={block.text} />
+        </div>
+      </details>
+    );
+  }
+  return (
+    <div key={key} className="chatBlock chatBlockText">
+      <FencedMessage text={block.text} />
+    </div>
+  );
+}
 
 export function ToolChatModal(props: {
   open: boolean;
@@ -71,7 +114,9 @@ export function ToolChatModal(props: {
                   {m.role} · {new Date(m.ts).toLocaleString()}
                 </div>
                 <div className="chatText">
-                  <FencedMessage text={m.text} />
+                  {Array.isArray(m.blocks) && m.blocks.length > 0
+                    ? m.blocks.map((b, bi) => renderBlock(b, bi))
+                    : <FencedMessage text={m.text} />}
                 </div>
               </div>
             ))}
@@ -81,4 +126,3 @@ export function ToolChatModal(props: {
     </div>
   );
 }
-

@@ -21,6 +21,7 @@ export function UnlockScreen(props: {
   pairCode: string;
   setPairCode: (v: string) => void;
   pairMsg: string | null;
+  unlockMsg: string | null;
   onUnlock: () => void;
   onRetry: () => void;
   onPair: () => void | Promise<void>;
@@ -34,10 +35,10 @@ export function UnlockScreen(props: {
           </div>
           <div className="loginTitle">FromYourPhone</div>
         </div>
-        <div className="loginSub">Scan the Pair QR code (recommended) or paste the token from the host terminal.</div>
+        <div className="loginSub">Use Pair code first (recommended). Token is a fallback.</div>
 
         <div className="loginHint" style={{ marginTop: 8 }}>
-          Pair is easiest: scan the Pair QR from the host. You should only need this once per device.
+          Pair is fastest: scan the host Pair QR, or paste the 8-char code shown on host.
         </div>
         <div className="loginActions" style={{ marginTop: 10 }}>
           <input
@@ -46,6 +47,12 @@ export function UnlockScreen(props: {
             placeholder="pair code (8 chars)"
             autoCapitalize="characters"
             autoCorrect="off"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void props.onPair();
+              }
+            }}
           />
           <button className="btn" onClick={props.onPair}>
             Pair
@@ -54,7 +61,7 @@ export function UnlockScreen(props: {
         {props.pairMsg ? <div className="loginHint">{props.pairMsg}</div> : null}
 
         <div className="loginHint" style={{ marginTop: 10 }}>
-          Fallback: paste the long token (printed on the host) to unlock.
+          Fallback: paste long token from host terminal.
         </div>
         <input
           value={props.token}
@@ -62,6 +69,12 @@ export function UnlockScreen(props: {
           placeholder="token..."
           autoCapitalize="none"
           autoCorrect="off"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              props.onUnlock();
+            }
+          }}
         />
         <div className="loginActions">
           <button className="btn primary" onClick={props.onUnlock}>
@@ -71,7 +84,9 @@ export function UnlockScreen(props: {
             Retry
           </button>
         </div>
-        <div className="loginHint">After first unlock/pair, your device stores an httpOnly cookie so you usually will not be asked again.</div>
+        {props.unlockMsg ? <div className="loginHint">{props.unlockMsg}</div> : null}
+        <div className="loginHint">After first unlock/pair, device stores an httpOnly cookie, so you usually are not asked again.</div>
+        <div className="loginHint">If it auto-opens without asking, that device is already paired.</div>
       </div>
     </div>
   );

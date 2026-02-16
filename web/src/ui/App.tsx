@@ -36,6 +36,26 @@ import { ToolChatModal } from "./modals/ToolChatModal";
 import { LogModal } from "./modals/LogModal";
 import { ControlsModal } from "./modals/ControlsModal";
 
+function cleanPreviewLine(raw: string): string {
+  let s = String(raw ?? "");
+  if (!s.trim()) return "";
+  // Control chars (including C1) can leak into previews and render as weird fragments on phones.
+  s = s.replace(/[\u0000-\u001F\u007F-\u009F]/g, " ");
+  // Some terminals emit cursor-position sequences as visible text when partially stripped (e.g. "4;2H").
+  s = s.replace(/\b\d{1,3}(?:;\d{1,3})+[A-Za-z]\b/g, " ");
+
+  // Codex prompts often include a "›" marker. Keeping the last one makes previews far more readable.
+  const lastPrompt = s.lastIndexOf("›");
+  if (lastPrompt >= 0) s = s.slice(lastPrompt);
+
+  // De-noise common Codex footer hints when they appear.
+  s = s.replace(/\s*\?\s*for shortcuts\b/gi, "?");
+  s = s.replace(/\s*\b\d{1,3}%\s*context left\b\s*$/gi, "");
+
+  s = s.replace(/\s{2,}/g, " ").trim();
+  return s;
+}
+
 export function App() {
   const [authed, setAuthed] = useState<"unknown" | "yes" | "no">("unknown");
   const [token, setToken] = useState("");
@@ -139,6 +159,14 @@ export function App() {
   );
   const activeIsCodexNative =
     activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
+  const activeIsRawTerminal = Boolean(activeSession) && !activeIsCodexNative;
+  const activeSessionClosing = Boolean(activeSession?.closing);
+  const activeToolSessionId = useMemo(() => {
+    const v = typeof activeSession?.toolSessionId === "string" ? String(activeSession.toolSessionId).trim() : "";
+    return v || "";
+  }, [activeSession?.toolSessionId]);
+  const activeCanOpenChatHistory =
+    !activeIsCodexNative && (activeSession?.tool === "codex" || activeSession?.tool === "claude") && Boolean(activeToolSessionId);
   const activeWorkspaceKey = (activeSession?.workspaceKey ?? selectedWorkspaceKey ?? null) as string | null;
   const pinnedBySlot = useMemo(() => {
     const out: Record<number, SessionRow> = {};
@@ -160,6 +188,50 @@ export function App() {
     }
     return ids;
   }, [pinnedBySlot, slotCfg.slots]);
+  const workspaceSessionsSorted = useMemo(() => {
+    const norm = (v: unknown): string => String(v ?? "").trim().replace(/\/+$/g, "");
+    const key = String(activeWorkspaceKey ?? "").trim();
+    const activeRoot = norm(activeSession?.workspaceRoot || activeSession?.treePath || activeSession?.cwd || "");
+    const byId = new Map<string, SessionRow>();
+
+    for (const s of sessions) {
+      const gk = String(s.workspaceKey ?? (s.cwd ? `dir:${s.cwd}` : `dir:${s.id}`));
+      let include = false;
+      if (key && gk === key) include = true;
+
+      if (!include && activeRoot) {
+        const roots = [s.workspaceRoot, s.treePath, s.cwd].map((x) => norm(x)).filter(Boolean);
+        include = roots.some((r) => r === activeRoot || r.startsWith(activeRoot + "/") || activeRoot.startsWith(r + "/"));
+      }
+
+      if (!include) continue;
+      const prev = byId.get(s.id);
+      if (!prev || Number(s.updatedAt ?? 0) >= Number(prev.updatedAt ?? 0)) byId.set(s.id, s);
+    }
+
+    return Array.from(byId.values()).sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
+  }, [sessions, activeWorkspaceKey, activeSession?.workspaceRoot, activeSession?.treePath, activeSession?.cwd]);
+  const workspaceSessionOrder = useMemo(
+    () => workspaceSessionsSorted.map((s) => s.id),
+    [workspaceSessionsSorted],
+  );
+  const fallbackSwitchOrder = useMemo(() => {
+    if (!activeSession) return [] as string[];
+    return sessions
+      .filter((s) => s.tool === activeSession.tool)
+      .slice()
+      .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0))
+      .map((s) => s.id);
+  }, [sessions, activeSession?.tool]);
+  const sessionSwitchOrder = useMemo(
+    () => {
+      const primary = pinnedOrder.length >= 2 ? pinnedOrder : workspaceSessionOrder;
+      if (primary.length >= 2) return primary;
+      if (fallbackSwitchOrder.length >= 2) return fallbackSwitchOrder;
+      return primary;
+    },
+    [pinnedOrder, workspaceSessionOrder, fallbackSwitchOrder],
+  );
   const [composer, setComposer] = useState("");
 
   const [showPicker, setShowPicker] = useState(false);
@@ -185,6 +257,7 @@ export function App() {
   const [pairCode, setPairCode] = useState("");
   const [pairInfo, setPairInfo] = useState<{ code: string; url: string; expiresAt: number } | null>(null);
   const [pairMsg, setPairMsg] = useState<string | null>(null);
+  const [unlockMsg, setUnlockMsg] = useState<string | null>(null);
 
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [modelProvider, setModelProvider] = useState<string>("opencode");
@@ -195,6 +268,7 @@ export function App() {
 
   const termRef = useRef<HTMLDivElement | null>(null);
   const runSurfaceRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const term = useRef<XTermTerminal | null>(null);
   const fit = useRef<XTermFitAddon | null>(null);
   const roRef = useRef<ResizeObserver | null>(null);
@@ -255,11 +329,66 @@ export function App() {
   }, [profiles, tool]);
   const selectedProfile = useMemo(() => profiles.find((p) => p.id === profileId) ?? null, [profiles, profileId]);
   const recentForPicker = useMemo(() => recentWorkspaces.map((r) => r.path).filter(Boolean).slice(0, 8), [recentWorkspaces]);
+  const mergedWorkspaces = useMemo(() => {
+    const norm = (v: string) => String(v || "").trim().replace(/\/+$/g, "");
+    const byRoot = new Map<string, WorkspaceItem>();
+
+    for (const w of workspaces) {
+      const rootNorm = norm(String(w.root || ""));
+      const mergeKey = rootNorm || String(w.key || "");
+      const prev = byRoot.get(mergeKey);
+      if (!prev) {
+        byRoot.set(mergeKey, {
+          ...w,
+          trees: Array.isArray(w.trees) ? [...w.trees] : [],
+          sessions: Array.isArray(w.sessions) ? [...w.sessions] : [],
+        });
+        continue;
+      }
+
+      const out: WorkspaceItem = {
+        ...prev,
+        trees: Array.isArray(prev.trees) ? [...prev.trees] : [],
+        sessions: Array.isArray(prev.sessions) ? [...prev.sessions] : [],
+      };
+
+      const prevIsDir = String(prev.key || "").startsWith("dir:");
+      const curIsDir = String(w.key || "").startsWith("dir:");
+      if (prevIsDir && !curIsDir) out.key = w.key;
+
+      if ((!prev.root || prev.root === "(unknown)") && w.root && w.root !== "(unknown)") out.root = w.root;
+      out.isGit = Boolean(prev.isGit || w.isGit);
+
+      const treeMap = new Map<string, any>();
+      for (const t of [...(prev.trees ?? []), ...(w.trees ?? [])]) {
+        const p = String((t as any)?.path ?? "");
+        if (!p) continue;
+        treeMap.set(p, t);
+      }
+      out.trees = Array.from(treeMap.values());
+
+      const sessMap = new Map<string, SessionRow>();
+      for (const s of [...(prev.sessions ?? []), ...(w.sessions ?? [])]) {
+        const sid = String((s as any)?.id ?? "");
+        if (!sid) continue;
+        const cur = sessMap.get(sid);
+        if (!cur || Number((s as any)?.updatedAt ?? 0) >= Number((cur as any)?.updatedAt ?? 0)) {
+          sessMap.set(sid, s as SessionRow);
+        }
+      }
+      out.sessions = Array.from(sessMap.values()).sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
+      out.lastUsed = Math.max(Number(prev.lastUsed ?? 0), Number(w.lastUsed ?? 0), ...out.sessions.map((s) => Number(s.updatedAt ?? 0)));
+
+      byRoot.set(mergeKey, out);
+    }
+
+    return Array.from(byRoot.values()).sort((a, b) => Number(b.lastUsed ?? 0) - Number(a.lastUsed ?? 0));
+  }, [workspaces]);
   const filteredWorkspaces = useMemo(() => {
     const q = workspaceQuery.trim().toLowerCase();
-    if (!q) return workspaces;
-    return workspaces.filter((w) => String(w.root).toLowerCase().includes(q) || String(w.key).toLowerCase().includes(q));
-  }, [workspaceQuery, workspaces]);
+    if (!q) return mergedWorkspaces;
+    return mergedWorkspaces.filter((w) => String(w.root).toLowerCase().includes(q) || String(w.key).toLowerCase().includes(q));
+  }, [workspaceQuery, mergedWorkspaces]);
 
   async function ensureTerminalReady(): Promise<void> {
     if (term.current && fit.current) return;
@@ -299,23 +428,42 @@ export function App() {
           return "\"IBM Plex Mono\", ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Monaco, Consolas, monospace";
         }
       })();
+      const isPhoneLike = (() => {
+        try {
+          const coarse = typeof window !== "undefined" && typeof window.matchMedia === "function"
+            ? window.matchMedia("(pointer: coarse)").matches
+            : false;
+          const ua = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
+          return coarse || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+        } catch {
+          return false;
+        }
+      })();
+      const safeFontSize = isPhoneLike ? Math.max(13, fontSize) : fontSize;
+      // iOS/Android canvas rendering can clip lines when lineHeight is too tight.
+      const safeLineHeight = isPhoneLike ? Math.max(1.45, lineHeight) : lineHeight;
 
-	      const t = new Terminal({
-	        cursorBlink: true,
-	        fontFamily: monoStack,
-	        fontSize,
-	        lineHeight,
-	        theme: {
-	          background: "#060810",
-	          foreground: "#e4eaf4",
-	          cursor: "#f5a623",
-          selectionBackground: "rgba(245,166,35,.25)",
+      const t = new Terminal({
+        cursorBlink: true,
+        fontFamily: monoStack,
+        fontSize: safeFontSize,
+        lineHeight: safeLineHeight,
+        theme: {
+          background: "#060810",
+          foreground: "#e4eaf4",
+          cursor: "#f5a623",
+          selectionBackground: "rgba(148,163,184,.14)",
           selectionForeground: "#eaf0fa",
         },
         scrollback: 8000,
-        allowTransparency: true,
+        allowTransparency: !isPhoneLike,
         rightClickSelectsWord: false,
       });
+      try {
+        (t.options as any).customGlyphs = !isPhoneLike;
+      } catch {
+        // ignore
+      }
       const f = new FitAddon();
       t.loadAddon(f);
       t.open(el2);
@@ -327,6 +475,16 @@ export function App() {
       }
       term.current = t;
       fit.current = f;
+      try {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            fit.current?.fit();
+            t.refresh(0, Math.max(0, t.rows - 1));
+          });
+        });
+      } catch {
+        // ignore
+      }
 
       // Make the terminal interactive: forward keystrokes to the remote PTY.
       t.onData((data) => {
@@ -485,6 +643,45 @@ export function App() {
   }
 
   useEffect(() => {
+    // Mobile soft keyboard handling:
+    // When the keyboard opens, the VisualViewport shrinks (esp. iOS Safari).
+    // We expose the inset as a CSS var so the bottom UI doesn't get clipped.
+    const root = document.documentElement;
+    let raf = 0;
+
+    const update = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        try {
+          const vv: any = (window as any).visualViewport;
+          const vvHeight = typeof vv?.height === "number" ? vv.height : window.innerHeight;
+          const vvTop = typeof vv?.offsetTop === "number" ? vv.offsetTop : 0;
+          const kb = Math.max(0, window.innerHeight - vvHeight - vvTop);
+          root.style.setProperty("--kb", `${Math.round(kb)}px`);
+          if (kb > 30) root.dataset.kb = "1";
+          else delete root.dataset.kb;
+        } catch {
+          // ignore
+        }
+      });
+    };
+
+    const vv: any = (window as any).visualViewport;
+    update();
+    vv?.addEventListener?.("resize", update);
+    vv?.addEventListener?.("scroll", update);
+    window.addEventListener("resize", update);
+    window.addEventListener("orientationchange", update);
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      vv?.removeEventListener?.("resize", update);
+      vv?.removeEventListener?.("scroll", update);
+      window.removeEventListener("resize", update);
+      window.removeEventListener("orientationchange", update);
+    };
+  }, []);
+
+  useEffect(() => {
     const u = new URL(window.location.href);
     const t = u.searchParams.get("token");
     const pair = u.searchParams.get("pair");
@@ -505,6 +702,7 @@ export function App() {
           window.location.reload();
         } catch {
           setAuthed("no");
+          setPairMsg("Pair link expired or invalid. Generate a new one from host.");
         }
       })();
       return;
@@ -571,6 +769,13 @@ export function App() {
   useEffect(() => {
     selectedWorkspaceKeyRef.current = selectedWorkspaceKey;
   }, [selectedWorkspaceKey]);
+
+  useEffect(() => {
+    if (!selectedWorkspaceKey) return;
+    if (mergedWorkspaces.some((w) => String(w.key) === String(selectedWorkspaceKey))) return;
+    const first = String(mergedWorkspaces[0]?.key ?? "").trim();
+    if (first) setSelectedWorkspaceKey(first);
+  }, [selectedWorkspaceKey, mergedWorkspaces]);
 
   useEffect(() => {
     activeIdRef.current = activeId;
@@ -648,7 +853,7 @@ export function App() {
   useEffect(() => {
     // Keep the selected tree consistent per workspace.
     if (!selectedWorkspaceKey) return;
-    const w = workspaces.find((x) => x.key === selectedWorkspaceKey) ?? null;
+    const w = mergedWorkspaces.find((x) => x.key === selectedWorkspaceKey) ?? null;
     if (!w) return;
 
     if (!w.isGit) {
@@ -672,7 +877,7 @@ export function App() {
     let desired = saved || String(w.root || "");
     if (desired && !allowed.has(desired)) desired = String(w.root || "");
     if (desired && desired !== selectedTreePath) setSelectedTreePath(desired);
-  }, [selectedWorkspaceKey, workspaces]);
+  }, [selectedWorkspaceKey, mergedWorkspaces]);
 
   useEffect(() => {
     if (authed !== "yes") return;
@@ -722,7 +927,7 @@ export function App() {
           }
           if (msg?.type === "session.preview" && typeof msg.sessionId === "string" && typeof msg.line === "string") {
             const sid = msg.sessionId;
-            const line = msg.line;
+            const line = cleanPreviewLine(msg.line);
             setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, preview: line } : s)));
             setWorkspaces((prev) =>
               prev.map((w) => ({
@@ -792,7 +997,7 @@ export function App() {
 
   useEffect(() => {
     if (authed !== "yes") return;
-    const w = selectedWorkspaceKey ? workspaces.find((x) => x.key === selectedWorkspaceKey) ?? null : null;
+    const w = selectedWorkspaceKey ? mergedWorkspaces.find((x) => x.key === selectedWorkspaceKey) ?? null : null;
     const under = String(w?.root ?? "").trim();
     if (!under) {
       setToolSessions([]);
@@ -800,7 +1005,7 @@ export function App() {
     }
     const t = setTimeout(() => refreshToolSessions({ under }), 160);
     return () => clearTimeout(t);
-  }, [selectedWorkspaceKey, workspaces, authed]);
+  }, [selectedWorkspaceKey, mergedWorkspaces, authed]);
 
   useEffect(() => {
     lsSet("fyp_slots", String(slotCfg.slots));
@@ -840,7 +1045,11 @@ export function App() {
 
   useEffect(() => {
     if (!term.current) return;
-    term.current.options.fontSize = fontSize;
+    const coarse = typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia("(pointer: coarse)").matches
+      : false;
+    const safeFontSize = coarse ? Math.max(13, fontSize) : fontSize;
+    term.current.options.fontSize = safeFontSize;
     lsSet("fyp_font", String(fontSize));
     setTimeout(() => {
       try {
@@ -854,7 +1063,11 @@ export function App() {
 
   useEffect(() => {
     if (!term.current) return;
-    term.current.options.lineHeight = lineHeight;
+    const coarse = typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia("(pointer: coarse)").matches
+      : false;
+    const safeLineHeight = coarse ? Math.max(1.45, lineHeight) : lineHeight;
+    term.current.options.lineHeight = safeLineHeight;
     lsSet("fyp_lh", String(lineHeight));
     setTimeout(() => {
       try {
@@ -997,328 +1210,62 @@ export function App() {
   }, [tab, activeId]);
 
   useEffect(() => {
-    // Swipe left/right on the terminal area to switch pinned sessions.
-    // This keeps the UI fast and uncluttered on mobile.
+    // Swipe left/right on the terminal area to switch sessions.
+    // Keep this very light-touch so scrolling/typing in mobile browsers stays reliable.
     if (tab !== "run") return;
     if (activeIsCodexNative) return;
-    const el = runSurfaceRef.current ?? termRef.current;
+    if (activeSessionClosing) return;
+    const el = termRef.current;
     if (!el) return;
     let pointerId: number | null = null;
-    let touchId: number | null = null;
     let startX = 0;
     let startY = 0;
-    let lastY = 0;
-    let mode: "pending" | "scroll" | "swipe" = "pending";
-    let scrollRemainderPx = 0;
-
-    const linePx = () => Math.min(46, Math.max(10, fontSize * lineHeight));
-    const inTerminal = (target: EventTarget | null): boolean => {
-      const t = termRef.current;
-      if (!t) return false;
-      if (!target) return false;
-      // Allow gestures only when the touch starts inside the xterm container.
-      // This avoids breaking taps on overlays (like the TUI assist buttons).
-      try {
-        return t.contains(target as any);
-      } catch {
-        return false;
-      }
-    };
+    let startTs = 0;
 
     const reset = () => {
       pointerId = null;
-      touchId = null;
-      mode = "pending";
-      scrollRemainderPx = 0;
+      startTs = 0;
     };
 
     const onDown = (e: PointerEvent) => {
       if (e.pointerType === "mouse") return;
-      if (touchId != null) return; // touch fallback is active
-      if (!inTerminal(e.target)) return;
-      // Capture-phase listeners (see addEventListener options below) ensure we get touch input
-      // even if xterm attaches its own handlers and stops propagation.
-      try {
-        (el as any).setPointerCapture?.(e.pointerId);
-      } catch {
-        // ignore
-      }
       pointerId = e.pointerId;
       startX = e.clientX;
       startY = e.clientY;
-      lastY = e.clientY;
-      mode = "pending";
-      scrollRemainderPx = 0;
-      // Prevent xterm selection on touch. We handle focus on tap in onUp.
-      try {
-        term.current?.clearSelection();
-        e.preventDefault();
-      } catch {
-        // ignore
-      }
-      try {
-        e.stopPropagation();
-      } catch {
-        // ignore
-      }
-    };
-
-    const onMove = (e: PointerEvent) => {
-      if (e.pointerType === "mouse") return;
-      if (touchId != null) return; // touch fallback is active
-      if (pointerId == null || e.pointerId !== pointerId) return;
-
-      const dxTotal = e.clientX - startX;
-      const dyTotal = e.clientY - startY;
-      const ax = Math.abs(dxTotal);
-      const ay = Math.abs(dyTotal);
-
-      if (mode === "pending") {
-        if (ay > 10 && ay > ax * 1.15) mode = "scroll";
-        else if (ax > 70 && ax > ay * 1.15) mode = "swipe";
-      }
-
-      if (mode !== "scroll") {
-        if (mode === "swipe") {
-          // Disable xterm selection while swiping between slots.
-          e.preventDefault();
-          e.stopPropagation();
-        }
-        return;
-      }
-      // Disable xterm selection drag; we implement scrollback ourselves.
-      e.preventDefault();
-      e.stopPropagation();
-      try {
-        term.current?.clearSelection();
-      } catch {
-        // ignore
-      }
-
-      const dy = e.clientY - lastY;
-      lastY = e.clientY;
-
-      const px = dy + scrollRemainderPx;
-      const lp = linePx();
-      const lines = Math.trunc(px / lp);
-      scrollRemainderPx = px - lines * lp;
-      if (!lines) return;
-      try {
-        // xterm: negative scrollLines => up (older), positive => down (newer)
-        term.current?.scrollLines(-lines);
-      } catch {
-        // ignore
-      }
+      startTs = Date.now();
     };
 
     const onUp = (e: PointerEvent) => {
       if (e.pointerType === "mouse") return;
-      if (touchId != null) return; // touch fallback is active
       if (pointerId == null || e.pointerId !== pointerId) return;
 
       const dx = e.clientX - startX;
       const dy = e.clientY - startY;
       const ax = Math.abs(dx);
       const ay = Math.abs(dy);
-      const wasTap = mode === "pending" && ax < 8 && ay < 8;
-      const wasSwipe = (mode === "swipe" || mode === "pending") && ax >= 60 && ax > ay * 1.2;
-
-      try {
-        (el as any).releasePointerCapture?.(e.pointerId);
-      } catch {
-        // ignore
-      }
+      const dt = startTs > 0 ? Date.now() - startTs : 9999;
       reset();
 
-      if (wasTap) {
-        try {
-          term.current?.focus();
-        } catch {
-          // ignore
-        }
-      }
-
-      if (!wasSwipe) return;
-      if (!activeId) return;
-      if (pinnedOrder.length < 2) return;
-      const idx = pinnedOrder.indexOf(activeId);
-      if (idx < 0) return;
-      const dir = dx < 0 ? 1 : -1;
-      const next = (idx + dir + pinnedOrder.length) % pinnedOrder.length;
-      const id = pinnedOrder[next];
-      if (id) openSession(id);
+      if (dt > 760) return;
+      if (ax < 70 || ax <= ay * 1.25) return;
+      void switchSessionRelative(dx < 0 ? 1 : -1, "swipe");
     };
 
     const onCancel = (e: PointerEvent) => {
       if (e.pointerType === "mouse") return;
-      if (touchId != null) return; // touch fallback is active
       if (pointerId == null || e.pointerId !== pointerId) return;
-      try {
-        (el as any).releasePointerCapture?.(e.pointerId);
-      } catch {
-        // ignore
-      }
       reset();
     };
 
-    // Capture phase is important: xterm attaches its own listeners, and we want
-    // touch gestures to stay consistent on iOS/Android.
-    el.addEventListener("pointerdown", onDown, { passive: false, capture: true });
-    el.addEventListener("pointermove", onMove, { passive: false, capture: true });
-    el.addEventListener("pointerup", onUp, { passive: false, capture: true });
-    el.addEventListener("pointercancel", onCancel, { passive: true, capture: true });
-
-    // iOS Safari still has edge-cases where xterm consumes touch events before pointer
-    // listeners fire. Add a touch fallback specifically for mobile.
-    const isIOS = (() => {
-      try {
-        return /iPad|iPhone|iPod/.test(navigator.userAgent || "");
-      } catch {
-        return false;
-      }
-    })();
-
-    const findTouch = (list: TouchList): Touch | null => {
-      if (touchId == null) return null;
-      for (let i = 0; i < list.length; i++) {
-        const t = list.item(i);
-        if (t && t.identifier === touchId) return t;
-      }
-      return null;
-    };
-
-    const onTouchStart = (e: TouchEvent) => {
-      if (!isIOS) return;
-      if (pointerId != null) return;
-      if (e.touches.length !== 1) return;
-      if (!inTerminal(e.target)) return;
-      const t0 = e.touches.item(0);
-      if (!t0) return;
-      touchId = t0.identifier;
-      startX = t0.clientX;
-      startY = t0.clientY;
-      lastY = t0.clientY;
-      mode = "pending";
-      scrollRemainderPx = 0;
-      try {
-        e.stopPropagation();
-        term.current?.clearSelection();
-      } catch {
-        // ignore
-      }
-    };
-
-    const onTouchMove = (e: TouchEvent) => {
-      if (!isIOS) return;
-      if (touchId == null) return;
-      const t0 = findTouch(e.touches);
-      if (!t0) return;
-      const dxTotal = t0.clientX - startX;
-      const dyTotal = t0.clientY - startY;
-      const ax = Math.abs(dxTotal);
-      const ay = Math.abs(dyTotal);
-
-      if (mode === "pending") {
-        if (ay > 10 && ay > ax * 1.15) mode = "scroll";
-        else if (ax > 70 && ax > ay * 1.15) mode = "swipe";
-      }
-
-      if (mode !== "scroll") {
-        if (mode === "swipe") {
-          try {
-            e.preventDefault();
-            e.stopPropagation();
-          } catch {
-            // ignore
-          }
-        }
-        return;
-      }
-
-      try {
-        e.preventDefault();
-        e.stopPropagation();
-      } catch {
-        // ignore
-      }
-
-      try {
-        term.current?.clearSelection();
-      } catch {
-        // ignore
-      }
-
-      const dy = t0.clientY - lastY;
-      lastY = t0.clientY;
-      const px = dy + scrollRemainderPx;
-      const lp = linePx();
-      const lines = Math.trunc(px / lp);
-      scrollRemainderPx = px - lines * lp;
-      if (!lines) return;
-      try {
-        term.current?.scrollLines(-lines);
-      } catch {
-        // ignore
-      }
-    };
-
-    const onTouchEnd = (e: TouchEvent) => {
-      if (!isIOS) return;
-      if (touchId == null) return;
-      const t0 = findTouch(e.changedTouches);
-      if (!t0) {
-        // If our tracked touch ended but wasn't in changedTouches for some reason, reset when no touches remain.
-        if (e.touches.length === 0) reset();
-        return;
-      }
-      const dx = t0.clientX - startX;
-      const dy = t0.clientY - startY;
-      const ax = Math.abs(dx);
-      const ay = Math.abs(dy);
-      const wasTap = mode === "pending" && ax < 8 && ay < 8;
-      const wasSwipe = (mode === "swipe" || mode === "pending") && ax >= 60 && ax > ay * 1.2;
-      reset();
-
-      if (wasTap) {
-        try {
-          term.current?.focus();
-        } catch {
-          // ignore
-        }
-      }
-
-      if (!wasSwipe) return;
-      if (!activeId) return;
-      if (pinnedOrder.length < 2) return;
-      const idx = pinnedOrder.indexOf(activeId);
-      if (idx < 0) return;
-      const dir = dx < 0 ? 1 : -1;
-      const next = (idx + dir + pinnedOrder.length) % pinnedOrder.length;
-      const id = pinnedOrder[next];
-      if (id) openSession(id);
-    };
-
-    const onTouchCancel = (e: TouchEvent) => {
-      if (!isIOS) return;
-      if (touchId == null) return;
-      if (e.touches.length === 0) reset();
-    };
-
-    el.addEventListener("touchstart", onTouchStart, { passive: true, capture: true });
-    el.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
-    el.addEventListener("touchend", onTouchEnd, { passive: true, capture: true });
-    el.addEventListener("touchcancel", onTouchCancel, { passive: true, capture: true });
+    el.addEventListener("pointerdown", onDown, { passive: true });
+    el.addEventListener("pointerup", onUp, { passive: true });
+    el.addEventListener("pointercancel", onCancel, { passive: true });
     return () => {
-      el.removeEventListener("pointerdown", onDown, { capture: true } as any);
-      el.removeEventListener("pointermove", onMove, { capture: true } as any);
-      el.removeEventListener("pointerup", onUp, { capture: true } as any);
-      el.removeEventListener("pointercancel", onCancel, { capture: true } as any);
-      el.removeEventListener("touchstart", onTouchStart as any, { capture: true } as any);
-      el.removeEventListener("touchmove", onTouchMove as any, { capture: true } as any);
-      el.removeEventListener("touchend", onTouchEnd as any, { capture: true } as any);
-      el.removeEventListener("touchcancel", onTouchCancel as any, { capture: true } as any);
+      el.removeEventListener("pointerdown", onDown);
+      el.removeEventListener("pointerup", onUp);
+      el.removeEventListener("pointercancel", onCancel);
     };
-  }, [tab, activeId, pinnedOrder, slotCfg, activeIsCodexNative, fontSize, lineHeight]);
+  }, [tab, activeId, sessionSwitchOrder, activeIsCodexNative, activeSessionClosing]);
 
   function backoffMs(attempt: number): number {
     const base = 140;
@@ -1473,6 +1420,20 @@ export function App() {
         if (ws.current !== s) return; // stale socket after a fast session switch
         const msg = JSON.parse(String(ev.data));
         if (msg?.type === "pong") return;
+        if (msg?.type === "session.closing") {
+          setSessionWsState("connecting");
+          setToast("Session closing...");
+          void refreshSessions();
+          return;
+        }
+        if (msg?.type === "session.closed") {
+          setSessionWsState("closed");
+          if (activeIdRef.current === id) setActiveId(null);
+          setToast("Session closed");
+          void refreshSessions();
+          void refreshWorkspaces();
+          return;
+        }
         if (msg?.type === "codex.native.delta" && typeof msg?.delta === "string") {
           const kind = typeof msg?.kind === "string" ? msg.kind : "agent";
           const threadId = typeof msg?.threadId === "string" ? msg.threadId : "";
@@ -1591,17 +1552,38 @@ export function App() {
     setTab("run");
   }
 
+  function switchSessionRelative(delta: number, source: "swipe" | "button" = "button"): boolean {
+    if (!activeId) return false;
+    if (sessionSwitchOrder.length < 2) return false;
+    const idx = sessionSwitchOrder.indexOf(activeId);
+    if (idx < 0) return false;
+    const step = delta >= 0 ? 1 : -1;
+    const next = (idx + step + sessionSwitchOrder.length) % sessionSwitchOrder.length;
+    const nextId = sessionSwitchOrder[next];
+    if (!nextId || nextId === activeId) return false;
+    const s = sessions.find((x) => x.id === nextId) ?? null;
+    openSession(nextId);
+    const label = String(s?.label || s?.profileId || s?.tool || "").trim();
+    setToast(
+      `${next + 1}/${sessionSwitchOrder.length}${label ? ` · ${label}` : ""}`,
+    );
+    if (source === "swipe") {
+      try {
+        if (typeof navigator !== "undefined" && typeof navigator.vibrate === "function") navigator.vibrate(8);
+      } catch {
+        // ignore
+      }
+    }
+    return true;
+  }
+
   async function removeSession(sessionId: string) {
     const sess = sessions.find((s) => s.id === sessionId) ?? null;
     if (!sess) return;
-    if (sess.running) {
-      setToast("Session is running. Kill it first.");
-      return;
-    }
-
     const label = sess.label || sess.profileId || sessionId.slice(0, 8);
+    const runningNote = sess.running ? "\n\nThis session is running and will be force-closed first." : "";
     const ok = window.confirm(
-      `Remove session "${label}"?\n\nThis deletes the FromYourPhone record (terminal replay + inbox items). It does NOT delete ${sess.tool} chat logs stored by the tool.`,
+      `Remove session "${label}"?${runningNote}\n\nThis deletes the FromYourPhone record (terminal replay + inbox items). It does NOT delete ${sess.tool} chat logs stored by the tool.`,
     );
     if (!ok) return;
 
@@ -1631,8 +1613,8 @@ export function App() {
     setShowControls(false);
 
     try {
-      await api(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
-      setToast("Session removed");
+      await api(`/api/sessions/${encodeURIComponent(sessionId)}?force=1`, { method: "DELETE" });
+      setToast(sess.running ? "Session closed and removed" : "Session removed");
     } catch (e: any) {
       setToast(typeof e?.message === "string" ? e.message : "remove failed");
     } finally {
@@ -1645,6 +1627,10 @@ export function App() {
   async function sendControl(type: "interrupt" | "stop" | "kill") {
     if (!activeId) {
       setToast("No active session");
+      return;
+    }
+    if (activeSessionClosing) {
+      setToast("Session is closing");
       return;
     }
 
@@ -1668,6 +1654,10 @@ export function App() {
   async function sendRaw(text: string) {
     if (!activeId) {
       setToast("No active session");
+      return;
+    }
+    if (activeSessionClosing) {
+      setToast("Session is closing");
       return;
     }
 
@@ -1752,6 +1742,10 @@ export function App() {
       setToast("No active session");
       return;
     }
+    if (activeSessionClosing) {
+      setToast("Session is closing");
+      return;
+    }
     const isCodexNative = activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
     const suffix = (() => {
       const pid = activeSession?.profileId ?? "";
@@ -1788,32 +1782,41 @@ export function App() {
     }
   }
 
-	  async function startSessionWith(input: { tool: ToolId; profileId: string; transport?: string; cwd?: string; overrides?: any; savePreset?: boolean; toolAction?: "resume" | "fork"; toolSessionId?: string }) {
-	    try {
-	      const res = await api<{ id: string }>("/api/sessions", {
-	        method: "POST",
-	        headers: { "content-type": "application/json" },
-	        body: JSON.stringify({
-	          tool: input.tool,
-	          profileId: input.profileId,
-	          transport: input.transport,
-	          cwd: input.cwd,
-	          toolAction: input.toolAction,
-	          toolSessionId: input.toolSessionId,
-	          overrides: input.overrides ?? {},
-	          savePreset: typeof input.savePreset === "boolean" ? input.savePreset : false,
-	        }),
-	      });
-	      setToast("Session started");
-	      const rows = await refreshSessions();
-	      await refreshRecentWorkspaces();
-	      await refreshWorkspaces();
-	      openSession(res.id);
-	      void autoPinSession(res.id, rows);
-	    } catch (e: any) {
-	      setToast(typeof e?.message === "string" ? e.message : "failed to create session");
-	    }
-	  }
+  async function startSessionWith(input: {
+    tool: ToolId;
+    profileId: string;
+    transport?: string;
+    cwd?: string;
+    overrides?: any;
+    savePreset?: boolean;
+    toolAction?: "resume" | "fork";
+    toolSessionId?: string;
+  }) {
+    try {
+      const res = await api<{ id: string }>("/api/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          tool: input.tool,
+          profileId: input.profileId,
+          transport: input.transport,
+          cwd: input.cwd,
+          toolAction: input.toolAction,
+          toolSessionId: input.toolSessionId,
+          overrides: input.overrides ?? {},
+          savePreset: typeof input.savePreset === "boolean" ? input.savePreset : false,
+        }),
+      });
+      setToast("Session started");
+      const rows = await refreshSessions();
+      await refreshRecentWorkspaces();
+      await refreshWorkspaces();
+      openSession(res.id);
+      void autoPinSession(res.id, rows);
+    } catch (e: any) {
+      setToast(typeof e?.message === "string" ? e.message : "failed to create session");
+    }
+  }
 
   async function createSession() {
     const overrides: any = {};
@@ -2166,34 +2169,101 @@ export function App() {
 
   const codexNativeMessages = useMemo(() => {
     const thread = codexNativeThread;
-    if (!thread) return [] as { id: string; role: "user" | "assistant"; kind: string; text: string }[];
+    if (!thread) return [] as { id: string; role: "user" | "assistant"; kind: string; text: string; tone?: "default" | "thinking" | "toolUse" | "toolResult" }[];
 
-    const out: { id: string; role: "user" | "assistant"; kind: string; text: string }[] = [];
+    const out: { id: string; role: "user" | "assistant"; kind: string; text: string; tone?: "default" | "thinking" | "toolUse" | "toolResult" }[] = [];
     const seen = new Set<string>();
 
-    const textFrom = (v: any, depth = 0): string => {
-      if (depth > 4) return "";
+    const formatValue = (v: any): string => {
       if (v == null) return "";
       if (typeof v === "string") return v;
-      if (Array.isArray(v)) return v.map((x) => textFrom(x, depth + 1)).join("");
+      if (typeof v === "number" || typeof v === "boolean") return String(v);
+      try {
+        return JSON.stringify(v, null, 2);
+      } catch {
+        return "";
+      }
+    };
+
+    const textFrom = (v: any, depth = 0): string => {
+      if (depth > 5) return "";
+      if (v == null) return "";
+      if (typeof v === "string") return v;
+      if (typeof v === "number" || typeof v === "boolean") return String(v);
+      if (Array.isArray(v)) return v.map((x) => textFrom(x, depth + 1)).filter(Boolean).join("\n");
       if (typeof v !== "object") return "";
       if (typeof (v as any).text === "string") return String((v as any).text);
+      if (typeof (v as any).thinking === "string") return String((v as any).thinking);
       if (typeof (v as any).delta === "string") return String((v as any).delta);
       const te = (v as any).text_elements;
       if (Array.isArray(te)) return te.map((x: any) => (typeof x?.text === "string" ? x.text : "")).join("");
-      const c = (v as any).content;
-      if (Array.isArray(c)) return c.map((x: any) => textFrom(x, depth + 1)).join("");
-      if (typeof c === "string") return c;
+      const summary = (v as any).summary;
+      if (Array.isArray(summary)) return summary.map((x: any) => textFrom(x, depth + 1)).filter(Boolean).join("\n");
+      if (typeof summary === "string") return summary;
+      const content = (v as any).content;
+      if (Array.isArray(content)) return content.map((x: any) => textFrom(x, depth + 1)).filter(Boolean).join("\n");
+      if (typeof content === "string") return content;
+      if (content && typeof content === "object") {
+        const nested = textFrom(content, depth + 1);
+        if (nested) return nested;
+      }
+      const output = (v as any).output;
+      if (output != null) {
+        const nested = textFrom(output, depth + 1);
+        if (nested) return nested;
+      }
+      const result = (v as any).result;
+      if (result != null) {
+        const nested = textFrom(result, depth + 1);
+        if (nested) return nested;
+      }
       return "";
     };
 
-    const push = (m: { id: string; role: "user" | "assistant"; kind: string; text: string }) => {
-      const text = String(m.text ?? "").trimEnd();
+    const normalizeText = (v: string): string => {
+      const t = String(v ?? "").replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
+      if (!t) return "";
+      if (t.length <= 14000) return t;
+      return `${t.slice(0, 13985)}\n...[truncated]`;
+    };
+
+    const push = (m: {
+      id: string;
+      role: "user" | "assistant";
+      kind: string;
+      text: string;
+      tone?: "default" | "thinking" | "toolUse" | "toolResult";
+    }) => {
+      const text = normalizeText(m.text);
       if (!text) return;
-      const sig = `${m.role}|${m.kind}|${m.id}|${text.slice(0, 140)}`;
+      const sig = `${m.role}|${m.kind}|${m.id}|${text.slice(0, 180)}`;
       if (seen.has(sig)) return;
       seen.add(sig);
       out.push({ ...m, text });
+    };
+
+    const toolCallText = (item: any): string => {
+      const name =
+        typeof item?.name === "string"
+          ? item.name
+          : typeof item?.toolName === "string"
+            ? item.toolName
+            : typeof item?.functionName === "string"
+              ? item.functionName
+              : "";
+      const args = item?.input ?? item?.arguments ?? item?.args ?? item?.payload ?? null;
+      const head = name ? `Tool: ${name}` : "Tool call";
+      const body = normalizeText(textFrom(args) || formatValue(args));
+      return body ? `${head}\n${body}` : head;
+    };
+
+    const toolResultText = (item: any): string => {
+      const raw = item?.result ?? item?.output ?? item?.response ?? item?.content ?? null;
+      const body = normalizeText(textFrom(raw) || formatValue(raw));
+      const errRaw = item?.error ?? (item?.is_error ? raw : null);
+      const err = normalizeText(textFrom(errRaw) || formatValue(errRaw));
+      if (err) return body ? `[error]\n${err}\n\n${body}` : `[error]\n${err}`;
+      return body;
     };
 
     const turns = Array.isArray((thread as any).turns) ? ((thread as any).turns as any[]) : [];
@@ -2219,29 +2289,63 @@ export function App() {
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
         if (!item || typeof item !== "object") continue;
-        const type = typeof item.type === "string" ? String(item.type) : typeof (item as any).kind === "string" ? String((item as any).kind) : "";
+
+        const type =
+          typeof item.type === "string"
+            ? String(item.type)
+            : typeof (item as any).kind === "string"
+              ? String((item as any).kind)
+              : "";
+        const typeNorm = type.toLowerCase();
         const itemId = typeof item.id === "string" ? String(item.id) : `${turnId || "turn"}:${i}`;
 
-        if (type === "userMessage") {
-          push({ id: itemId, role: "user", kind: "user", text: textFrom((item as any).text ?? (item as any).content ?? item) });
+        if (typeNorm === "usermessage" || typeNorm === "user_message") {
+          push({
+            id: itemId,
+            role: "user",
+            kind: "user",
+            text: textFrom((item as any).text ?? (item as any).content ?? item),
+          });
           continue;
         }
-        if (type === "agentMessage") {
-          push({ id: itemId, role: "assistant", kind: "assistant", text: textFrom((item as any).text ?? (item as any).content ?? item) });
+        if (typeNorm === "agentmessage" || typeNorm === "assistantmessage" || typeNorm === "assistant_message") {
+          push({
+            id: itemId,
+            role: "assistant",
+            kind: "assistant",
+            text: textFrom((item as any).text ?? (item as any).content ?? item),
+          });
           continue;
         }
-        if (type === "plan") {
-          push({ id: itemId, role: "assistant", kind: "plan", text: textFrom((item as any).text ?? (item as any).content ?? item) });
+        if (typeNorm === "reasoning" || typeNorm === "thinking") {
+          const summaryText = textFrom((item as any).summary);
+          const contentText = textFrom((item as any).content);
+          push({
+            id: itemId,
+            role: "assistant",
+            kind: "thinking",
+            tone: "thinking",
+            text: summaryText || contentText || textFrom(item),
+          });
           continue;
         }
-        if (type === "commandExecution") {
+        if (typeNorm === "plan") {
+          push({
+            id: itemId,
+            role: "assistant",
+            kind: "plan",
+            text: textFrom((item as any).text ?? (item as any).content ?? item),
+          });
+          continue;
+        }
+        if (typeNorm === "commandexecution" || typeNorm === "command_execution") {
           const cmd = typeof (item as any).command === "string" ? String((item as any).command) : "";
           const status = typeof (item as any).status === "string" ? String((item as any).status) : "";
           const t = cmd ? `$ ${cmd}${status ? `\n[${status}]` : ""}` : textFrom(item);
-          push({ id: itemId, role: "assistant", kind: "command", text: t });
+          push({ id: itemId, role: "assistant", kind: "command", text: t, tone: "toolUse" });
           continue;
         }
-        if (type === "fileChange") {
+        if (typeNorm === "filechange" || typeNorm === "file_change") {
           const pathsRaw = Array.isArray((item as any).paths)
             ? (item as any).paths
             : Array.isArray((item as any).files)
@@ -2249,8 +2353,48 @@ export function App() {
               : [];
           const paths = pathsRaw.map((x: any) => String(x ?? "")).filter(Boolean);
           const t = paths.length ? `Edits:\n- ${paths.join("\n- ")}` : textFrom(item);
-          push({ id: itemId, role: "assistant", kind: "edits", text: t });
+          push({ id: itemId, role: "assistant", kind: "edits", text: t, tone: "toolResult" });
           continue;
+        }
+
+        const looksLikeToolUse =
+          /tool.*(call|use)|(?:^|_)function(?:_|$).*(call|use)|mcp.*(call|use)|call_tool/.test(typeNorm) ||
+          typeNorm === "toolcall" ||
+          typeNorm === "functioncall";
+        if (looksLikeToolUse) {
+          push({
+            id: itemId,
+            role: "assistant",
+            kind: "tool_use",
+            tone: "toolUse",
+            text: toolCallText(item),
+          });
+          continue;
+        }
+
+        const looksLikeToolResult =
+          /tool.*(result|output)|(?:^|_)function(?:_|$).*(result|output)|mcp.*(result|output)|call_result/.test(typeNorm) ||
+          typeNorm === "toolresult" ||
+          typeNorm === "functioncalloutput";
+        if (looksLikeToolResult) {
+          push({
+            id: itemId,
+            role: "assistant",
+            kind: "tool_result",
+            tone: "toolResult",
+            text: toolResultText(item),
+          });
+          continue;
+        }
+
+        const fallback = textFrom(item);
+        if (fallback) {
+          push({
+            id: itemId,
+            role: "assistant",
+            kind: type || "message",
+            text: fallback,
+          });
         }
       }
     }
@@ -2268,14 +2412,23 @@ export function App() {
         pairCode={pairCode}
         setPairCode={setPairCode}
         pairMsg={pairMsg}
+        unlockMsg={unlockMsg}
         onUnlock={() => {
+          setPairMsg(null);
+          setUnlockMsg(null);
+          const tok = token.trim();
+          if (!tok) {
+            setUnlockMsg("Paste the long token from the host terminal.");
+            return;
+          }
           const u = new URL(window.location.href);
-          u.searchParams.set("token", token.trim());
+          u.searchParams.set("token", tok);
           window.location.href = u.toString();
         }}
         onRetry={() => window.location.reload()}
         onPair={async () => {
           setPairMsg(null);
+          setUnlockMsg(null);
           try {
             await api("/api/auth/pair/claim", {
               method: "POST",
@@ -2322,6 +2475,30 @@ export function App() {
                   pinnedBySlot={pinnedBySlot}
                   onOpenSession={openSession}
                 />
+                {pinnedOrder.length < 2 && workspaceSessionsSorted.length > 1 ? (
+                  <div className="pinBar">
+                    {workspaceSessionsSorted.slice(0, 6).map((s, idx) => {
+                      const on = s.id === activeId;
+                      const hasAttention = (s.attention ?? 0) > 0;
+                      return (
+                        <button
+                          key={s.id}
+                          className={`pinPill ${on ? "pinPillOn" : ""}`}
+                          onClick={() => openSession(s.id)}
+                          aria-label={`Session ${idx + 1}: ${s.label || s.profileId}`}
+                        >
+                          <span className="pinPillNum">{idx + 1}</span>
+                          <span className="pinPillLabel">{s.label || s.tool}</span>
+                          {hasAttention ? <span className="pinPillDot" /> : null}
+                          {s.running ? <span className="pinPillRun" /> : null}
+                        </button>
+                      );
+                    })}
+                    {workspaceSessionsSorted.length > 6 ? (
+                      <span className="chip mono">+{workspaceSessionsSorted.length - 6}</span>
+                    ) : null}
+                  </div>
+                ) : null}
                 <div className="runInfo">
                   <div className={`dot ${activeSession?.running ? "dotOn" : "dotOff"}`}>
                     {activeSession?.running ? "RUN" : "IDLE"}
@@ -2329,10 +2506,14 @@ export function App() {
                   <span className="mono runLabel">
                     {activeSession?.label || activeSession?.profileId || ""}
                   </span>
+                  {activeSessionClosing ? <span className="chip mono">closing</span> : null}
                   {sessionWsState !== "open" ? (
                     <span className="chip mono">
                       {sessionWsState === "connecting" ? "..." : "off"}
                     </span>
+                  ) : null}
+                  {!activeIsCodexNative && (activeSession?.tool === "codex" || activeSession?.tool === "claude") && !activeToolSessionId ? (
+                    <span className="chip mono">linking…</span>
                   ) : null}
                   {activeInboxCount > 0 ? (
                     <button className="runAlert" onClick={() => { refreshInbox({ workspaceKey: activeWorkspaceKey }); setTab("inbox"); }}>
@@ -2340,6 +2521,28 @@ export function App() {
                     </button>
                   ) : null}
                   <div className="spacer" />
+                  <button
+                    className="runBtn"
+                    onClick={() => switchSessionRelative(-1, "button")}
+                    aria-label="Previous session"
+                    disabled={sessionSwitchOrder.length < 2}
+                    title="Previous session"
+                  >
+                    <svg viewBox="0 0 16 16" width="14" height="14">
+                      <polyline points="10 3 5 8 10 13" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+                    </svg>
+                  </button>
+                  <button
+                    className="runBtn"
+                    onClick={() => switchSessionRelative(1, "button")}
+                    aria-label="Next session"
+                    disabled={sessionSwitchOrder.length < 2}
+                    title="Next session"
+                  >
+                    <svg viewBox="0 0 16 16" width="14" height="14">
+                      <polyline points="6 3 11 8 6 13" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+                    </svg>
+                  </button>
                   <button className="runBtn" onClick={() => sendControl("interrupt")} aria-label="Ctrl+C">
                     <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM5 5l6 6M11 5l-6 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/></svg>
                   </button>
@@ -2347,15 +2550,13 @@ export function App() {
                     <button
                       className="runBtn"
                       onClick={() => {
+                        if (!activeCanOpenChatHistory) return;
                         const toolId = activeSession?.tool as any;
-                        const tid = typeof activeSession?.toolSessionId === "string" ? String(activeSession.toolSessionId) : "";
-                        if (!tid) {
-                          setToast("Chat history not linked yet");
-                          return;
-                        }
-                        openToolChat(toolId, tid, { refresh: true, limit: toolChatLimit });
+                        openToolChat(toolId, activeToolSessionId, { refresh: true, limit: toolChatLimit });
                       }}
                       aria-label="Chat history"
+                      title={activeCanOpenChatHistory ? "Chat history" : "Chat history (linking...)"}
+                      disabled={!activeCanOpenChatHistory}
                     >
                       <svg viewBox="0 0 16 16" width="14" height="14">
                         <path
@@ -2374,7 +2575,7 @@ export function App() {
                 </div>
               </div>
 
-              {activeAttention ? (
+              {activeAttention && !activeIsRawTerminal ? (
                 <div className={`attentionCard attention${activeAttention.severity}`}>
                   <div className="attentionHead">
                     <span className="chip">{activeAttention.severity}</span>
@@ -2419,7 +2620,7 @@ export function App() {
                 ) : (
                   <>
                     <div className="term" ref={termRef} />
-                    {!activeAttention && tuiAssist ? (
+                    {!activeIsRawTerminal && !activeAttention && tuiAssist ? (
                       <TerminalAssistOverlay
                         assist={tuiAssist}
                         onHide={() => {
@@ -2433,11 +2634,38 @@ export function App() {
                 )}
               </div>
 
-              <div className="compose">
+              <div
+                className="compose"
+                onClick={() => {
+                  try {
+                    composerRef.current?.focus();
+                  } catch {
+                    // ignore
+                  }
+                }}
+              >
                 <textarea
+                  ref={composerRef}
                   value={composer}
                   onChange={(e) => setComposer(e.target.value)}
                   placeholder="Message..."
+                  disabled={!activeId || activeSessionClosing}
+                  autoCapitalize="sentences"
+                  autoCorrect="on"
+                  spellCheck={false}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                  }}
+                  onTouchStart={(e) => {
+                    e.stopPropagation();
+                  }}
+                  onFocus={() => {
+                    try {
+                      (term.current as any)?.blur?.();
+                    } catch {
+                      // ignore
+                    }
+                  }}
                   rows={1}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
@@ -2446,7 +2674,12 @@ export function App() {
                     }
                   }}
                 />
-                <button className="composeSend" onClick={sendText} aria-label="Send">
+                <button
+                  className="composeSend"
+                  onClick={sendText}
+                  aria-label="Send"
+                  disabled={!activeId || activeSessionClosing || !composer.trim()}
+                >
                   <svg viewBox="0 0 20 20" width="18" height="18"><path d="M3 10l14-7-7 14v-7H3z" fill="currentColor"/></svg>
                 </button>
               </div>
@@ -2476,7 +2709,7 @@ export function App() {
                 />
               </div>
               <div className="row" style={{ padding: 0 }}>
-                <div className="list">
+                <div className="list listScrollWorkspace">
                   {filteredWorkspaces.length === 0 ? (
                     <div className="row">
                       <div className="help">No matching workspaces yet. Start a session in New.</div>
@@ -2508,8 +2741,8 @@ export function App() {
 	                  })}
                 </div>
               </div>
-              {(() => {
-	                const w = selectedWorkspaceKey ? workspaces.find((x) => x.key === selectedWorkspaceKey) ?? null : null;
+	              {(() => {
+	                const w = selectedWorkspaceKey ? mergedWorkspaces.find((x) => x.key === selectedWorkspaceKey) ?? null : null;
 	                if (!w) return <div className="row"><div className="help">Pick a workspace to see sessions and worktrees.</div></div>;
 	                const trees = (w.trees ?? []).filter((t) => t.path);
 	                return (
@@ -2618,7 +2851,7 @@ export function App() {
                       })()}
 
 	                    <div className="row" style={{ padding: 0 }}>
-	                      <div className="list">
+	                      <div className="list listScrollSessions">
 	                        {(() => {
 	                          const groups = groupByRecent(
 	                            w.sessions ?? [],
@@ -2659,14 +2892,14 @@ export function App() {
 	                                          {isPinned ? <span className="badge badgePin">#{s.pinnedSlot}</span> : null}
 	                                          {s.attention && s.attention > 0 ? <span className="badge">{s.attention}</span> : null}
 	                                        </div>
-	                                        <div className="listSub mono">
-	                                          {s.running ? "RUNNING" : "STOPPED"} {s.id ? `· ${s.id}` : ""}
-	                                        </div>
-	                                        {s.preview ? <div className="preview mono">{s.preview}</div> : null}
-	                                      </div>
-	                                    </div>
-	                                    <div className="listRight">
-	                                      <button
+                                        <div className="listSub mono">
+                                          {s.running ? "RUNNING" : "STOPPED"} {s.id ? `· ${s.id}` : ""}
+                                        </div>
+                                        {s.preview ? <div className="preview mono">{cleanPreviewLine(s.preview)}</div> : null}
+                                      </div>
+                                    </div>
+                                    <div className="listRight">
+                                      <button
 	                                        className={`btn ${isPinned ? "" : "ghost"}`}
 	                                        onClick={(e) => {
 	                                          e.stopPropagation();
@@ -2735,7 +2968,7 @@ export function App() {
                             </div>
 
                             <div className="row" style={{ padding: 0 }}>
-                              <div className="list">
+                              <div className="list listScrollToolSessions">
                                 {toolSessionsLoading ? (
                                   <div className="row">
                                     <div className="help">Loading tool sessions...</div>
@@ -2777,7 +3010,7 @@ export function App() {
                                               {ts.gitBranch ? `${ts.gitBranch} · ` : ""}
                                               {new Date(ts.updatedAt).toLocaleString()} · {ts.id.slice(0, 8)}
                                             </div>
-                                            {ts.preview ? <div className="preview mono">{ts.preview}</div> : null}
+                                            {ts.preview ? <div className="preview mono">{cleanPreviewLine(ts.preview)}</div> : null}
                                           </div>
                                         </div>
                                         <div className="listRight">
@@ -3301,7 +3534,7 @@ export function App() {
 	              </div>
 	              <div className="row">
 	                <div className="help">
-	                  Pin/unpin from Workspace. Swipe left/right in Run to switch between pinned sessions.
+	                  Pin/unpin from Workspace. Swipe left/right in Run to switch sessions (pinned first; otherwise recent sessions in this workspace).
 	                </div>
 	              </div>
 	            </div>

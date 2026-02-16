@@ -6,7 +6,16 @@ export type CodexNativeBubble = {
   role: "user" | "assistant";
   kind: string;
   text: string;
+  tone?: "default" | "thinking" | "toolUse" | "toolResult";
 };
+
+function kindLabel(kind: string): string {
+  const k = String(kind || "").trim().toLowerCase();
+  if (k === "tool_use") return "tool call";
+  if (k === "tool_result") return "tool result";
+  if (k === "thinking") return "thinking";
+  return kind || "message";
+}
 
 export function CodexNativeThreadView(props: {
   threadId: string;
@@ -34,8 +43,18 @@ export function CodexNativeThreadView(props: {
         ) : null}
         {props.messages.map((m) => (
           <div key={m.id} className={`bubbleRow ${m.role === "user" ? "bubbleUser" : "bubbleAssistant"}`}>
-            <div className="bubble">
-              <div className="bubbleKind mono">{m.kind}</div>
+            <div
+              className={`bubble ${
+                m.tone === "thinking"
+                  ? "bubbleThinking"
+                  : m.tone === "toolUse"
+                    ? "bubbleToolUse"
+                    : m.tone === "toolResult"
+                      ? "bubbleToolResult"
+                      : ""
+              }`}
+            >
+              <div className="bubbleKind mono">{kindLabel(m.kind)}</div>
               <FencedMessage text={m.text} />
             </div>
           </div>

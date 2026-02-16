@@ -20,6 +20,14 @@ export type ToolSessionMessage = {
   role: "user" | "assistant";
   ts: number;
   text: string;
+  blocks?: ToolSessionMessageBlock[];
+};
+
+export type ToolSessionMessageBlock = {
+  type: "text" | "thinking" | "tool_use" | "tool_result";
+  text: string;
+  name?: string;
+  callId?: string;
 };
 
 function expandHome(p: string): string {
@@ -93,6 +101,125 @@ function takeText(s: string | null | undefined, max = 260): string | null {
   const v = typeof s === "string" ? s.replace(/\s+/g, " ").trim() : "";
   if (!v) return null;
   return v.length > max ? v.slice(0, Math.max(0, max - 3)) + "..." : v;
+}
+
+function parseTs(v: any): number {
+  if (typeof v !== "string") return Date.now();
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? ms : Date.now();
+}
+
+function cleanText(v: string): string {
+  return v.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
+}
+
+function clampText(v: string, max = 12000): string {
+  if (v.length <= max) return v;
+  return `${v.slice(0, Math.max(0, max - 15))}\n\n...[truncated]`;
+}
+
+function isObj(v: any): v is Record<string, any> {
+  return typeof v === "object" && v !== null;
+}
+
+function extractAnyText(v: any, depth = 0): string {
+  if (depth > 4) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (!v) return "";
+  if (Array.isArray(v)) {
+    return v
+      .map((it) => extractAnyText(it, depth + 1))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (!isObj(v)) return "";
+  if (typeof v.text === "string") return v.text;
+  if (typeof v.thinking === "string") return v.thinking;
+  if (typeof v.output === "string") return v.output;
+  if (typeof v.content === "string") return v.content;
+  if (Array.isArray(v.content)) {
+    return v.content
+      .map((it: any) => extractAnyText(it, depth + 1))
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function formatStructuredValue(v: any): string {
+  if (v == null) return "";
+  if (typeof v === "string") {
+    const raw = v.trim();
+    if (!raw) return "";
+    const parsed = safeJsonParse(raw);
+    if (parsed && typeof parsed === "object") {
+      try {
+        return JSON.stringify(parsed, null, 2);
+      } catch {
+        return v;
+      }
+    }
+    return v;
+  }
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return "";
+  }
+}
+
+function normalizeBlocks(blocks: ToolSessionMessageBlock[]): ToolSessionMessageBlock[] {
+  const out: ToolSessionMessageBlock[] = [];
+  for (const b of blocks) {
+    const text = clampText(cleanText(String(b?.text ?? "")));
+    if (!text) continue;
+    out.push({
+      type: b.type,
+      text,
+      name: typeof b.name === "string" && b.name.trim() ? b.name.trim() : undefined,
+      callId: typeof b.callId === "string" && b.callId.trim() ? b.callId.trim() : undefined,
+    });
+  }
+  return out;
+}
+
+function messageFromBlocks(
+  role: "user" | "assistant",
+  ts: number,
+  blocks: ToolSessionMessageBlock[],
+): ToolSessionMessage | null {
+  const normalized = normalizeBlocks(blocks);
+  if (normalized.length === 0) return null;
+  const text = normalized.map((b) => b.text).join("\n\n");
+  return { role, ts, text, blocks: normalized };
+}
+
+function formatToolCallText(name: string, input: any): string {
+  const head = cleanText(name) ? `Tool: ${cleanText(name)}` : "Tool call";
+  const body = cleanText(formatStructuredValue(input));
+  return body ? `${head}\n${body}` : head;
+}
+
+function codexMessageText(content: any): string {
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const it of content) {
+    const text = cleanText(extractAnyText(it));
+    if (text) parts.push(text);
+  }
+  return cleanText(parts.join(""));
+}
+
+function codexReasoningText(payload: any): string {
+  const summary = Array.isArray(payload?.summary) ? payload.summary : [];
+  const parts: string[] = [];
+  for (const it of summary) {
+    const text = cleanText(extractAnyText(it));
+    if (text) parts.push(text);
+  }
+  return cleanText(parts.join("\n"));
 }
 
 function extractCodexPreviewFromTail(rawTail: string): { title: string | null; preview: string | null } {
@@ -376,24 +503,42 @@ function parseCodexMessagesFromText(raw: string): ToolSessionMessage[] {
   for (const ln of lines) {
     const obj = safeJsonParse(ln);
     if (!obj) continue;
-    if (obj.type !== "response_item" || obj.payload?.type !== "message") continue;
-    const role = String(obj.payload?.role ?? "");
-    if (role !== "user" && role !== "assistant") continue;
-    const content = Array.isArray(obj.payload?.content) ? obj.payload.content : [];
-    const parts: string[] = [];
-    for (const it of content) {
-      if (it && typeof it === "object") {
-        if (typeof it.text === "string") parts.push(it.text);
-      }
+    if (obj.type !== "response_item" || !isObj(obj.payload)) continue;
+    const payload = obj.payload;
+    const ts = parseTs(obj.timestamp);
+    const pType = String(payload.type ?? "");
+
+    if (pType === "message") {
+      const role = String(payload.role ?? "");
+      if (role !== "user" && role !== "assistant") continue;
+      const text = codexMessageText(payload.content);
+      const msg = messageFromBlocks(role, ts, [{ type: "text", text }]);
+      if (msg) out.push(msg);
+      continue;
     }
-    const text = parts.join("").trim();
-    if (!text) continue;
-    const ts = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
-    out.push({
-      role,
-      ts: Number.isFinite(ts) ? ts : Date.now(),
-      text,
-    });
+
+    if (pType === "reasoning") {
+      const text = codexReasoningText(payload);
+      const msg = messageFromBlocks("assistant", ts, [{ type: "thinking", text }]);
+      if (msg) out.push(msg);
+      continue;
+    }
+
+    if (pType === "function_call") {
+      const name = typeof payload.name === "string" ? payload.name : "";
+      const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
+      const text = formatToolCallText(name, payload.arguments);
+      const msg = messageFromBlocks("assistant", ts, [{ type: "tool_use", text, name, callId }]);
+      if (msg) out.push(msg);
+      continue;
+    }
+
+    if (pType === "function_call_output") {
+      const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
+      const outputText = cleanText(extractAnyText(payload.output));
+      const msg = messageFromBlocks("assistant", ts, [{ type: "tool_result", text: outputText, callId }]);
+      if (msg) out.push(msg);
+    }
   }
   return out;
 }
@@ -418,14 +563,49 @@ function parseClaudeMessagesFromText(raw: string): ToolSessionMessage[] {
   for (const ln of lines) {
     const obj = safeJsonParse(ln);
     if (!obj) continue;
-    if (obj.type !== "user" && obj.type !== "assistant") continue;
-    if (!obj.message || typeof obj.message !== "object") continue;
-    const role = String(obj.message?.role ?? "");
+    if (!isObj(obj.message)) continue;
+    const role = String(obj.message.role ?? obj.type ?? "");
     if (role !== "user" && role !== "assistant") continue;
-    const text = extractClaudeText(obj.message?.content);
-    if (!text) continue;
-    const ts = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
-    out.push({ role, ts: Number.isFinite(ts) ? ts : Date.now(), text });
+    const ts = parseTs(obj.timestamp);
+    const content = Array.isArray(obj.message.content) ? obj.message.content : [];
+    const blocks: ToolSessionMessageBlock[] = [];
+
+    for (const it of content) {
+      if (!isObj(it)) continue;
+      const t = String(it.type ?? "");
+      if (t === "text") {
+        blocks.push({ type: "text", text: extractAnyText(it.text ?? it) });
+        continue;
+      }
+      if (t === "thinking") {
+        blocks.push({ type: "thinking", text: extractAnyText(it.thinking ?? it.text ?? it) });
+        continue;
+      }
+      if (t === "tool_use") {
+        const name = typeof it.name === "string" ? it.name : "";
+        const callId = typeof it.id === "string" ? it.id : undefined;
+        blocks.push({
+          type: "tool_use",
+          text: formatToolCallText(name, it.input),
+          name,
+          callId,
+        });
+        continue;
+      }
+      if (t === "tool_result") {
+        const callId = typeof it.tool_use_id === "string" ? it.tool_use_id : undefined;
+        const base = cleanText(extractAnyText(it.content ?? it));
+        const text = it.is_error === true && base ? `[error]\n${base}` : base;
+        blocks.push({ type: "tool_result", text, callId });
+      }
+    }
+
+    if (blocks.length === 0) {
+      const fallback = extractClaudeText(obj.message.content);
+      if (fallback) blocks.push({ type: "text", text: fallback });
+    }
+    const msg = messageFromBlocks(role, ts, blocks);
+    if (msg) out.push(msg);
   }
   return out;
 }

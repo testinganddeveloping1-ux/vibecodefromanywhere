@@ -112,6 +112,43 @@ export class SessionManager {
     return this.sessions.get(id)?.status ?? null;
   }
 
+  async close(id: string, opts?: { force?: boolean; graceMs?: number }): Promise<{ existed: boolean; wasRunning: boolean }> {
+    const sess = this.sessions.get(id);
+    if (!sess) return { existed: false, wasRunning: false };
+
+    const force = opts?.force !== false;
+    const graceMs = Math.min(10_000, Math.max(100, Number(opts?.graceMs ?? 1400)));
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const waitStopped = async (timeoutMs: number) => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const cur = this.sessions.get(id);
+        if (!cur || !cur.status.running) return;
+        await sleep(40);
+      }
+    };
+
+    const wasRunning = Boolean(sess.status.running);
+
+    if (sess.status.running) {
+      // Graceful: Ctrl+C first.
+      this.interrupt(id);
+      await waitStopped(graceMs);
+    }
+
+    if (force) {
+      const cur = this.sessions.get(id);
+      if (cur?.status.running) {
+        this.kill(id);
+        await waitStopped(900);
+      }
+    }
+
+    // Always forget to clear listeners/queues and release PTY references.
+    this.forget(id);
+    return { existed: true, wasRunning };
+  }
+
   forget(id: string): void {
     const sess = this.sessions.get(id);
     if (!sess) return;
@@ -123,6 +160,12 @@ export class SessionManager {
     }
     try {
       sess.pty.kill();
+    } catch {
+      // ignore
+    }
+    // Fallback: if PTY kill didn't terminate the process promptly, force-kill by PID.
+    try {
+      if (sess.status.running && sess.status.pid) process.kill(sess.status.pid, "SIGKILL");
     } catch {
       // ignore
     }

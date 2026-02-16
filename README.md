@@ -103,8 +103,17 @@ npm run dev
 ```
 
 Open:
-- UI: `http://127.0.0.1:5173`
-- Backend: `http://127.0.0.1:7337`
+- Phone/host UI (backend-served, production-like): `http://127.0.0.1:7337`
+
+`npm run dev` now watches and rebuilds `dist/web` continuously, so the backend-served UI always reflects your latest frontend changes.
+
+If you also want Vite's standalone dev server:
+
+```bash
+npm run dev:web
+```
+
+- Vite UI: `http://127.0.0.1:5173`
 
 ## CLI (Optional)
 

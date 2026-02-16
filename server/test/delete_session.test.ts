@@ -104,5 +104,49 @@ describe("sessions delete", () => {
     await app.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }, 15_000);
-});
 
+  test("force delete closes running session and removes record", async () => {
+    const { app, dir } = await testApp();
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/sessions",
+      headers: { authorization: "Bearer t123", "content-type": "application/json" },
+      payload: JSON.stringify({ tool: "codex", profileId: "codex.default", savePreset: false }),
+    });
+    expect(created.statusCode).toBe(200);
+    const id = JSON.parse(created.payload).id as string;
+    expect(typeof id).toBe("string");
+
+    const del = await app.inject({
+      method: "DELETE",
+      url: `/api/sessions/${encodeURIComponent(id)}?force=1`,
+      headers: { authorization: "Bearer t123" },
+    });
+    expect(del.statusCode).toBe(200);
+    const body = JSON.parse(del.payload);
+    expect(body?.ok).toBe(true);
+    expect(body?.force).toBe(true);
+
+    await waitFor(async () => {
+      const after = await app.inject({
+        method: "GET",
+        url: `/api/sessions/${encodeURIComponent(id)}`,
+        headers: { authorization: "Bearer t123" },
+      });
+      return after.statusCode === 404;
+    }, 5000);
+
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/sessions",
+      headers: { authorization: "Bearer t123" },
+    });
+    expect(list.statusCode).toBe(200);
+    const items = JSON.parse(list.payload) as any[];
+    expect(items.some((s) => s && s.id === id)).toBe(false);
+
+    await app.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }, 15_000);
+});

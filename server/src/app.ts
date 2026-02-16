@@ -414,6 +414,7 @@ main().catch(() => {});
     number,
     { requestId: any; threadId: string; questions: any[]; idx: number; answers: Record<string, string[]> }
   >();
+  const closingSessions = new Set<string>();
 
   // Restore thread->session mapping after a server restart so native sessions keep working.
   try {
@@ -459,13 +460,129 @@ main().catch(() => {});
     }
   }
 
+  function sessionTransport(s: any): string {
+    return String((s as any)?.transport ?? "pty");
+  }
+
+  function isStoreSessionRunning(s: any): boolean {
+    const transport = sessionTransport(s);
+    if (transport === "pty") return sessions.getStatus(String(s.id))?.running ?? false;
+    if (transport === "codex-app-server" && String(s?.tool ?? "") === "codex") {
+      const threadId = typeof s?.toolSessionId === "string" ? String(s.toolSessionId) : "";
+      if (!threadId) return false;
+      return codexNativeThreadRun.get(threadId)?.running ?? false;
+    }
+    return false;
+  }
+
+  async function interruptCodexNativeThread(threadId: string, opts?: { forceClearRunState?: boolean }) {
+    if (!threadId) return;
+    const turnId = codexNativeThreadRun.get(threadId)?.turnId ?? null;
+    if (turnId) {
+      try {
+        await codexApp.ensureStarted();
+        await codexApp.call("turn/interrupt", { threadId, turnId });
+      } catch {
+        // ignore
+      }
+    }
+    if (opts?.forceClearRunState) codexNativeThreadRun.set(threadId, { running: false, turnId: null });
+  }
+
+  function notifySessionSockets(sessionId: string, payload: unknown) {
+    try {
+      const set = sockets.get(sessionId);
+      if (!set) return;
+      for (const sock of set) {
+        wsSend(sock, payload);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  function closeSessionSockets(sessionId: string) {
+    try {
+      const set = sockets.get(sessionId);
+      if (!set) return;
+      for (const sock of set) {
+        try {
+          wsSend(sock, { type: "session.closed", ts: Date.now() });
+          sock.close();
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      sockets.delete(sessionId);
+    }
+  }
+
+  function cleanupSessionTransientState(sessionId: string) {
+    outputBuf.delete(sessionId);
+    textBuf.delete(sessionId);
+    assistState.delete(sessionId);
+    lastPreview.delete(sessionId);
+    lastPreviewBroadcast.delete(sessionId);
+    lastInboxBroadcast.delete(sessionId);
+    claudeHookSessions.delete(sessionId);
+    for (const [sig, r] of claudeHookRequests.entries()) {
+      if (r.sessionId === sessionId) claudeHookRequests.delete(sig);
+    }
+  }
+
+  async function closeSessionLifecycle(input: {
+    sessionId: string;
+    storeSession: any;
+    force: boolean;
+    deleteRecord: boolean;
+  }): Promise<{ ok: true; wasRunning: boolean }> {
+    const { sessionId, storeSession, force, deleteRecord } = input;
+    const transport = sessionTransport(storeSession);
+    const wasRunning = isStoreSessionRunning(storeSession);
+
+    if (transport === "pty") {
+      if (force) {
+        await sessions.close(sessionId, { force: true, graceMs: 1400 });
+      } else {
+        sessions.forget(sessionId);
+      }
+    } else if (transport === "codex-app-server" && storeSession.tool === "codex" && storeSession.toolSessionId) {
+      if (force && wasRunning) {
+        await interruptCodexNativeThread(String(storeSession.toolSessionId), { forceClearRunState: true });
+      }
+    }
+
+    flushOutput(sessionId);
+    closeSessionSockets(sessionId);
+
+    if (deleteRecord) store.deleteSession(sessionId);
+
+    cleanupSessionTransientState(sessionId);
+
+    if (storeSession.tool === "codex" && transport === "codex-app-server" && storeSession.toolSessionId) {
+      const threadId = String(storeSession.toolSessionId);
+      codexNativeThreadToSession.delete(threadId);
+      codexNativeThreadRun.delete(threadId);
+      codexNativeThreadMeta.delete(threadId);
+    }
+
+    return { ok: true, wasRunning };
+  }
+
   function stripAnsi(s: string): string {
     // Minimal ANSI stripper: good enough for prompt detection. We keep it dependency-free.
+    // Also strip 8-bit C1 control sequences (e.g. CSI = 0x9B) which some terminals emit.
     // eslint-disable-next-line no-control-regex
     return s
       .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+      .replace(/\u009b[0-9;?]*[ -/]*[@-~]/g, "")
       // OSC (ESC ]) can be terminated by BEL (\u0007) or ST (ESC \\).
       .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, "")
+      // OSC (C1) can be terminated by BEL (\u0007) or ST (\u009c).
+      .replace(/\u009d[\s\S]*?(?:\u0007|\u009c)/g, "")
       // DCS (ESC P) uses ST (ESC \\) terminator.
       .replace(/\u001bP[\s\S]*?\u001b\\/g, "");
   }
@@ -478,10 +595,14 @@ main().catch(() => {});
   }
 
   function updateLastLine(sessionId: string, chunk: string) {
-    const plain = stripAnsi(chunk).replace(/\r/g, "");
+    // Treat CR as a line boundary for previews. Many TUIs redraw the same line with `\r`,
+    // and naive removal produces unreadable concatenated fragments like "StartStartiStarting...".
+    const plain = stripAnsi(chunk).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     const parts = plain.split("\n");
     for (let i = parts.length - 1; i >= 0; i--) {
-      const ln = parts[i]!.trim();
+      const ln = parts[i]!
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+        .trim();
       if (!ln) continue;
       lastPreview.set(sessionId, { ts: Date.now(), line: ln.slice(0, 220) });
       return;
@@ -748,6 +869,8 @@ main().catch(() => {});
   function attachExitTracking(sessionId: string) {
     sessions.onExit(sessionId, (st) => {
       try {
+        const exists = store.getSession(sessionId);
+        if (!exists) return;
         flushOutput(sessionId);
         try {
           store.setSessionExit(sessionId, st.exitCode ?? null, st.signal ?? null);
@@ -775,16 +898,7 @@ main().catch(() => {});
         // ignore
       } finally {
         // Best-effort cleanup to avoid unbounded memory growth if many sessions are spawned.
-        outputBuf.delete(sessionId);
-        textBuf.delete(sessionId);
-        assistState.delete(sessionId);
-        lastPreview.delete(sessionId);
-        lastPreviewBroadcast.delete(sessionId);
-        lastInboxBroadcast.delete(sessionId);
-        claudeHookSessions.delete(sessionId);
-        for (const [sig, r] of claudeHookRequests.entries()) {
-          if (r.sessionId === sessionId) claudeHookRequests.delete(sig);
-        }
+        cleanupSessionTransientState(sessionId);
       }
     });
   }
@@ -915,7 +1029,8 @@ main().catch(() => {});
     // - Extracts the most recent question-ish line (title)
     // - Extracts option hotkeys like "(Y) Yes", "1) Foo", "[A] Allow"
     // - Emits a stable signature so the UI can update without spamming
-    const raw = String(text ?? "").replace(/\r/g, "");
+    // Treat CR as a line boundary so redraw-heavy TUIs don't concatenate fragments.
+    const raw = String(text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     if (!raw.trim()) return null;
 
     const linesAll = raw.split("\n");
@@ -1364,14 +1479,8 @@ main().catch(() => {});
         pinnedSlot: s.pinnedSlot,
         createdAt: s.createdAt,
         updatedAt: s.updatedAt,
-        running:
-          String(s.transport ?? "pty") === "pty"
-            ? sessions.getStatus(s.id)?.running ?? false
-            : String(s.transport ?? "pty") === "codex-app-server" && s.tool === "codex"
-              ? s.toolSessionId
-                ? codexNativeThreadRun.get(String(s.toolSessionId))?.running ?? false
-                : false
-              : false,
+        running: isStoreSessionRunning(s),
+        closing: closingSessions.has(String(s.id)),
         attention: counts[s.id] ?? 0,
         preview: lastPreview.get(s.id)?.line ?? null,
       });
@@ -1518,6 +1627,22 @@ main().catch(() => {});
       const r: any = await codexApp.call("thread/read", { threadId, includeTurns: true });
       return { ok: true, thread: r?.thread ?? null };
     } catch (e: any) {
+      const msg = String(e?.message ?? e ?? "");
+      // New/native threads can exist before first user message; Codex may reject includeTurns
+      // until the thread is materialized. Return an empty thread instead of surfacing an error.
+      if (
+        /not materialized yet|includeturns is unavailable|thread not loaded|thread not found|no such thread|unknown thread/i.test(
+          msg,
+        )
+      ) {
+        return {
+          ok: true,
+          thread: {
+            id: threadId,
+            turns: [],
+          },
+        };
+      }
       return reply.code(400).send({ ok: false, error: "codex_native_unavailable", message: String(e?.message ?? e) });
     }
   });
@@ -1658,14 +1783,8 @@ main().catch(() => {});
     const counts = store.getOpenAttentionCounts();
     return store.listSessions().map((s) => ({
       ...s,
-      running:
-        String(s.transport ?? "pty") === "pty"
-          ? sessions.getStatus(s.id)?.running ?? false
-          : String(s.transport ?? "pty") === "codex-app-server" && s.tool === "codex"
-            ? s.toolSessionId
-              ? codexNativeThreadRun.get(String(s.toolSessionId))?.running ?? false
-              : false
-            : false,
+      running: isStoreSessionRunning(s),
+      closing: closingSessions.has(String(s.id)),
       attention: counts[s.id] ?? 0,
       preview: lastPreview.get(s.id)?.line ?? null,
     }));
@@ -1673,74 +1792,30 @@ main().catch(() => {});
 
   app.delete("/api/sessions/:id", async (req, reply) => {
     const id = (req.params as any).id as string;
+    const q = (req.query ?? {}) as any;
+    const force = q?.force === "1" || q?.force === "true" || q?.force === "yes";
+    if (!id) return reply.code(400).send({ ok: false, error: "bad_id" });
+    if (closingSessions.has(id)) return reply.code(409).send({ ok: false, error: "closing" });
+
     const sess = store.getSession(id);
     if (!sess) return reply.code(404).send({ ok: false, error: "not_found" });
 
-    const st = sessions.getStatus(id);
-    if (st?.running) return reply.code(409).send({ ok: false, error: "running" });
+    const running = isStoreSessionRunning(sess);
+    if (running && !force) return reply.code(409).send({ ok: false, error: "running" });
 
-    // Remove from the in-memory session manager as well (frees PTY refs).
+    closingSessions.add(id);
+    notifySessionSockets(id, { type: "session.closing", ts: Date.now() });
     try {
-      sessions.forget(id);
-    } catch {
-      // ignore
-    }
-
-    // Flush any buffered output chunks for this session before deleting DB rows.
-    try {
-      flushOutput(id);
-    } catch {
-      // ignore
-    }
-
-    try {
-      store.deleteSession(id);
+      const out = await closeSessionLifecycle({ sessionId: id, storeSession: sess, force: force || running, deleteRecord: true });
+      broadcastGlobal({ type: "sessions.changed" });
+      broadcastGlobal({ type: "workspaces.changed" });
+      broadcastGlobal({ type: "inbox.changed", sessionId: id });
+      return { ok: true, wasRunning: out.wasRunning, force: force || running };
     } catch (e: any) {
       return reply.code(500).send({ ok: false, error: "delete_failed", message: String(e?.message ?? "delete_failed") });
+    } finally {
+      closingSessions.delete(id);
     }
-
-    // Close and forget session websockets, if any.
-    try {
-      const set = sockets.get(id);
-      if (set) {
-        for (const sock of set) {
-          try {
-            sock.close();
-          } catch {
-            // ignore
-          }
-        }
-      }
-      sockets.delete(id);
-    } catch {
-      // ignore
-    }
-
-    // Best-effort cleanup for memory caches.
-    try {
-      outputBuf.delete(id);
-      textBuf.delete(id);
-      assistState.delete(id);
-      lastPreview.delete(id);
-      lastPreviewBroadcast.delete(id);
-      lastInboxBroadcast.delete(id);
-      claudeHookSessions.delete(id);
-      for (const [sig, r] of claudeHookRequests.entries()) {
-        if (r.sessionId === id) claudeHookRequests.delete(sig);
-      }
-      if (sess.tool === "codex" && String((sess as any).transport ?? "pty") === "codex-app-server" && sess.toolSessionId) {
-        codexNativeThreadToSession.delete(String(sess.toolSessionId));
-        codexNativeThreadRun.delete(String(sess.toolSessionId));
-        codexNativeThreadMeta.delete(String(sess.toolSessionId));
-      }
-    } catch {
-      // ignore
-    }
-
-    broadcastGlobal({ type: "sessions.changed" });
-    broadcastGlobal({ type: "workspaces.changed" });
-    broadcastGlobal({ type: "inbox.changed", sessionId: id });
-    return { ok: true };
   });
 
   app.post("/api/sessions", async (req, reply) => {
@@ -2256,18 +2331,12 @@ main().catch(() => {});
     const id = (req.params as any).id as string;
     const s = store.getSession(id);
     if (!s) return reply.code(404).send({ error: "not found" });
-    const transport = String((s as any).transport ?? "pty");
+    const transport = sessionTransport(s);
     const st = transport === "pty" ? sessions.getStatus(id) : null;
-    const running =
-      transport === "pty"
-        ? st?.running ?? false
-        : transport === "codex-app-server" && s.tool === "codex"
-          ? s.toolSessionId
-            ? codexNativeThreadRun.get(String(s.toolSessionId))?.running ?? false
-            : false
-          : false;
+    const running = isStoreSessionRunning(s);
     return {
       ...s,
+      closing: closingSessions.has(id),
       status: st ?? { running, pid: null, exitCode: s.exitCode, signal: s.signal },
     };
   });
@@ -2315,11 +2384,12 @@ main().catch(() => {});
     const id = (req.params as any).id as string;
     const body = (req.body ?? {}) as any;
     const text = typeof body.text === "string" ? body.text : "";
+    if (closingSessions.has(id)) return reply.code(409).send({ error: "session_closing" });
     const sess = store.getSession(id);
     if (!sess) return reply.code(404).send({ error: "not found" });
     const evId = store.appendEvent(id, "input", { text });
     broadcastEvent(id, { id: evId, ts: Date.now(), kind: "input", data: { text } });
-    const transport = String((sess as any).transport ?? "pty");
+    const transport = sessionTransport(sess);
     if (transport === "codex-app-server" && sess.tool === "codex") {
       const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
       if (!threadId) return reply.code(409).send({ error: "no_thread" });
@@ -2366,11 +2436,12 @@ main().catch(() => {});
 
   app.post("/api/sessions/:id/interrupt", async (req, reply) => {
     const id = (req.params as any).id as string;
+    if (closingSessions.has(id)) return reply.code(409).send({ error: "session_closing" });
     const sess = store.getSession(id);
     if (!sess) return reply.code(404).send({ error: "not found" });
     const evId = store.appendEvent(id, "interrupt", {});
     broadcastEvent(id, { id: evId, ts: Date.now(), kind: "interrupt", data: {} });
-    const transport = String((sess as any).transport ?? "pty");
+    const transport = sessionTransport(sess);
     if (transport === "codex-app-server" && sess.tool === "codex") {
       const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
       const turnId = threadId ? codexNativeThreadRun.get(threadId)?.turnId ?? null : null;
@@ -2390,11 +2461,12 @@ main().catch(() => {});
 
   app.post("/api/sessions/:id/stop", async (req, reply) => {
     const id = (req.params as any).id as string;
+    if (closingSessions.has(id)) return reply.code(409).send({ error: "session_closing" });
     const sess = store.getSession(id);
     if (!sess) return reply.code(404).send({ error: "not found" });
     const evId = store.appendEvent(id, "stop", {});
     broadcastEvent(id, { id: evId, ts: Date.now(), kind: "stop", data: {} });
-    const transport = String((sess as any).transport ?? "pty");
+    const transport = sessionTransport(sess);
     if (transport === "codex-app-server" && sess.tool === "codex") {
       const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
       const turnId = threadId ? codexNativeThreadRun.get(threadId)?.turnId ?? null : null;
@@ -2414,11 +2486,12 @@ main().catch(() => {});
 
   app.post("/api/sessions/:id/kill", async (req, reply) => {
     const id = (req.params as any).id as string;
+    if (closingSessions.has(id)) return reply.code(409).send({ error: "session_closing" });
     const sess = store.getSession(id);
     if (!sess) return reply.code(404).send({ error: "not found" });
     const evId = store.appendEvent(id, "kill", {});
     broadcastEvent(id, { id: evId, ts: Date.now(), kind: "kill", data: {} });
-    const transport = String((sess as any).transport ?? "pty");
+    const transport = sessionTransport(sess);
     if (transport === "codex-app-server" && sess.tool === "codex") {
       const threadId = sess.toolSessionId ? String(sess.toolSessionId) : "";
       const turnId = threadId ? codexNativeThreadRun.get(threadId)?.turnId ?? null : null;
@@ -2441,10 +2514,11 @@ main().catch(() => {});
     const body = (req.body ?? {}) as any;
     const cols = Number(body.cols);
     const rows = Number(body.rows);
+    if (closingSessions.has(id)) return reply.code(409).send({ error: "session_closing" });
     const sess = store.getSession(id);
     if (!sess) return reply.code(404).send({ error: "not found" });
     if (!Number.isFinite(cols) || !Number.isFinite(rows)) return reply.code(400).send({ error: "invalid size" });
-    const transport = String((sess as any).transport ?? "pty");
+    const transport = sessionTransport(sess);
     if (transport === "pty") sessions.resize(id, cols, rows);
     return { ok: true };
   });
@@ -2470,8 +2544,8 @@ main().catch(() => {});
 
   app.get("/ws/sessions/:id", { websocket: true }, (socket: WebSocket, req) => {
     const id = (req.params as any).id as string;
-    const sess = store.getSession(id);
-    if (!sess) {
+    const openSess = store.getSession(id);
+    if (!openSess || closingSessions.has(id)) {
       try {
         socket.close();
       } catch {
@@ -2479,7 +2553,6 @@ main().catch(() => {});
       }
       return;
     }
-    const transport = String((sess as any).transport ?? "pty");
 
     const set = sockets.get(id) ?? new Set<WebSocket>();
     set.add(socket);
@@ -2507,6 +2580,21 @@ main().catch(() => {});
           wsSend(socket, { type: "pong", ts: Date.now(), clientTs: Number(msg.ts ?? 0) || null });
           return;
         }
+        if (closingSessions.has(id)) {
+          wsSend(socket, { type: "session.closing", ts: Date.now() });
+          return;
+        }
+        const sess = store.getSession(id);
+        if (!sess) {
+          wsSend(socket, { type: "session.closed", ts: Date.now() });
+          try {
+            socket.close();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        const transport = sessionTransport(sess);
         if (msg?.type === "input" && typeof msg.text === "string") {
           const evId = store.appendEvent(id, "input", { text: msg.text });
           broadcastEvent(id, { id: evId, ts: Date.now(), kind: "input", data: { text: msg.text } });
@@ -2542,9 +2630,8 @@ main().catch(() => {});
           } else {
             sessions.write(id, msg.text);
             try {
-              const cur = store.getSession(id);
-              if (cur && cur.tool === "codex" && !cur.toolSessionId && cur.cwd) {
-                scheduleCodexToolSessionLink(id, cur.cwd, Date.now());
+              if (sess.tool === "codex" && !sess.toolSessionId && sess.cwd) {
+                scheduleCodexToolSessionLink(id, sess.cwd, Date.now());
               }
             } catch {
               // ignore
