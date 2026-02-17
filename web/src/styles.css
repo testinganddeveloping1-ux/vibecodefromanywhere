@@ -64,12 +64,15 @@
   --kb: 0px;
   /* Space reserved for the bottom nav (hidden when keyboard is open). */
   --nav-space: var(--nav-h);
+  /* Breathing room between content and the bottom nav. */
+  --nav-gap: 8px;
 }
 
 /* When the on-screen keyboard is open, hide the bottom nav so the terminal and
    composer remain usable on small screens. */
 :root[data-kb="1"] {
   --nav-space: 0px;
+  --nav-gap: 0px;
 }
 
 /* ==== Reset ==== */
@@ -117,12 +120,13 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   height: 100%;
   display: flex;
   flex-direction: column;
-  padding-bottom: calc(var(--nav-space) + var(--safe-b) + var(--kb));
+  padding-bottom: calc(var(--nav-space) + var(--nav-gap) + var(--safe-b) + var(--kb));
   position: relative;
   z-index: 1;
-  /* Prevent body scroll; tabs manage their own scrolling. */
   min-height: 0;
-  overflow: hidden;
+  /* iOS Safari can break nested scrolling when an ancestor uses overflow:hidden. */
+  overflow-x: hidden;
+  overflow-y: visible;
 }
 
 /* ==== Header ==== */
@@ -169,7 +173,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 /* ==== Bottom Navigation ==== */
 .nav {
   position: fixed;
-  left: 0; right: 0; bottom: var(--kb);
+  left: 0; right: 0; bottom: 0;
   z-index: 40;
   display: flex;
   gap: 2px;

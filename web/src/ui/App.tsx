@@ -293,7 +293,14 @@ export function App() {
   const [online, setOnline] = useState<boolean>(() => (typeof navigator !== "undefined" ? navigator.onLine : true));
   const [fontSize, setFontSize] = useState<number>(() => {
     const v = lsGet("fyp_font");
-    const n = v ? Number(v) : 15;
+    // Phone-first default: smaller font gives more columns so TUIs wrap less.
+    const ua = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
+    const coarse =
+      typeof window !== "undefined" && typeof window.matchMedia === "function"
+        ? window.matchMedia("(pointer: coarse)").matches
+        : false;
+    const phoneLike = coarse || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+    const n = v ? Number(v) : phoneLike ? 13 : 15;
     return Number.isFinite(n) ? Math.min(22, Math.max(11, n)) : 15;
   });
   const [lineHeight, setLineHeight] = useState<number>(() => {
@@ -439,7 +446,7 @@ export function App() {
           return false;
         }
       })();
-      const safeFontSize = isPhoneLike ? Math.max(13, fontSize) : fontSize;
+      const safeFontSize = fontSize;
       // iOS/Android canvas rendering can clip lines when lineHeight is too tight.
       const safeLineHeight = isPhoneLike ? Math.max(1.45, lineHeight) : lineHeight;
 
@@ -654,9 +661,11 @@ export function App() {
       raf = requestAnimationFrame(() => {
         try {
           const vv: any = (window as any).visualViewport;
-          const vvHeight = typeof vv?.height === "number" ? vv.height : window.innerHeight;
-          const vvTop = typeof vv?.offsetTop === "number" ? vv.offsetTop : 0;
-          const kb = Math.max(0, window.innerHeight - vvHeight - vvTop);
+          const layoutH = window.innerHeight;
+          const vvHeight = typeof vv?.height === "number" ? vv.height : layoutH;
+          // iOS Safari can report non-zero offsetTop during address-bar transitions/zoom.
+          // Using it here causes false "keyboard closed" states, so we ignore it.
+          const kb = Math.max(0, layoutH - vvHeight);
           root.style.setProperty("--kb", `${Math.round(kb)}px`);
           if (kb > 30) root.dataset.kb = "1";
           else delete root.dataset.kb;
