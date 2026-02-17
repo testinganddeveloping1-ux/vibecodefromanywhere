@@ -65,7 +65,7 @@
   /* Space reserved for the bottom nav (hidden when keyboard is open). */
   --nav-space: var(--nav-h);
   /* Breathing room between content and the bottom nav. */
-  --nav-gap: 8px;
+  --nav-gap: 12px;
 }
 
 /* When the on-screen keyboard is open, hide the bottom nav so the terminal and
@@ -572,6 +572,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .listRow:first-child { border-top: 0; }
 .listRow:active { background: rgba(255, 255, 255, 0.025); }
 .listRowDiv { touch-action: pan-y; }
+.listRow .btn { touch-action: pan-y; }
 .listLeft {
   display: flex;
   align-items: center;

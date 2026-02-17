@@ -56,6 +56,19 @@ function cleanPreviewLine(raw: string): string {
   return s;
 }
 
+function isPhoneLikeDevice(): boolean {
+  try {
+    const ua = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
+    const coarse =
+      typeof window !== "undefined" && typeof window.matchMedia === "function"
+        ? window.matchMedia("(pointer: coarse)").matches
+        : false;
+    return coarse || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+  } catch {
+    return false;
+  }
+}
+
 export function App() {
   const [authed, setAuthed] = useState<"unknown" | "yes" | "no">("unknown");
   const [token, setToken] = useState("");
@@ -294,13 +307,7 @@ export function App() {
   const [fontSize, setFontSize] = useState<number>(() => {
     const v = lsGet("fyp_font");
     // Phone-first default: smaller font gives more columns so TUIs wrap less.
-    const ua = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
-    const coarse =
-      typeof window !== "undefined" && typeof window.matchMedia === "function"
-        ? window.matchMedia("(pointer: coarse)").matches
-        : false;
-    const phoneLike = coarse || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
-    const n = v ? Number(v) : phoneLike ? 13 : 15;
+    const n = v ? Number(v) : isPhoneLikeDevice() ? 13 : 15;
     return Number.isFinite(n) ? Math.min(22, Math.max(11, n)) : 15;
   });
   const [lineHeight, setLineHeight] = useState<number>(() => {
@@ -435,17 +442,7 @@ export function App() {
           return "\"IBM Plex Mono\", ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Monaco, Consolas, monospace";
         }
       })();
-      const isPhoneLike = (() => {
-        try {
-          const coarse = typeof window !== "undefined" && typeof window.matchMedia === "function"
-            ? window.matchMedia("(pointer: coarse)").matches
-            : false;
-          const ua = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
-          return coarse || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
-        } catch {
-          return false;
-        }
-      })();
+      const isPhoneLike = isPhoneLikeDevice();
       const safeFontSize = fontSize;
       // iOS/Android canvas rendering can clip lines when lineHeight is too tight.
       const safeLineHeight = isPhoneLike ? Math.max(1.45, lineHeight) : lineHeight;
@@ -482,6 +479,26 @@ export function App() {
       }
       term.current = t;
       fit.current = f;
+
+      // If the web font loads after xterm mounts (slow mobile networks), the initial measurements
+      // can be wrong and cause vertical clipping. Re-fit once fonts settle.
+      try {
+        const fonts: any = (document as any).fonts;
+        if (fonts && typeof fonts.ready?.then === "function") {
+          fonts.ready.then(() => {
+            if (term.current !== t) return;
+            try {
+              f.fit();
+              t.refresh(0, Math.max(0, t.rows - 1));
+            } catch {
+              // ignore
+            }
+          });
+        }
+      } catch {
+        // ignore
+      }
+
       try {
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
@@ -1054,11 +1071,7 @@ export function App() {
 
   useEffect(() => {
     if (!term.current) return;
-    const coarse = typeof window !== "undefined" && typeof window.matchMedia === "function"
-      ? window.matchMedia("(pointer: coarse)").matches
-      : false;
-    const safeFontSize = coarse ? Math.max(13, fontSize) : fontSize;
-    term.current.options.fontSize = safeFontSize;
+    term.current.options.fontSize = fontSize;
     lsSet("fyp_font", String(fontSize));
     setTimeout(() => {
       try {
@@ -1072,10 +1085,7 @@ export function App() {
 
   useEffect(() => {
     if (!term.current) return;
-    const coarse = typeof window !== "undefined" && typeof window.matchMedia === "function"
-      ? window.matchMedia("(pointer: coarse)").matches
-      : false;
-    const safeLineHeight = coarse ? Math.max(1.45, lineHeight) : lineHeight;
+    const safeLineHeight = isPhoneLikeDevice() ? Math.max(1.45, lineHeight) : lineHeight;
     term.current.options.lineHeight = safeLineHeight;
     lsSet("fyp_lh", String(lineHeight));
     setTimeout(() => {
@@ -2584,7 +2594,7 @@ export function App() {
                 </div>
               </div>
 
-              {activeAttention && !activeIsRawTerminal ? (
+              {activeAttention ? (
                 <div className={`attentionCard attention${activeAttention.severity}`}>
                   <div className="attentionHead">
                     <span className="chip">{activeAttention.severity}</span>
@@ -2629,7 +2639,7 @@ export function App() {
                 ) : (
                   <>
                     <div className="term" ref={termRef} />
-                    {!activeIsRawTerminal && !activeAttention && tuiAssist ? (
+                    {activeIsRawTerminal && !activeAttention && tuiAssist ? (
                       <TerminalAssistOverlay
                         assist={tuiAssist}
                         onHide={() => {
