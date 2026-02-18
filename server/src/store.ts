@@ -158,6 +158,9 @@ export function createStore(baseDir: string) {
   const stmtEventsAfter = db.prepare(
     "SELECT id, ts, kind, data FROM events WHERE sessionId = ? AND id < ? ORDER BY id DESC LIMIT ?",
   );
+  const stmtLatestEventOfKind = db.prepare(
+    "SELECT id, ts, kind, data FROM events WHERE sessionId = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+  );
   const stmtDeleteEvents = db.prepare("DELETE FROM events WHERE sessionId = ?");
   const stmtOut = db.prepare("INSERT INTO output (sessionId, ts, chunk) VALUES (?, ?, ?)");
   const stmtTranscriptFirst = db.prepare(
@@ -407,6 +410,23 @@ export function createStore(baseDir: string) {
     return { items, nextCursor };
   }
 
+  function getLatestEvent(sessionId: string, kind: string): EventItem | null {
+    const r = stmtLatestEventOfKind.get(sessionId, kind) as any;
+    if (!r) return null;
+    let parsed: any = {};
+    try {
+      parsed = JSON.parse(String(r.data ?? "{}"));
+    } catch {
+      parsed = {};
+    }
+    return {
+      id: Number(r.id),
+      ts: Number(r.ts),
+      kind: String(r.kind),
+      data: parsed,
+    };
+  }
+
   function listRecentWorkspaces(limit: number): { path: string; lastUsed: number }[] {
     const lim = Math.min(50, Math.max(1, Math.floor(limit || 10)));
     const rows = stmtRecentWorkspaces.all(lim) as any[];
@@ -577,6 +597,7 @@ export function createStore(baseDir: string) {
     appendOutput,
     getTranscript,
     getEvents,
+    getLatestEvent,
     listRecentWorkspaces,
     getWorkspacePreset,
     upsertWorkspacePreset,

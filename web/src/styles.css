@@ -62,17 +62,6 @@
   --safe-t: env(safe-area-inset-top, 0px);
   /* Soft keyboard inset (VisualViewport driven). */
   --kb: 0px;
-  /* Space reserved for the bottom nav (hidden when keyboard is open). */
-  --nav-space: var(--nav-h);
-  /* Breathing room between content and the bottom nav. */
-  --nav-gap: 12px;
-}
-
-/* When the on-screen keyboard is open, hide the bottom nav so the terminal and
-   composer remain usable on small screens. */
-:root[data-kb="1"] {
-  --nav-space: 0px;
-  --nav-gap: 0px;
 }
 
 /* ==== Reset ==== */
@@ -120,7 +109,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   height: 100%;
   display: flex;
   flex-direction: column;
-  padding-bottom: calc(var(--nav-space) + var(--nav-gap) + var(--safe-b) + var(--kb));
+  /* Keep inputs above the on-screen keyboard on browsers that don't shrink layout viewport. */
+  padding-bottom: var(--kb);
   position: relative;
   z-index: 1;
   min-height: 0;
@@ -172,21 +162,16 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 
 /* ==== Bottom Navigation ==== */
 .nav {
-  position: fixed;
-  left: 0; right: 0; bottom: 0;
-  z-index: 40;
+  flex-shrink: 0;
   display: flex;
   gap: 2px;
   padding: 4px 12px calc(4px + var(--safe-b));
   background: var(--bg0);
   border-top: 1px solid var(--edge);
-  transition: transform var(--t-mid) var(--ease), opacity var(--t-mid) var(--ease);
 }
 
 :root[data-kb="1"] .nav {
-  transform: translateY(120%);
-  opacity: 0;
-  pointer-events: none;
+  display: none;
 }
 .navBtn {
   flex: 1;
@@ -272,7 +257,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   display: flex;
   flex-direction: column;
   padding: 4px 6px;
-  padding-bottom: 6px;
+  padding-bottom: 2px;
   gap: 6px;
   animation: fadeIn var(--t-mid) var(--ease);
 }
@@ -354,6 +339,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   border-radius: var(--r-lg);
   background: var(--surface0);
   overflow: hidden;
+  /* Make it easy to start scrolling from inside cards on mobile. */
+  touch-action: pan-y;
 }
 .cardHead {
   display: flex;
@@ -1110,7 +1097,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   flex-shrink: 0;
   position: relative;
   margin-top: 4px;
-  margin-bottom: 4px;
+  margin-bottom: 0;
   z-index: 8;
   pointer-events: auto;
 }
@@ -1687,7 +1674,7 @@ pre.mdCode[data-lang]::before {
   .hdr { padding: 2px var(--sp-sm); min-height: 34px; }
   .navBtn { min-height: 34px; padding: 3px; }
   .navLabel { display: none; }
-  .shell { padding-bottom: calc(var(--nav-space) + var(--safe-b) + var(--kb)); }
+  .shell { padding-bottom: var(--kb); }
   .compose textarea { min-height: 32px; }
 }
 

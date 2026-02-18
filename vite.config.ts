@@ -7,6 +7,11 @@ export default defineConfig({
   build: {
     outDir: "../dist/web",
     emptyOutDir: true,
+    // Vite's default esbuild minifier currently produces a broken xterm.js bundle
+    // (runtime ReferenceError inside `requestMode`). This is catastrophic on mobile
+    // because it triggers our boot overlay "Startup error" and blocks interaction.
+    // Disabling minification keeps the bundle correct and the UI reliable.
+    minify: false,
   },
   server: {
     strictPort: true,

@@ -5,8 +5,13 @@ dist
 .vite
 .turbo
 coverage
+out/
+projects-scrolled.png
+run-tab.png
 *.log
 .env.*
 .DS_Store
 .env
 .venv*
+playwright-*.png
+playwright-*.webm

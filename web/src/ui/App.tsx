@@ -174,12 +174,21 @@ export function App() {
     activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
   const activeIsRawTerminal = Boolean(activeSession) && !activeIsCodexNative;
   const activeSessionClosing = Boolean(activeSession?.closing);
+  const activeCanInput = useMemo(() => {
+    if (!activeSession) return false;
+    if (activeSessionClosing) return false;
+    if (activeIsCodexNative) return true;
+    // For PTY sessions, require the underlying process to be running.
+    return Boolean(activeSession.running);
+  }, [activeSession, activeSessionClosing, activeIsCodexNative]);
   const activeToolSessionId = useMemo(() => {
     const v = typeof activeSession?.toolSessionId === "string" ? String(activeSession.toolSessionId).trim() : "";
     return v || "";
   }, [activeSession?.toolSessionId]);
   const activeCanOpenChatHistory =
-    !activeIsCodexNative && (activeSession?.tool === "codex" || activeSession?.tool === "claude") && Boolean(activeToolSessionId);
+    !activeIsCodexNative &&
+    (activeSession?.tool === "codex" || activeSession?.tool === "claude" || activeSession?.tool === "opencode") &&
+    Boolean(activeToolSessionId);
   const activeWorkspaceKey = (activeSession?.workspaceKey ?? selectedWorkspaceKey ?? null) as string | null;
   const pinnedBySlot = useMemo(() => {
     const out: Record<number, SessionRow> = {};
@@ -286,6 +295,20 @@ export function App() {
   const fit = useRef<XTermFitAddon | null>(null);
   const roRef = useRef<ResizeObserver | null>(null);
   const termInit = useRef<Promise<void> | null>(null);
+  const termInitFailAt = useRef<number>(0);
+  const ttyResizeCtl = useRef<{
+    last: { cols: number; rows: number } | null;
+    raf: number;
+    timers: any[];
+    badFits: number;
+    badAt: number;
+  }>({
+    last: null,
+    raf: 0,
+    timers: [],
+    badFits: 0,
+    badAt: 0,
+  });
   const nativeChatRef = useRef<HTMLDivElement | null>(null);
   const ws = useRef<WebSocket | null>(null);
   const globalWs = useRef<WebSocket | null>(null);
@@ -312,8 +335,8 @@ export function App() {
   });
   const [lineHeight, setLineHeight] = useState<number>(() => {
     const v = lsGet("fyp_lh");
-    const n = v ? Number(v) : 1.4;
-    return Number.isFinite(n) ? Math.min(1.6, Math.max(1.1, n)) : 1.4;
+    const n = v ? Number(v) : isPhoneLikeDevice() ? 1.52 : 1.4;
+    return Number.isFinite(n) ? Math.min(1.9, Math.max(1.1, n)) : isPhoneLikeDevice() ? 1.52 : 1.4;
   });
 
   const orderedProfiles = useMemo(() => {
@@ -444,11 +467,14 @@ export function App() {
       })();
       const isPhoneLike = isPhoneLikeDevice();
       const safeFontSize = fontSize;
-      // iOS/Android canvas rendering can clip lines when lineHeight is too tight.
-      const safeLineHeight = isPhoneLike ? Math.max(1.45, lineHeight) : lineHeight;
+      const safeLineHeight = lineHeight;
 
       const t = new Terminal({
         cursorBlink: true,
+        // Canvas renderer is more consistent across mobile browsers and avoids a class of
+        // DOM renderer measurement glitches that can lead to "vertical text" artifacts.
+        // (xterm v6 types don't include rendererType even though it's supported at runtime.)
+        rendererType: "canvas",
         fontFamily: monoStack,
         fontSize: safeFontSize,
         lineHeight: safeLineHeight,
@@ -462,7 +488,7 @@ export function App() {
         scrollback: 8000,
         allowTransparency: !isPhoneLike,
         rightClickSelectsWord: false,
-      });
+      } as any);
       try {
         (t.options as any).customGlyphs = !isPhoneLike;
       } catch {
@@ -471,7 +497,11 @@ export function App() {
       const f = new FitAddon();
       t.loadAddon(f);
       t.open(el2);
-      f.fit();
+      try {
+        f.fit();
+      } catch {
+        // ignore
+      }
       try {
         t.refresh(0, Math.max(0, t.rows - 1));
       } catch {
@@ -521,21 +551,155 @@ export function App() {
 
       roRef.current?.disconnect();
       roRef.current = new ResizeObserver(() => {
-        fit.current?.fit();
-        const cols = term.current?.cols;
-        const rows = term.current?.rows;
-        if (!cols || !rows || !ws.current || ws.current.readyState !== WebSocket.OPEN || !connectedSessionId.current) return;
-        ws.current.send(JSON.stringify({ type: "resize", cols, rows }));
+        scheduleFitAndResize({});
       });
       roRef.current.observe(el2);
     })()
-      .catch(() => {
-        // ignore; user can re-open Run to retry
+      .catch((e) => {
+        // Terminal load failures should not "black screen" the whole app.
+        // We show a toast (rate-limited) and keep the rest of the UI usable.
+        try {
+          const now = Date.now();
+          if (now - termInitFailAt.current > 1800) {
+            termInitFailAt.current = now;
+            const msg = typeof (e as any)?.message === "string" ? String((e as any).message) : "";
+            setToast(msg ? `Terminal failed to load: ${msg}` : "Terminal failed to load. Try refreshing.");
+          }
+        } catch {
+          // ignore
+        }
       })
       .finally(() => {
         termInit.current = null;
       });
     return termInit.current;
+  }
+
+  function normalizeTtySize(cols: number, rows: number): { cols: number; rows: number } | null {
+    const c = Math.floor(Number(cols));
+    const r = Math.floor(Number(rows));
+    if (!Number.isFinite(c) || !Number.isFinite(r)) return null;
+    // Ignore pathological values which can break PTY rendering (e.g. 1-3 columns => "vertical text").
+    if (c < 12 || r < 6) return null;
+    return { cols: Math.min(400, c), rows: Math.min(220, r) };
+  }
+
+  function canFitNow(): boolean {
+    if (tabRef.current !== "run") return false;
+    if (activeIsCodexNative) return false;
+    const el = runSurfaceRef.current ?? termRef.current;
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    // `hidden` sections report 0x0; avoid fitting in that state.
+    if (rect.width < 160 || rect.height < 120) return false;
+    return true;
+  }
+
+  function scheduleFitAndResize(opts: { force?: boolean; burst?: boolean } = {}) {
+    const ctl = ttyResizeCtl.current;
+    const force = Boolean(opts.force);
+    const burst = Boolean(opts.burst);
+
+    const repairIfBad = () => {
+      // If xterm ever ends up at 1-3 columns, the UI looks like "vertical text".
+      // This can happen transiently during layout/keyboard transitions (esp. iOS Safari).
+      // Even if we can't safely fit right now, we should never leave the terminal in a pathological size.
+      if (!term.current) return;
+      const cur = normalizeTtySize(term.current.cols, term.current.rows);
+      if (cur) return;
+      const restore = ctl.last ?? { cols: 100, rows: 30 };
+      try {
+        term.current.resize(restore.cols, restore.rows);
+        term.current.refresh(0, Math.max(0, term.current.rows - 1));
+      } catch {
+        // ignore
+      }
+      if (!ctl.last) ctl.last = restore;
+    };
+
+    const runOnce = () => {
+      if (!term.current || !fit.current) return;
+      if (!canFitNow()) return;
+      const before = { cols: term.current.cols, rows: term.current.rows };
+      try {
+        fit.current.fit();
+      } catch {
+        // ignore
+      }
+
+      const norm = normalizeTtySize(term.current.cols, term.current.rows);
+      if (!norm) {
+        // xterm-fit can occasionally measure a tiny width/huge cell size during layout transitions,
+        // resulting in a 1-3 column terminal ("vertical text"). Never leave the terminal in that state:
+        // revert to the last known-good size and retry a few times.
+        const now = Date.now();
+        if (!ctl.badAt || now - ctl.badAt > 1500) ctl.badFits = 0;
+        ctl.badAt = now;
+        ctl.badFits += 1;
+
+        const restore =
+          ctl.last ??
+          normalizeTtySize(before.cols, before.rows) ??
+          {
+            cols: 100,
+            rows: 30,
+          };
+        try {
+          term.current.resize(restore.cols, restore.rows);
+          term.current.refresh(0, Math.max(0, term.current.rows - 1));
+        } catch {
+          // ignore
+        }
+
+        if (ctl.badFits <= 4) {
+          const t = setTimeout(() => scheduleFitAndResize({ force: true, burst: false }), 80);
+          ctl.timers.push(t);
+        }
+        return;
+      }
+
+      ctl.badFits = 0;
+      ctl.badAt = 0;
+      try {
+        term.current.refresh(0, Math.max(0, term.current.rows - 1));
+      } catch {
+        // ignore
+      }
+      if (!force && ctl.last && ctl.last.cols === norm.cols && ctl.last.rows === norm.rows) return;
+      ctl.last = norm;
+
+      if (ws.current && ws.current.readyState === WebSocket.OPEN && connectedSessionId.current) {
+        try {
+          ws.current.send(JSON.stringify({ type: "resize", cols: norm.cols, rows: norm.rows }));
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    if (ctl.raf) cancelAnimationFrame(ctl.raf);
+    ctl.raf = requestAnimationFrame(() => {
+      ctl.raf = 0;
+      if (!canFitNow()) {
+        repairIfBad();
+        return;
+      }
+      runOnce();
+    });
+
+    if (burst) {
+      try {
+        for (const t of ctl.timers) clearTimeout(t);
+      } catch {
+        // ignore
+      }
+      ctl.timers = [];
+      // Layout + font metrics can stabilize over a few frames; refit a couple more times.
+      for (const d of [60, 220]) {
+        const t = setTimeout(() => scheduleFitAndResize({ force, burst: false }), d);
+        ctl.timers.push(t);
+      }
+    }
   }
 
   async function loadWorkspacePreset(pathStr: string, toolId: ToolId) {
@@ -1049,6 +1213,15 @@ export function App() {
         // ignore
       }
       termOutBuf.current = null;
+      try {
+        const ctl = ttyResizeCtl.current;
+        if (ctl.raf) cancelAnimationFrame(ctl.raf);
+        for (const t of ctl.timers) clearTimeout(t);
+        ctl.timers = [];
+        ctl.raf = 0;
+      } catch {
+        // ignore
+      }
       roRef.current?.disconnect();
       roRef.current = null;
       term.current?.dispose();
@@ -1062,7 +1235,7 @@ export function App() {
     (async () => {
       try {
         await ensureTerminalReady();
-        setTimeout(() => fit.current?.fit(), 20);
+        scheduleFitAndResize({ force: true, burst: true });
       } catch {
         // ignore
       }
@@ -1075,7 +1248,7 @@ export function App() {
     lsSet("fyp_font", String(fontSize));
     setTimeout(() => {
       try {
-        fit.current?.fit();
+        scheduleFitAndResize({ force: true, burst: true });
         term.current?.refresh(0, Math.max(0, (term.current?.rows ?? 1) - 1));
       } catch {
         // ignore
@@ -1085,12 +1258,11 @@ export function App() {
 
   useEffect(() => {
     if (!term.current) return;
-    const safeLineHeight = isPhoneLikeDevice() ? Math.max(1.45, lineHeight) : lineHeight;
-    term.current.options.lineHeight = safeLineHeight;
+    term.current.options.lineHeight = lineHeight;
     lsSet("fyp_lh", String(lineHeight));
     setTimeout(() => {
       try {
-        fit.current?.fit();
+        scheduleFitAndResize({ force: true, burst: true });
         term.current?.refresh(0, Math.max(0, (term.current?.rows ?? 1) - 1));
       } catch {
         // ignore
@@ -1100,7 +1272,7 @@ export function App() {
 
   useEffect(() => {
     if (tab !== "run") return;
-    setTimeout(() => fit.current?.fit(), 50);
+    setTimeout(() => scheduleFitAndResize({ force: true }), 50);
   }, [tab, activeId]);
 
   useEffect(() => {
@@ -1108,11 +1280,7 @@ export function App() {
     // appears. ResizeObserver doesn't always fire in those cases, so we explicitly refit xterm.
     const onResize = () => {
       try {
-        fit.current?.fit();
-        const cols = term.current?.cols;
-        const rows = term.current?.rows;
-        if (!cols || !rows || !ws.current || ws.current.readyState !== WebSocket.OPEN || !connectedSessionId.current) return;
-        ws.current.send(JSON.stringify({ type: "resize", cols, rows }));
+        scheduleFitAndResize({ burst: true });
       } catch {
         // ignore
       }
@@ -1453,6 +1621,17 @@ export function App() {
           void refreshWorkspaces();
           return;
         }
+        if (msg?.type === "session.stopped") {
+          setToast("Session stopped");
+          void refreshSessions();
+          return;
+        }
+        if (msg?.type === "session.restarted") {
+          setToast("Session resumed");
+          void refreshSessions();
+          scheduleFitAndResize({ force: true, burst: true });
+          return;
+        }
         if (msg?.type === "codex.native.delta" && typeof msg?.delta === "string") {
           const kind = typeof msg?.kind === "string" ? msg.kind : "agent";
           const threadId = typeof msg?.threadId === "string" ? msg.threadId : "";
@@ -1515,10 +1694,7 @@ export function App() {
       setSessionWsState("open");
       sessionCtl.current.ping = startPing(s);
 
-      fit.current?.fit();
-      const cols = term.current?.cols;
-      const rows = term.current?.rows;
-      if (cols && rows) s.send(JSON.stringify({ type: "resize", cols, rows }));
+      scheduleFitAndResize({ force: true, burst: true });
       const queued = pendingInputBySession.current[id];
       if (Array.isArray(queued) && queued.length > 0) {
         for (const text of queued) s.send(JSON.stringify({ type: "input", text }));
@@ -1723,6 +1899,10 @@ export function App() {
       setToast("No active session");
       return;
     }
+    if (!activeCanInput) {
+      setToast(activeSessionClosing ? "Session is closing" : "Session stopped");
+      return;
+    }
     let text = "";
     try {
       text = await navigator.clipboard.readText();
@@ -1756,7 +1936,7 @@ export function App() {
 
   async function sendText() {
     const text = composer.trimEnd();
-    if (!text) return;
+    const hasText = Boolean(text.trim());
     if (!activeId) {
       setToast("No active session");
       return;
@@ -1765,6 +1945,27 @@ export function App() {
       setToast("Session is closing");
       return;
     }
+    if (!activeCanInput) {
+      // If the session isn't running, treat Send as "Resume" (and optionally send the queued message).
+      setToast("Resuming...");
+      try {
+        await api(`/api/sessions/${encodeURIComponent(activeId)}/restart`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        });
+      } catch (e: any) {
+        setToast(typeof e?.message === "string" ? e.message : "Resume failed");
+        void refreshSessions();
+        return;
+      }
+      void refreshSessions();
+      void refreshWorkspaces();
+      if (!hasText) {
+        setComposer("");
+        return;
+      }
+    }
     const isCodexNative = activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
     const suffix = (() => {
       const pid = activeSession?.profileId ?? "";
@@ -1772,6 +1973,8 @@ export function App() {
       return typeof p?.sendSuffix === "string" ? p.sendSuffix : "\r";
     })();
     const full = isCodexNative ? text : text + suffix;
+
+    if (!hasText) return;
 
     if (ws.current && ws.current.readyState === WebSocket.OPEN && connectedSessionId.current === activeId) {
       ws.current.send(JSON.stringify({ type: "input", text: full }));
@@ -1791,7 +1994,15 @@ export function App() {
       setToast("Sent");
       setComposer("");
       return;
-    } catch {
+    } catch (e: any) {
+      const msg = typeof e?.message === "string" ? e.message : "";
+      // Don't queue when the server explicitly rejected the input (e.g. the session stopped).
+      if (msg.includes("Session stopped") || msg.includes("session_not_running") || msg.includes("unknown session")) {
+        setToast(msg || "Session stopped");
+        void refreshSessions();
+        return;
+      }
+
       // If the host is unreachable (offline), keep the message and send once the socket reconnects.
       const q = pendingInputBySession.current[activeId] ?? [];
       q.push(full);
@@ -2565,7 +2776,7 @@ export function App() {
                   <button className="runBtn" onClick={() => sendControl("interrupt")} aria-label="Ctrl+C">
                     <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM5 5l6 6M11 5l-6 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/></svg>
                   </button>
-                  {!activeIsCodexNative && (activeSession?.tool === "codex" || activeSession?.tool === "claude") ? (
+                  {!activeIsCodexNative && (activeSession?.tool === "codex" || activeSession?.tool === "claude" || (activeSession?.tool === "opencode" && Boolean(activeToolSessionId))) ? (
                     <button
                       className="runBtn"
                       onClick={() => {
@@ -2667,7 +2878,15 @@ export function App() {
                   ref={composerRef}
                   value={composer}
                   onChange={(e) => setComposer(e.target.value)}
-                  placeholder="Message..."
+                  placeholder={
+                    !activeId
+                      ? "No active session"
+                      : activeSessionClosing
+                        ? "Session closing..."
+                        : !activeCanInput
+                          ? "Session stopped. Tap send to resume."
+                          : "Message..."
+                  }
                   disabled={!activeId || activeSessionClosing}
                   autoCapitalize="sentences"
                   autoCorrect="on"
@@ -2696,10 +2915,14 @@ export function App() {
                 <button
                   className="composeSend"
                   onClick={sendText}
-                  aria-label="Send"
-                  disabled={!activeId || activeSessionClosing || !composer.trim()}
+                  aria-label={activeCanInput ? "Send" : "Resume"}
+                  disabled={!activeId || activeSessionClosing || (activeCanInput && !composer.trim())}
                 >
-                  <svg viewBox="0 0 20 20" width="18" height="18"><path d="M3 10l14-7-7 14v-7H3z" fill="currentColor"/></svg>
+                  {activeCanInput ? (
+                    <svg viewBox="0 0 20 20" width="18" height="18"><path d="M3 10l14-7-7 14v-7H3z" fill="currentColor"/></svg>
+                  ) : (
+                    <svg viewBox="0 0 20 20" width="18" height="18"><path d="M7 5l10 5-10 5V5z" fill="currentColor"/></svg>
+                  )}
                 </button>
               </div>
             </div>
@@ -2739,11 +2962,18 @@ export function App() {
 	                    const on = selectedWorkspaceKey === w.key;
 	                    const rootLabel = String(w.root || "").trim() || "(unknown)";
 	                    return (
-	                      <button
+	                      <div
 	                        key={w.key}
-	                        type="button"
-	                        className={`listRow ${on ? "listRowOn" : ""}`}
+	                        className={`listRow listRowDiv ${on ? "listRowOn" : ""}`}
+	                        role="button"
+	                        tabIndex={0}
 	                        onClick={() => setSelectedWorkspaceKey(w.key)}
+	                        onKeyDown={(e) => {
+	                          if (e.key === "Enter" || e.key === " ") {
+	                            e.preventDefault();
+	                            setSelectedWorkspaceKey(w.key);
+	                          }
+	                        }}
 	                      >
 	                        <div className="listLeft">
 	                          <span className={`chip ${w.isGit ? "chipOn" : ""}`}>{w.isGit ? "git" : "dir"}</span>
@@ -2755,7 +2985,7 @@ export function App() {
 	                          </div>
 	                        </div>
 	                        <div className="listRight">{on ? "open" : ""}</div>
-	                      </button>
+	                      </div>
 	                    );
 	                  })}
                 </div>
@@ -2982,7 +3212,7 @@ export function App() {
                                   Refresh
                                 </button>
                               </div>
-                              <div className="help">Chat history stored by Codex and Claude on this host. Tap to view, or resume in a live terminal.</div>
+                              <div className="help">Chat history stored by Codex, Claude, and OpenCode on this host. Tap to view, or resume in a live terminal.</div>
                               {toolSessionsMsg ? <div className="help mono">{toolSessionsMsg}</div> : null}
                             </div>
 
@@ -3264,6 +3494,7 @@ export function App() {
                       <div className="field">
                         <label>Sandbox</label>
                         <select value={codexOpt.sandbox} onChange={(e) => setCodexOpt((p) => ({ ...p, sandbox: e.target.value }))}>
+                          <option value="">(profile default)</option>
                           {(codexCaps?.sandboxModes ?? ["workspace-write"]).map((m) => (
                             <option key={m} value={m}>
                               {m}
@@ -3277,6 +3508,7 @@ export function App() {
                           value={codexOpt.askForApproval}
                           onChange={(e) => setCodexOpt((p) => ({ ...p, askForApproval: e.target.value }))}
                         >
+                          <option value="">(profile default)</option>
                           {(codexCaps?.approvalPolicies ?? ["on-request"]).map((m) => (
                             <option key={m} value={m}>
                               {m}
@@ -3326,6 +3558,7 @@ export function App() {
                           value={claudeOpt.permissionMode}
                           onChange={(e) => setClaudeOpt((p) => ({ ...p, permissionMode: e.target.value }))}
                         >
+                          <option value="">(profile default)</option>
                           {(claudeCaps?.permissionModes ?? ["default"]).map((m) => (
                             <option key={m} value={m}>
                               {m}
@@ -3754,7 +3987,7 @@ export function App() {
           }
         }}
         onClearLabel={() => setLabelDraft("")}
-        onFit={() => fit.current?.fit()}
+        onFit={() => scheduleFitAndResize({ force: true, burst: true })}
         onCopy={copyTermSelection}
         onPaste={pasteClipboardToTerm}
         onSendRaw={sendRaw}

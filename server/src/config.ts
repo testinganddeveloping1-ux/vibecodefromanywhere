@@ -25,7 +25,8 @@ export type Config = {
       // Tool-native settings (preferred over brittle macros).
       codex?: {
         sandbox?: "read-only" | "workspace-write" | "danger-full-access";
-        askForApproval?: "untrusted" | "on-failure" | "on-request" | "never";
+        // Codex CLI `--ask-for-approval` values. `on-failure` is deprecated but kept for back-compat.
+        askForApproval?: "untrusted" | "on-request" | "never" | "on-failure";
         fullAuto?: boolean;
         bypassApprovalsAndSandbox?: boolean;
         search?: boolean;
@@ -33,13 +34,8 @@ export type Config = {
         addDir?: string[];
       };
       claude?: {
-        permissionMode?:
-          | "acceptEdits"
-          | "bypassPermissions"
-          | "default"
-          | "delegate"
-          | "dontAsk"
-          | "plan";
+        // Claude Code `--permission-mode` values.
+        permissionMode?: "default" | "acceptEdits" | "plan" | "bypassPermissions" | "delegate" | "dontAsk";
         dangerouslySkipPermissions?: boolean;
         addDir?: string[];
       };

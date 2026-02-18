@@ -62,7 +62,7 @@ export type TuiAssist = {
   options: { id: string; label: string; send: string }[];
 };
 
-export type ToolSessionTool = "codex" | "claude";
+export type ToolSessionTool = "codex" | "claude" | "opencode";
 export type ToolSessionSummary = {
   tool: ToolSessionTool;
   id: string;

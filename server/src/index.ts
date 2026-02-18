@@ -7,6 +7,11 @@ import qrcode from "qrcode-terminal";
 
 const cfg = await loadOrCreateConfig();
 
+function truthyEnv(name: string): boolean {
+  const v = String(process.env[name] ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 function isLoopbackBind(bind: string): boolean {
   const b = String(bind ?? "").trim().toLowerCase();
   return b === "127.0.0.1" || b === "::1" || b === "localhost";
@@ -94,6 +99,7 @@ if (await probeExistingServer(probePort)) {
   const runningPort = pidInfo?.port ?? cfg.server.port;
   const host = advertisedHost(runningBind);
   const adminUrl = `http://${host}:${runningPort}/?token=${encodeURIComponent(cfg.auth.token)}`;
+  const showTokenQr = truthyEnv("FYP_SHOW_TOKEN_QR");
 
   console.log(`FromYourPhone already running on http://${host}:${runningPort}`);
 
@@ -110,6 +116,11 @@ if (await probeExistingServer(probePort)) {
       qrcode.generate(pairUrl, { small: true });
       console.log(`\nFallback (manual): Token link (long)`);
       console.log(`${adminUrl}\n`);
+      if (showTokenQr) {
+        console.log("Token QR (optional):");
+        qrcode.generate(adminUrl, { small: true });
+        console.log("");
+      }
     } else {
       console.log(`\nScan on phone: Token link`);
       console.log(`${adminUrl}\n`);
@@ -195,6 +206,7 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 const host = advertisedHost(cfg.server.bind);
 const adminUrl = `http://${host}:${cfg.server.port}/?token=${encodeURIComponent(cfg.auth.token)}`;
+const showTokenQr = truthyEnv("FYP_SHOW_TOKEN_QR");
 
 console.log(`FromYourPhone listening on http://${cfg.server.bind}:${cfg.server.port}`);
 
@@ -211,6 +223,11 @@ if (isLoopbackBind(cfg.server.bind)) {
     qrcode.generate(pairUrl, { small: true });
     console.log(`\nFallback (manual): Token link (long)`);
     console.log(`${adminUrl}\n`);
+    if (showTokenQr) {
+      console.log("Token QR (optional):");
+      qrcode.generate(adminUrl, { small: true });
+      console.log("");
+    }
   } else {
     console.log(`\nScan on phone: Token link`);
     console.log(`${adminUrl}\n`);

@@ -17,12 +17,12 @@ import { macroToWrites } from "./macros/macro_engine.js";
 import { isUnderRoot, listDir, normalizeRoots, validateCwd } from "./workspaces.js";
 import { ToolDetector } from "./tools/detector.js";
 import { buildArgsForSession } from "./tools/arg_builders.js";
-import { execCapture } from "./tools/exec.js";
+import { execCapture, execCaptureViaFile } from "./tools/exec.js";
 import { PairingManager } from "./pairing.js";
 import { resolveGitForPath, listGitWorktrees } from "./git.js";
 import { nanoid } from "nanoid";
 import { createHash, randomUUID } from "node:crypto";
-import { ToolSessionIndex } from "./tool_sessions.js";
+import { ToolSessionIndex, parseOpenCodeExport, parseOpenCodeSessionList, type ToolSessionSummary } from "./tool_sessions.js";
 import { CodexAppServer } from "./codex_app_server.js";
 
 export type AppConfig = {
@@ -1162,6 +1162,7 @@ main().catch(() => {});
 
   // Tracks linking attempts so repeated inputs don't start overlapping scans.
   const codexToolSessionLinkInFlight = new Set<string>();
+  const opencodeToolSessionLinkInFlight = new Set<string>();
 
   function scheduleCodexToolSessionLink(fypSessionId: string, cwd: string, createdAt: number) {
     // Codex does not let us set the session UUID ahead of time, so we discover it by scanning
@@ -1253,6 +1254,129 @@ main().catch(() => {});
           if (n + 1 >= maxAttempts) done();
           // ignore
         }
+      }, delay).unref?.();
+    };
+
+    attempt(0);
+  }
+
+  function scheduleOpenCodeToolSessionLink(fypSessionId: string, cwd: string, createdAt: number) {
+    // OpenCode doesn't expose the new session id to stdout, so we discover it by listing
+    // recent sessions and picking the most-recent one for this directory.
+    // We re-trigger on first input (HTTP/WS) in case the session is created late.
+    const maxAttempts = 22;
+    const baseDelayMs = 320;
+    const stepMs = 720;
+    const normCwd = path.resolve(cwd);
+    let normCwdReal = "";
+    try {
+      normCwdReal = fs.realpathSync(normCwd);
+    } catch {
+      normCwdReal = "";
+    }
+    if (opencodeToolSessionLinkInFlight.has(fypSessionId)) return;
+    opencodeToolSessionLinkInFlight.add(fypSessionId);
+
+    const done = () => {
+      try {
+        opencodeToolSessionLinkInFlight.delete(fypSessionId);
+      } catch {
+        // ignore
+      }
+    };
+
+    const attempt = (n: number) => {
+      const delay = baseDelayMs + n * stepMs + Math.floor(Math.random() * 120);
+      setTimeout(() => {
+        void (async () => {
+          try {
+            const cur = store.getSession(fypSessionId);
+            if (!cur || cur.tool !== "opencode") {
+              done();
+              return;
+            }
+            if (cur.toolSessionId) {
+              done();
+              return;
+            }
+
+            let caps: any = null;
+            try {
+              caps = await detector.get();
+            } catch {
+              caps = null;
+            }
+            if (!caps?.opencode?.installed) {
+              done();
+              return;
+            }
+
+            const matchCwd = (p: string): boolean => {
+              const resolved = path.resolve(p);
+              if (resolved === normCwd) return true;
+              if (!normCwdReal) return false;
+              try {
+                return fs.realpathSync(resolved) === normCwdReal;
+              } catch {
+                return false;
+              }
+            };
+
+            const spec = tools.opencode;
+            const r = await execCaptureViaFile(
+              spec.command,
+              [...spec.args, "session", "list", "--format", "json", "--max-count", "20"],
+              { timeoutMs: 10_000, cwd: normCwd },
+            );
+            if (!r.ok) {
+              if (n + 1 < maxAttempts) attempt(n + 1);
+              else done();
+              return;
+            }
+
+            const items = parseOpenCodeSessionList(stripAnsi(r.stdout))
+              .filter((s) => s.tool === "opencode" && matchCwd(s.cwd))
+              .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
+
+            const cutoff = createdAt - 12_000;
+            const recent = items.filter((s) => Math.max(Number(s.updatedAt ?? 0), Number(s.createdAt ?? 0)) >= cutoff);
+            // OpenCode frequently resumes the most recent session in a directory instead of creating a new one.
+            // In that case, `updatedAt/createdAt` may be much older than our spawn time, so a strict cutoff
+            // would never link and we'd lose chat history. Prefer "recent" sessions first, but after a few
+            // retries fall back to "most recent in this cwd".
+            const cand = (recent[0] ?? (n >= 4 ? items[0] : null)) ?? null;
+            if (!cand) {
+              if (n + 1 < maxAttempts) attempt(n + 1);
+              else done();
+              return;
+            }
+
+            // Avoid linking two FYP sessions to the same OpenCode session id.
+            const dup = store.listSessions().find((s) => s.id !== fypSessionId && s.toolSessionId === cand.id) ?? null;
+            if (dup) {
+              if (n + 1 < maxAttempts) attempt(n + 1);
+              else done();
+              return;
+            }
+
+            store.setSessionToolSessionId(fypSessionId, cand.id);
+            const evId = store.appendEvent(fypSessionId, "session.tool_link", { tool: "opencode", toolSessionId: cand.id });
+            if (evId !== -1) {
+              broadcastEvent(fypSessionId, {
+                id: evId,
+                ts: Date.now(),
+                kind: "session.tool_link",
+                data: { tool: "opencode", toolSessionId: cand.id },
+              });
+            }
+            broadcastGlobal({ type: "sessions.changed" });
+            broadcastGlobal({ type: "workspaces.changed" });
+            done();
+          } catch {
+            if (n + 1 >= maxAttempts) done();
+            // ignore
+          }
+        })();
       }, delay).unref?.();
     };
 
@@ -1367,7 +1491,8 @@ main().catch(() => {});
     const args = [...spec.args, "models"];
     if (provider) args.push(provider);
     if (refresh) args.push("--refresh");
-    const r = await execCapture(spec.command, args, { timeoutMs: refresh ? 20_000 : 8_000 });
+    // OpenCode can truncate stdout when captured via pipes. Capture via file for reliability.
+    const r = await execCaptureViaFile(spec.command, args, { timeoutMs: refresh ? 20_000 : 8_000 });
     if (!r.ok) {
       const msg = (r.stderr || r.stdout || r.error || "").trim().slice(0, 420);
       return reply.code(400).send({ ok: false, error: "models_failed", message: msg || "failed to list models" });
@@ -1562,8 +1687,33 @@ main().catch(() => {});
     return { ok: true };
   });
 
-  // Tool-native session discovery (Codex + Claude).
+  // Tool-native session discovery (Codex + Claude + OpenCode).
   // This powers chat-history rendering and lets the phone UI resume/fork sessions created outside FYP.
+  const opencodeToolSessionsCache = new Map<string, { ts: number; items: ToolSessionSummary[] }>();
+  async function listOpenCodeToolSessionsForPath(cwd: string, opts?: { refresh?: boolean }): Promise<ToolSessionSummary[]> {
+    const key = path.resolve(cwd);
+    const refresh = Boolean(opts?.refresh);
+    const cached = !refresh ? opencodeToolSessionsCache.get(key) : null;
+    const maxAgeMs = 3000;
+    if (cached && Date.now() - cached.ts < maxAgeMs) return cached.items.slice();
+
+    let caps: any = null;
+    try {
+      caps = await detector.get();
+    } catch {
+      caps = null;
+    }
+    if (!caps?.opencode?.installed) return [];
+
+    const spec = tools.opencode;
+    const args = [...spec.args, "session", "list", "--format", "json"];
+    const r = await execCaptureViaFile(spec.command, args, { timeoutMs: 14_000, cwd: key });
+    if (!r.ok) return [];
+
+    const items = parseOpenCodeSessionList(stripAnsi(r.stdout));
+    opencodeToolSessionsCache.set(key, { ts: Date.now(), items });
+    return items.slice();
+  }
   app.get("/api/tool-sessions", async (req, reply) => {
     const q = (req.query ?? {}) as any;
     const tool = typeof q?.tool === "string" ? String(q.tool).trim() : "";
@@ -1572,14 +1722,27 @@ main().catch(() => {});
 
     let items = toolIndex.list({ refresh });
     if (tool === "codex" || tool === "claude") items = items.filter((s) => s.tool === tool);
+    if (tool === "opencode") items = [];
 
     if (under) {
       const vv = validateCwd(under, roots);
       if (!vv.ok) return reply.code(400).send({ error: "bad_path", reason: vv.reason });
       const root = vv.cwd;
       items = items.filter((s) => isUnderRoot(s.cwd, root));
+
+      // OpenCode sessions are listed per project directory; we only fetch them when the
+      // caller scopes by `under=...` (workspace) for performance and relevance.
+      if (!tool || tool === "opencode") {
+        try {
+          const oc = await listOpenCodeToolSessionsForPath(root, { refresh });
+          items = items.concat(oc.filter((s) => isUnderRoot(s.cwd, root)));
+        } catch {
+          // ignore
+        }
+      }
     }
 
+    items.sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
     return { ok: true, items };
   });
 
@@ -1590,8 +1753,28 @@ main().catch(() => {});
     const q = (req.query ?? {}) as any;
     const refresh = q?.refresh === "1" || q?.refresh === "true" || q?.refresh === "yes";
     const limit = Number(q?.limit ?? 160);
-    if (tool !== "codex" && tool !== "claude") return reply.code(400).send({ error: "bad_tool" });
+    if (tool !== "codex" && tool !== "claude" && tool !== "opencode") return reply.code(400).send({ error: "bad_tool" });
     if (!id) return reply.code(400).send({ error: "bad_id" });
+
+    if (tool === "opencode") {
+      let caps: any = null;
+      try {
+        caps = await detector.get();
+      } catch {
+        caps = null;
+      }
+      if (!caps?.opencode?.installed) return reply.code(400).send({ error: "tool_not_installed" });
+
+      const spec = tools.opencode;
+      const r = await execCaptureViaFile(spec.command, [...spec.args, "export", id], { timeoutMs: 22_000 });
+      if (!r.ok) {
+        const msg = (r.stderr || r.stdout || r.error || "").trim().slice(0, 420);
+        return reply.code(404).send({ error: "not_found", message: msg || "export failed" });
+      }
+      const parsed = parseOpenCodeExport(stripAnsi(r.stdout), { limit, idFallback: id });
+      if (!parsed.session) return reply.code(404).send({ error: "not_found" });
+      return { ok: true, session: parsed.session, messages: parsed.messages ?? [] };
+    }
 
     const sess = toolIndex.get(tool, id, { refresh });
     if (!sess) return reply.code(404).send({ error: "not_found" });
@@ -1837,7 +2020,7 @@ main().catch(() => {});
     if ((toolActionRaw || toolSessionId) && !wantsToolSession) {
       return reply.code(400).send({ error: "bad_tool_session" });
     }
-    if (wantsToolSession && tool !== "codex" && tool !== "claude") {
+    if (wantsToolSession && tool !== "codex" && tool !== "claude" && tool !== "opencode") {
       return reply.code(400).send({ error: "unsupported", field: "toolAction", value: toolAction });
     }
     if (tool !== "codex" && tool !== "claude" && tool !== "opencode") {
@@ -1850,7 +2033,7 @@ main().catch(() => {});
     if (!(toolCaps as any).installed) return reply.code(400).send({ error: "tool_not_installed" });
 
     let toolSess: any | null = null;
-    if (wantsToolSession && !(tool === "codex" && transport === "codex-app-server")) {
+    if ((tool === "codex" || tool === "claude") && wantsToolSession && !(tool === "codex" && transport === "codex-app-server")) {
       toolSess = toolIndex.get(tool as any, toolSessionId, { refresh: false }) ?? toolIndex.get(tool as any, toolSessionId, { refresh: true });
       if (!toolSess) return reply.code(404).send({ error: "tool_session_not_found" });
     }
@@ -1980,9 +2163,17 @@ main().catch(() => {});
     // Link FYP sessions to tool-native session IDs so we can render chat history.
     // - Claude: we can force a deterministic UUID with --session-id for new sessions.
     // - Codex: we discover the created session log shortly after spawn.
+    // - OpenCode: resume/fork uses `--session`/`--fork` and we store that id.
     let toolSessionIdForStore: string | null = null;
     if (wantsToolSession) toolSessionIdForStore = toolSessionId;
     else if (tool === "claude") toolSessionIdForStore = randomUUID();
+
+    if (wantsToolSession && tool === "opencode") {
+      effectiveProfile.opencode = effectiveProfile.opencode ?? {};
+      effectiveProfile.opencode.session = toolSessionId;
+      effectiveProfile.opencode.continue = false;
+      effectiveProfile.opencode.fork = toolAction === "fork";
+    }
 
     const built = buildArgsForSession({
       tool,
@@ -2227,6 +2418,9 @@ main().catch(() => {});
     if (tool === "codex" && !toolSessionIdForStore && cwd) {
       scheduleCodexToolSessionLink(id, cwd, spawnedAt);
     }
+    if (tool === "opencode" && !toolSessionIdForStore && cwd) {
+      scheduleOpenCodeToolSessionLink(id, cwd, spawnedAt);
+    }
 
     const createdEventId = store.appendEvent(id, "session.created", {
       tool,
@@ -2426,12 +2620,284 @@ main().catch(() => {});
         return reply.code(400).send({ error: "codex_native_failed", message: String(e?.message ?? e) });
       }
     } else {
+      const st = sessions.getStatus(id);
+      if (!st || !st.running) {
+        return reply
+          .code(409)
+          .send({ error: "session_not_running", message: "Session stopped. Resume or start a new session to send messages." });
+      }
       sessions.write(id, text);
       if (sess.tool === "codex" && !sess.toolSessionId && sess.cwd) {
         scheduleCodexToolSessionLink(id, sess.cwd, Date.now());
       }
+      if (sess.tool === "opencode" && !sess.toolSessionId && sess.cwd) {
+        scheduleOpenCodeToolSessionLink(id, sess.cwd, Date.now());
+      }
     }
     return { ok: true, event: { id: evId, ts: Date.now(), kind: "input", data: { text } } };
+  });
+
+  app.post("/api/sessions/:id/restart", async (req, reply) => {
+    const id = (req.params as any).id as string;
+    if (!id) return reply.code(400).send({ error: "bad_id" });
+    if (closingSessions.has(id)) return reply.code(409).send({ error: "session_closing" });
+    const sess = store.getSession(id);
+    if (!sess) return reply.code(404).send({ error: "not_found" });
+    const transport = sessionTransport(sess);
+    if (transport !== "pty") return reply.code(400).send({ error: "unsupported_transport" });
+    const st = sessions.getStatus(id);
+    if (st?.running) return reply.code(409).send({ error: "running" });
+
+    const tool = sess.tool as ToolId;
+    if (tool !== "codex" && tool !== "claude" && tool !== "opencode") return reply.code(400).send({ error: "invalid_tool" });
+
+    const body = (req.body ?? {}) as any;
+    const toolActionRaw = typeof body.toolAction === "string" ? body.toolAction : null;
+    const toolAction = toolActionRaw === "resume" || toolActionRaw === "fork" ? toolActionRaw : null;
+    const overrideToolSessionId = typeof body.toolSessionId === "string" ? body.toolSessionId.trim() : "";
+
+    const storedToolSessionId = typeof sess.toolSessionId === "string" ? String(sess.toolSessionId).trim() : "";
+    const created = (() => {
+      try {
+        return store.getLatestEvent(id, "session.created")?.data ?? null;
+      } catch {
+        return null;
+      }
+    })();
+
+    const createdToolSessionId =
+      created && typeof created.toolSessionId === "string" ? String(created.toolSessionId).trim() : "";
+    const toolSessionId = overrideToolSessionId || storedToolSessionId || createdToolSessionId;
+
+    const inferredAction = toolAction ?? (toolSessionId ? "resume" : null);
+    const wantsToolSession = Boolean(inferredAction && toolSessionId);
+
+    const overrideCwd = typeof body.cwd === "string" ? body.cwd.trim() : "";
+    const createdCwd = created && typeof created.cwd === "string" ? String(created.cwd).trim() : "";
+    const storedCwd = typeof sess.cwd === "string" ? String(sess.cwd).trim() : "";
+    const desiredCwd = overrideCwd || storedCwd || createdCwd || null;
+
+    const cwdOk = desiredCwd ? validateCwd(desiredCwd, roots) : null;
+    if (cwdOk && !cwdOk.ok) return reply.code(400).send({ error: "bad_cwd", reason: cwdOk.reason });
+    let cwd = cwdOk && cwdOk.ok ? cwdOk.cwd : undefined;
+    if (!cwd) {
+      const v = validateCwd(process.cwd(), roots);
+      cwd = v.ok ? v.cwd : roots[0] ?? process.cwd();
+    }
+
+    const profileId = typeof body.profileId === "string" ? body.profileId : String(sess.profileId ?? `${tool}.default`);
+    const baseProfile = profiles[profileId];
+
+    const caps = await detector.get();
+    const toolCaps = tool === "codex" ? caps.codex : tool === "claude" ? caps.claude : caps.opencode;
+    if (!(toolCaps as any).installed) return reply.code(400).send({ error: "tool_not_installed" });
+
+    const extraEnv: Record<string, string> = {};
+    if (baseProfile && baseProfile.tool === tool && (baseProfile as any).env && typeof (baseProfile as any).env === "object") {
+      for (const [k, v] of Object.entries((baseProfile as any).env as any)) extraEnv[String(k)] = String(v);
+    }
+
+    const overridesFromHistory =
+      created && created.overrides && typeof created.overrides === "object" ? (created.overrides as any) : {};
+    const overrides = body.overrides && typeof body.overrides === "object" ? (body.overrides as any) : overridesFromHistory;
+
+    const effectiveProfile =
+      baseProfile && baseProfile.tool === tool
+        ? (structuredClone(baseProfile) as any)
+        : ({
+            tool,
+            title: `${tool} (custom)`,
+            startup: [],
+            sendSuffix: "\r",
+          } as any);
+
+    function readDirs(v: any): string[] {
+      if (!Array.isArray(v)) return [];
+      return v.map((x) => String(x)).filter(Boolean);
+    }
+
+    function validateDirsOr400(dirs: string[]): { ok: true; dirs: string[] } | { ok: false; resp: any } {
+      const out: string[] = [];
+      for (const d of dirs) {
+        const vv = validateCwd(d, roots);
+        if (!vv.ok) return { ok: false, resp: reply.code(400).send({ error: "bad_dir", dir: d, reason: vv.reason }) as any };
+        out.push(vv.cwd);
+      }
+      return { ok: true, dirs: Array.from(new Set(out)) };
+    }
+
+    if (tool === "codex") {
+      effectiveProfile.codex = effectiveProfile.codex ?? {};
+      const o = overrides?.codex ?? {};
+      if (typeof o.sandbox === "string") effectiveProfile.codex.sandbox = o.sandbox;
+      if (typeof o.askForApproval === "string") effectiveProfile.codex.askForApproval = o.askForApproval;
+      if (typeof o.fullAuto === "boolean") effectiveProfile.codex.fullAuto = o.fullAuto;
+      if (typeof o.bypassApprovalsAndSandbox === "boolean")
+        effectiveProfile.codex.bypassApprovalsAndSandbox = o.bypassApprovalsAndSandbox;
+      if (typeof o.search === "boolean") effectiveProfile.codex.search = o.search;
+      if (typeof o.noAltScreen === "boolean") effectiveProfile.codex.noAltScreen = o.noAltScreen;
+      const mergedDirs = [...(effectiveProfile.codex.addDir ?? []), ...readDirs(o.addDir)];
+      const vd = validateDirsOr400(mergedDirs);
+      if (!vd.ok) return vd.resp;
+      effectiveProfile.codex.addDir = vd.dirs;
+
+      if (effectiveProfile.codex.sandbox && !caps.codex.sandboxModes.includes(effectiveProfile.codex.sandbox)) {
+        return reply.code(400).send({ error: "unsupported", field: "codex.sandbox", value: effectiveProfile.codex.sandbox });
+      }
+      if (
+        effectiveProfile.codex.askForApproval &&
+        !caps.codex.approvalPolicies.includes(effectiveProfile.codex.askForApproval)
+      ) {
+        return reply
+          .code(400)
+          .send({ error: "unsupported", field: "codex.askForApproval", value: effectiveProfile.codex.askForApproval });
+      }
+      if (typeof effectiveProfile.codex.noAltScreen === "boolean" && effectiveProfile.codex.noAltScreen) {
+        if (!caps.codex.supports.noAltScreen) {
+          return reply.code(400).send({ error: "unsupported", field: "codex.noAltScreen", value: true });
+        }
+      }
+    }
+
+    if (tool === "claude") {
+      effectiveProfile.claude = effectiveProfile.claude ?? {};
+      const o = overrides?.claude ?? {};
+      if (typeof o.permissionMode === "string") effectiveProfile.claude.permissionMode = o.permissionMode;
+      if (typeof o.dangerouslySkipPermissions === "boolean")
+        effectiveProfile.claude.dangerouslySkipPermissions = o.dangerouslySkipPermissions;
+      const mergedDirs = [...(effectiveProfile.claude.addDir ?? []), ...readDirs(o.addDir)];
+      const vd = validateDirsOr400(mergedDirs);
+      if (!vd.ok) return vd.resp;
+      effectiveProfile.claude.addDir = vd.dirs;
+
+      if (
+        effectiveProfile.claude.permissionMode &&
+        caps.claude.permissionModes.length > 0 &&
+        !caps.claude.permissionModes.includes(effectiveProfile.claude.permissionMode)
+      ) {
+        return reply
+          .code(400)
+          .send({ error: "unsupported", field: "claude.permissionMode", value: effectiveProfile.claude.permissionMode });
+      }
+    }
+
+    if (tool === "opencode") {
+      effectiveProfile.opencode = effectiveProfile.opencode ?? {};
+      const o = overrides?.opencode ?? {};
+      if (typeof o.model === "string") effectiveProfile.opencode.model = o.model;
+      if (typeof o.agent === "string") effectiveProfile.opencode.agent = o.agent;
+      if (typeof o.prompt === "string") effectiveProfile.opencode.prompt = o.prompt;
+      if (typeof o.continue === "boolean") effectiveProfile.opencode.continue = o.continue;
+      if (typeof o.session === "string") effectiveProfile.opencode.session = o.session;
+      if (typeof o.fork === "boolean") effectiveProfile.opencode.fork = o.fork;
+      if (typeof o.hostname === "string") effectiveProfile.opencode.hostname = o.hostname;
+      if (typeof o.port === "number") effectiveProfile.opencode.port = o.port;
+    }
+
+    // If no tool session is linked yet, Claude benefits from deterministic IDs so history can be loaded later.
+    let toolSessionIdForStore: string | null = storedToolSessionId || null;
+    if (!wantsToolSession && tool === "claude" && !toolSessionIdForStore) toolSessionIdForStore = randomUUID();
+
+    if (wantsToolSession && tool === "opencode") {
+      effectiveProfile.opencode = effectiveProfile.opencode ?? {};
+      effectiveProfile.opencode.session = toolSessionId;
+      effectiveProfile.opencode.continue = false;
+      effectiveProfile.opencode.fork = inferredAction === "fork";
+      toolSessionIdForStore = toolSessionId;
+    }
+
+    const built = buildArgsForSession({
+      tool,
+      baseArgs: [],
+      profile: effectiveProfile,
+      cwd,
+    });
+
+    if (wantsToolSession) {
+      if (tool === "codex") built.args = [inferredAction!, toolSessionId, ...built.args];
+      if (tool === "claude") {
+        built.args.push("--resume", toolSessionId);
+        if (inferredAction === "fork") built.args.push("--fork-session");
+      }
+    } else if (tool === "claude" && toolSessionIdForStore) {
+      built.args.push("--session-id", toolSessionIdForStore);
+    }
+
+    // OpenCode supports a positional "project" path. Use cwd if provided.
+    if (tool === "opencode" && cwd) built.args.unshift(cwd);
+
+    // Claude Code: install PermissionRequest hook (session-local via --settings) so approvals show in Inbox.
+    if (tool === "claude" && claudeHooksEnabled && caps.claude.supports.settings) {
+      const scriptPath = ensureClaudePermissionHookScript();
+      if (scriptPath) {
+        const hookKey = nanoid(32);
+        claudeHookSessions.set(id, { key: hookKey });
+        extraEnv.FYP_HOOK_BASE_URL = hookBaseUrl;
+        extraEnv.FYP_HOOK_KEY = hookKey;
+        extraEnv.FYP_SESSION_ID = id;
+        const cmd = `${shQuote(process.execPath)} ${shQuote(scriptPath)}`;
+        const settings = {
+          hooks: {
+            PermissionRequest: [
+              {
+                matcher: "*",
+                hooks: [{ type: "command", command: cmd, timeout: 600 }],
+              },
+            ],
+          },
+        };
+        built.args.push("--settings", JSON.stringify(settings));
+      }
+    }
+
+    // Best-effort: clear transient buffers so old TUI fragments don't produce stale overlays.
+    cleanupSessionTransientState(id);
+    // Ensure any previous PTY handle is released before respawn.
+    sessions.forget(id);
+
+    try {
+      sessions.createSession({ id, tool, profileId, cwd, extraArgs: built.args, env: extraEnv });
+    } catch (e: any) {
+      claudeHookSessions.delete(id);
+      return reply.code(400).send({
+        error: "spawn_failed",
+        message: typeof e?.message === "string" ? e.message : "failed to spawn tool",
+      });
+    }
+
+    attachBroadcast(id, tool);
+    attachExitTracking(id);
+
+    // Reset exit metadata now that a new run started.
+    try {
+      store.setSessionExit(id, null, null);
+      if (toolSessionIdForStore && toolSessionIdForStore !== storedToolSessionId) store.setSessionToolSessionId(id, toolSessionIdForStore);
+    } catch {
+      // ignore
+    }
+
+    if (tool === "codex" && !toolSessionIdForStore && cwd) {
+      scheduleCodexToolSessionLink(id, cwd, Date.now());
+    }
+
+    const evId = store.appendEvent(id, "session.restart", {
+      tool,
+      profileId,
+      cwd: cwd ?? null,
+      toolAction: wantsToolSession ? inferredAction : null,
+      toolSessionId: wantsToolSession ? toolSessionId : toolSessionIdForStore,
+      args: built.args,
+      notes: built.notes,
+      overrides: overrides ?? {},
+    });
+    if (evId !== -1) {
+      broadcastEvent(id, { id: evId, ts: Date.now(), kind: "session.restart", data: { tool, profileId, cwd: cwd ?? null } });
+    }
+    notifySessionSockets(id, { type: "session.restarted", ts: Date.now() });
+    broadcastGlobal({ type: "sessions.changed" });
+    broadcastGlobal({ type: "workspaces.changed" });
+
+    return { ok: true };
   });
 
   app.post("/api/sessions/:id/interrupt", async (req, reply) => {
@@ -2512,14 +2978,17 @@ main().catch(() => {});
   app.post("/api/sessions/:id/resize", async (req, reply) => {
     const id = (req.params as any).id as string;
     const body = (req.body ?? {}) as any;
-    const cols = Number(body.cols);
-    const rows = Number(body.rows);
+    const colsRaw = Number(body.cols);
+    const rowsRaw = Number(body.rows);
     if (closingSessions.has(id)) return reply.code(409).send({ error: "session_closing" });
     const sess = store.getSession(id);
     if (!sess) return reply.code(404).send({ error: "not found" });
-    if (!Number.isFinite(cols) || !Number.isFinite(rows)) return reply.code(400).send({ error: "invalid size" });
+    const cols = Math.floor(colsRaw);
+    const rows = Math.floor(rowsRaw);
+    if (!Number.isFinite(cols) || !Number.isFinite(rows)) return reply.code(400).send({ error: "invalid_size" });
+    if (cols < 12 || rows < 6) return reply.code(400).send({ error: "invalid_size" });
     const transport = sessionTransport(sess);
-    if (transport === "pty") sessions.resize(id, cols, rows);
+    if (transport === "pty") sessions.resize(id, Math.min(400, cols), Math.min(220, rows));
     return { ok: true };
   });
 
@@ -2628,18 +3097,30 @@ main().catch(() => {});
               }
             })();
           } else {
+            const st = sessions.getStatus(id);
+            if (!st || !st.running) {
+              wsSend(socket, { type: "session.stopped", ts: Date.now() });
+              return;
+            }
             sessions.write(id, msg.text);
             try {
               if (sess.tool === "codex" && !sess.toolSessionId && sess.cwd) {
                 scheduleCodexToolSessionLink(id, sess.cwd, Date.now());
+              }
+              if (sess.tool === "opencode" && !sess.toolSessionId && sess.cwd) {
+                scheduleOpenCodeToolSessionLink(id, sess.cwd, Date.now());
               }
             } catch {
               // ignore
             }
           }
         }
-        if (msg?.type === "resize" && Number.isFinite(msg.cols) && Number.isFinite(msg.rows)) {
-          if (transport === "pty") sessions.resize(id, msg.cols, msg.rows);
+        if (msg?.type === "resize") {
+          const cols = Math.floor(Number((msg as any).cols));
+          const rows = Math.floor(Number((msg as any).rows));
+          if (Number.isFinite(cols) && Number.isFinite(rows) && cols >= 12 && rows >= 6) {
+            if (transport === "pty") sessions.resize(id, Math.min(400, cols), Math.min(220, rows));
+          }
         }
         if (msg?.type === "interrupt") {
           const evId = store.appendEvent(id, "interrupt", {});

@@ -2,7 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+    <!-- Allow pinch-zoom on mobile. This is especially important for Terminal (TUI) mode. -->
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
     <meta name="theme-color" content="#050608" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -110,6 +111,10 @@
         const url = document.getElementById("bootUrl");
         if (url) url.textContent = String(window.location.href || "");
 
+        // Once React mounts, the inline boot UI must never "take over" again.
+        // The app has its own error boundary for runtime crashes.
+        let bootDone = false;
+
         const showErr = (msg) => {
           try {
             if (boot) boot.style.display = "flex";
@@ -120,21 +125,37 @@
           if (sub) sub.textContent = "Startup error";
         };
 
-        window.addEventListener("error", (e) => {
-          try { showErr(e && (e.message || (e.error && e.error.message) || e.error) ); } catch {}
-        });
-        window.addEventListener("unhandledrejection", (e) => {
-          try { showErr(e && (e.reason && (e.reason.message || e.reason)) ); } catch {}
-        });
+        const onError = (e) => {
+          if (bootDone) return;
+          try {
+            showErr(e && (e.message || (e.error && e.error.message) || e.error));
+          } catch {}
+        };
+        const onRejection = (e) => {
+          if (bootDone) return;
+          try {
+            showErr(e && (e.reason && (e.reason.message || e.reason)));
+          } catch {}
+        };
+        window.addEventListener("error", onError);
+        window.addEventListener("unhandledrejection", onRejection);
 
         window.__FYP_BOOT_OK = () => {
+          bootDone = true;
           try { if (boot) boot.style.display = "none"; } catch {}
+          try { window.removeEventListener("error", onError); } catch {}
+          try { window.removeEventListener("unhandledrejection", onRejection); } catch {}
         };
         window.__FYP_BOOT_FAIL = (msg) => {
+          if (bootDone) {
+            try { console.error("[FromYourPhone] bootFail after mount:", msg); } catch {}
+            return;
+          }
           try { showErr(msg); } catch {}
         };
 
         setTimeout(() => {
+          if (bootDone) return;
           try {
             const hasUi = root && root.children && root.children.length > 0;
             if (!hasUi && sub) sub.textContent = "Still loading...";

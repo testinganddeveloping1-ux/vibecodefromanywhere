@@ -16,7 +16,13 @@ export function buildArgsForSession(input: {
 
     const c = p?.codex;
     if (c?.sandbox) args.push("--sandbox", c.sandbox);
-    if (c?.askForApproval) args.push("--ask-for-approval", c.askForApproval);
+    if (c?.askForApproval) {
+      // `on-failure` is deprecated in newer Codex CLI builds. Map it to `on-request`
+      // for compatibility rather than failing session spawn.
+      const v = c.askForApproval === ("on-failure" as any) ? "on-request" : c.askForApproval;
+      args.push("--ask-for-approval", v);
+      if (c.askForApproval === ("on-failure" as any)) notes.push("codex.askForApproval on-failure deprecated; using on-request");
+    }
     if (c?.fullAuto) args.push("--full-auto");
     if (c?.bypassApprovalsAndSandbox) args.push("--dangerously-bypass-approvals-and-sandbox");
     if (c?.search) args.push("--search");
@@ -26,7 +32,11 @@ export function buildArgsForSession(input: {
 
   if (input.tool === "claude") {
     const c = p?.claude;
-    if (c?.permissionMode) args.push("--permission-mode", c.permissionMode);
+    if (c?.permissionMode) {
+      const allowed = new Set(["default", "acceptEdits", "plan", "bypassPermissions", "delegate", "dontAsk"]);
+      if (allowed.has(c.permissionMode)) args.push("--permission-mode", c.permissionMode);
+      else notes.push(`claude.permissionMode ignored (unsupported): ${c.permissionMode}`);
+    }
     if (c?.dangerouslySkipPermissions) args.push("--dangerously-skip-permissions");
     for (const d of c?.addDir ?? []) args.push("--add-dir", d);
   }
