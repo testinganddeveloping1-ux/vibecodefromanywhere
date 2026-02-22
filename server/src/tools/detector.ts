@@ -59,15 +59,16 @@ async function detectCodex(cmd: string, args: string[]): Promise<CodexCaps> {
   const rPath = resolveBinary(cmd);
   if (!rPath) return {
     installed: false,
-    sandboxModes: [],
-    approvalPolicies: [],
-    supports: {
-      cd: false,
-      addDir: false,
-      search: false,
-      fullAuto: false,
-      bypassApprovalsSandbox: false,
-      configOverride: false,
+      sandboxModes: [],
+      approvalPolicies: [],
+      supports: {
+        cd: false,
+        model: false,
+        addDir: false,
+        search: false,
+        fullAuto: false,
+        bypassApprovalsSandbox: false,
+        configOverride: false,
       noAltScreen: false,
     },
   };
@@ -87,6 +88,7 @@ async function detectCodex(cmd: string, args: string[]): Promise<CodexCaps> {
     approvalPolicies,
     supports: {
       cd: hasFlag(help, "--cd") || hasFlag(help, "-C, --cd"),
+      model: hasFlag(help, "--model") || hasFlag(help, "-m, --model"),
       addDir: hasFlag(help, "--add-dir"),
       search: hasFlag(help, "--search"),
       fullAuto: hasFlag(help, "--full-auto"),
@@ -102,7 +104,7 @@ async function detectClaude(cmd: string, args: string[]): Promise<ClaudeCaps> {
   if (!rPath) return {
     installed: false,
     permissionModes: [],
-    supports: { permissionMode: false, dangerouslySkipPermissions: false, addDir: false, settings: false },
+    supports: { permissionMode: false, dangerouslySkipPermissions: false, model: false, addDir: false, settings: false },
   };
 
   const version = (await execCapture(cmd, ["--version"], { timeoutMs: 1500 })).stdout.trim() || undefined;
@@ -116,6 +118,7 @@ async function detectClaude(cmd: string, args: string[]): Promise<ClaudeCaps> {
     supports: {
       permissionMode: hasFlag(help, "--permission-mode"),
       dangerouslySkipPermissions: hasFlag(help, "--dangerously-skip-permissions"),
+      model: hasFlag(help, "--model") || hasFlag(help, "-m, --model"),
       addDir: hasFlag(help, "--add-dir"),
       settings: hasFlag(help, "--settings"),
     },

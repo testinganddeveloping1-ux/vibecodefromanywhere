@@ -1,13 +1,15 @@
 import React from "react";
+import { IconLogo } from "./icons";
+import styles from "./LoginScreens.module.css";
 
 export function ConnectingScreen() {
   return (
-    <div className="login">
-      <div style={{ textAlign: "center" }}>
-        <div className="logo" style={{ width: 48, height: 48, fontSize: 14, margin: "0 auto 12px" }}>
-          FYP
+    <div className={styles.container}>
+      <div className={styles.card} style={{ alignItems: "center", justifyContent: "center", padding: "48px 24px", maxWidth: "320px" }}>
+        <div className={styles.logoBox} style={{ width: 64, height: 64, borderRadius: 20 }}>
+          <IconLogo />
         </div>
-        <div className="muted" style={{ fontSize: 13 }}>
+        <div className={styles.title} style={{ fontSize: 18, marginTop: "8px" }}>
           Connecting...
         </div>
       </div>
@@ -27,24 +29,23 @@ export function UnlockScreen(props: {
   onPair: () => void | Promise<void>;
 }) {
   return (
-    <div className="login">
-      <div className="loginCard">
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
-          <div className="logo" style={{ width: 38, height: 38, fontSize: 12 }}>
-            FYP
+    <div className={styles.container}>
+      <div className={styles.card}>
+        <div className={styles.header}>
+          <div className={styles.logoBox}>
+            <IconLogo />
           </div>
-          <div className="loginTitle">FromYourPhone</div>
+          <div className={styles.title}>FromYourPhone</div>
+          <div className={styles.subtitle}>Unlock or pair device to sync terminals and workspace instantly.</div>
         </div>
-        <div className="loginSub">Use Pair code first (recommended). Token is a fallback.</div>
 
-        <div className="loginHint" style={{ marginTop: 8 }}>
-          Pair is fastest: scan the host Pair QR, or paste the 8-char code shown on host.
-        </div>
-        <div className="loginActions" style={{ marginTop: 10 }}>
+        <div className={styles.inputGroup}>
+          <div className={styles.label}>Pair Code (Recommended)</div>
           <input
+            className={styles.input}
             value={props.pairCode}
             onChange={(e) => props.setPairCode(e.target.value)}
-            placeholder="pair code (8 chars)"
+            placeholder="8-char code from host screen"
             autoCapitalize="characters"
             autoCorrect="off"
             onKeyDown={(e) => {
@@ -54,39 +55,50 @@ export function UnlockScreen(props: {
               }
             }}
           />
-          <button className="btn" onClick={props.onPair}>
-            Pair
+        </div>
+
+        <div className={styles.actions}>
+          <button className={`${styles.btn} ${styles.btnPrimary}`} onClick={props.onPair} style={{ flex: 1 }}>
+            Pair Device
           </button>
         </div>
-        {props.pairMsg ? <div className="loginHint">{props.pairMsg}</div> : null}
 
-        <div className="loginHint" style={{ marginTop: 10 }}>
-          Fallback: paste long token from host terminal.
+        {props.pairMsg && <div className={styles.message}>{props.pairMsg}</div>}
+
+        <div style={{ height: 1, background: "rgba(255,255,255,0.08)", margin: "12px 0" }} />
+
+        <div className={styles.inputGroup}>
+          <div className={styles.label}>Token Fallback</div>
+          <input
+            className={styles.input}
+            value={props.token}
+            onChange={(e) => props.setToken(e.target.value)}
+            placeholder="Long connection token..."
+            autoCapitalize="none"
+            autoCorrect="off"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                props.onUnlock();
+              }
+            }}
+          />
         </div>
-        <input
-          value={props.token}
-          onChange={(e) => props.setToken(e.target.value)}
-          placeholder="token..."
-          autoCapitalize="none"
-          autoCorrect="off"
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              props.onUnlock();
-            }
-          }}
-        />
-        <div className="loginActions">
-          <button className="btn primary" onClick={props.onUnlock}>
+
+        <div className={styles.actions}>
+          <button className={`${styles.btn} ${styles.btnPrimary}`} onClick={props.onUnlock}>
             Unlock
           </button>
-          <button className="btn" onClick={props.onRetry}>
+          <button className={styles.btn} onClick={props.onRetry} style={{ background: "transparent", border: "1px solid rgba(255,255,255,0.1)" }}>
             Retry
           </button>
         </div>
-        {props.unlockMsg ? <div className="loginHint">{props.unlockMsg}</div> : null}
-        <div className="loginHint">After first unlock/pair, device stores an httpOnly cookie, so you usually are not asked again.</div>
-        <div className="loginHint">If it auto-opens without asking, that device is already paired.</div>
+
+        {props.unlockMsg && <div className={styles.message}>{props.unlockMsg}</div>}
+
+        <div className={styles.hint}>
+          A secure cookie will keep you paired on this device.
+        </div>
       </div>
     </div>
   );

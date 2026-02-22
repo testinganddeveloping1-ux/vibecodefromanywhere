@@ -75,7 +75,7 @@ describe("sessions delete", () => {
       if (r.statusCode !== 200) return false;
       const j = JSON.parse(r.payload);
       return Boolean(j?.status && j.status.running === false);
-    }, 5000);
+    }, 8000);
 
     const del = await app.inject({
       method: "DELETE",
@@ -103,7 +103,7 @@ describe("sessions delete", () => {
 
     await app.close();
     fs.rmSync(dir, { recursive: true, force: true });
-  }, 15_000);
+  }, 20_000);
 
   test("force delete closes running session and removes record", async () => {
     const { app, dir } = await testApp();

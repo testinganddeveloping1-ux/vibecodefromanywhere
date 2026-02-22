@@ -47,6 +47,42 @@ export function validateCwd(input: string, roots: string[]): { ok: true; cwd: st
 
 export type DirEntry = { name: string; path: string; kind: "dir" | "file" };
 
+export function createDir(
+  parentDir: string,
+  name: string,
+  roots: string[],
+): { ok: true; path: string; created: boolean } | { ok: false; reason: string } {
+  const parent = validateCwd(parentDir, roots);
+  if (!parent.ok) return parent;
+
+  const raw = typeof name === "string" ? name.trim() : "";
+  if (!raw) return { ok: false, reason: "folder name is empty" };
+  if (raw === "." || raw === "..") return { ok: false, reason: "invalid folder name" };
+  if (raw.includes("/") || raw.includes("\\")) return { ok: false, reason: "folder name cannot include path separators" };
+  if (raw.includes("\u0000")) return { ok: false, reason: "folder name contains invalid characters" };
+
+  const target = path.resolve(parent.cwd, raw);
+  const normRoots = normalizeRoots(roots);
+  if (normRoots.length > 0 && !normRoots.some((r) => isUnderRoot(target, r))) {
+    return { ok: false, reason: "target is outside allowed roots" };
+  }
+
+  try {
+    const st = fs.statSync(target);
+    if (!st.isDirectory()) return { ok: false, reason: "a non-directory already exists with that name" };
+    return { ok: true, path: target, created: false };
+  } catch {
+    // does not exist yet
+  }
+
+  try {
+    fs.mkdirSync(target, { recursive: false });
+  } catch {
+    return { ok: false, reason: "cannot create directory" };
+  }
+  return { ok: true, path: target, created: true };
+}
+
 export function listDir(
   dir: string,
   roots: string[],

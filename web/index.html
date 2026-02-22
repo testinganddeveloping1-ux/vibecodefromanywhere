@@ -1,175 +1,574 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <!-- Allow pinch-zoom on mobile. This is especially important for Terminal (TUI) mode. -->
-    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-    <meta name="theme-color" content="#050608" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="mobile-web-app-capable" content="yes" />
-    <meta name="format-detection" content="telephone=no" />
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <title>FromYourPhone</title>
-    <style>
-      /* Prevent flash of white on load */
-      html, body { background: #050608; }
-      /* Inline boot UI so you never get a "blank background" if JS fails. */
-      .boot {
-        position: fixed;
-        inset: 0;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 28px;
-        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-        color: rgba(240, 245, 255, 0.92);
-        background:
-          radial-gradient(900px 600px at 20% 18%, rgba(245, 166, 35, 0.10), transparent 60%),
-          radial-gradient(900px 600px at 80% 82%, rgba(59, 130, 246, 0.08), transparent 60%),
-          #050608;
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#020305" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="format-detection" content="telephone=no" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <title>vibecodefromanywhere</title>
+  <style>
+    /* ==============================================================
+       MAGIC SCRUBBER BOOT SEQUENCE
+       ============================================================== */
+    html,
+    body {
+      background: #000;
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .boot {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: "JetBrains Mono", "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+      background: #020305;
+      z-index: 99999;
+      perspective: 1200px;
+      transition: opacity 0.8s ease, transform 0.8s cubic-bezier(0.25, 1, 0.25, 1), filter 0.8s ease;
+    }
+
+    .boot.done {
+      opacity: 0;
+      transform: scale(1.06);
+      filter: blur(10px) brightness(1.5);
+      pointer-events: none;
+    }
+
+    /* Cinematic Aurora Background Void */
+    .bootBackground {
+      position: absolute;
+      inset: -50%;
+      background:
+        radial-gradient(circle at 30% 70%, rgba(255, 138, 61, 0.12) 0%, transparent 40%),
+        radial-gradient(circle at 70% 30%, rgba(255, 94, 98, 0.1) 0%, transparent 40%);
+      animation: auroraSpin 20s linear infinite;
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    /* Container for the flex layout */
+    .bootCenter {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      z-index: 5;
+      width: 100%;
+    }
+
+    /* The wrapper matching the text's actual rendered width seamlessly */
+    .magicTrailWrapper {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      margin: 0 40px;
+      /* Safe padding for logo overshooting */
+    }
+
+    /* Shared precise styling so both clone strings match pixel for pixel */
+    .bootTitle {
+      font-weight: 800;
+      font-size: clamp(16px, 6vw, 24px);
+      margin: 0;
+      padding: 0;
+      text-transform: lowercase;
+      letter-spacing: 0.5px;
+      line-height: 1;
+      background: linear-gradient(110deg, #ff8a3d 0%, #ff8a3d 40%, #ffdaab 50%, #ff8a3d 60%, #ff8a3d 100%);
+      background-size: 300% auto;
+      color: transparent;
+      background-clip: text;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      white-space: nowrap;
+      background-position: 200% center;
+    }
+
+    .bootTitleInvisible {
+      opacity: 0;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    .bootTitleVisible {
+      position: absolute;
+      left: 0;
+      top: 50%;
+      transform: translateY(-50%);
+      clip-path: inset(-50% 100% -50% -50%);
+      animation:
+        textUnmask 3.4s cubic-bezier(0.3, 0.05, 0.3, 1) forwards 1.2s,
+        fastDiagGlint 4.0s ease-out infinite 4.6s;
+    }
+
+    /* Logo Fly-in & Hologram Module */
+    .bootLogoContainer {
+      position: absolute;
+      left: 0%;
+      top: 50%;
+      width: 64px;
+      height: 64px;
+      margin-top: -32px;
+      margin-left: -32px;
+      /* Anchor dead center to left edge initially */
+      opacity: 0;
+      z-index: 10;
+      pointer-events: none;
+      animation:
+        logoSpawn 1.0s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards 0s,
+        logoMove 3.4s cubic-bezier(0.3, 0.05, 0.3, 1) forwards 1.2s;
+    }
+
+    .bootLogoGimbal {
+      width: 100%;
+      height: 100%;
+      transform: scale(0) rotate(-180deg);
+      animation:
+        gimbalPop 1.0s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards 0s,
+        gimbalSpinMove 3.4s cubic-bezier(0.3, 0.05, 0.3, 1) forwards 1.2s;
+    }
+
+    /* 3D Astrolabe Rings */
+    .bootRing {
+      position: absolute;
+      inset: -14px;
+      border-radius: 50%;
+      border: 1.5px solid transparent;
+      opacity: 0;
+    }
+
+    .bootRing1 {
+      border-top-color: rgba(255, 138, 61, 0.8);
+      border-right-color: rgba(255, 94, 98, 0.3);
+      filter: drop-shadow(0 0 4px rgba(255, 138, 61, 0.5));
+      animation: ringPop 0.5s ease forwards 0.4s, spinRing1 4s linear infinite 0.4s;
+    }
+
+    .bootRing2 {
+      inset: -24px;
+      border-bottom-color: rgba(255, 94, 98, 0.6);
+      border-left-color: rgba(255, 138, 61, 0.4);
+      animation: ringPop 0.5s ease forwards 0.5s, spinRing2 5s linear infinite 0.5s;
+    }
+
+    .bootRing3 {
+      inset: -34px;
+      border-top-color: rgba(255, 138, 61, 0.3);
+      border-bottom-color: rgba(255, 94, 98, 0.3);
+      border-style: dashed;
+      animation: ringPop 0.5s ease forwards 0.6s, spinRing3 8s linear infinite reverse 0.6s;
+    }
+
+    .bootLogoMask {
+      width: 100%;
+      height: 100%;
+      border-radius: 20px;
+      box-shadow: 0 0 50px rgba(255, 138, 61, 0.25), inset 0 0 16px rgba(255, 255, 255, 0.08);
+      background: #020305;
+      border: 1px solid rgba(255, 138, 61, 0.3);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      z-index: 10;
+      overflow: hidden;
+    }
+
+    .bootLogoImg {
+      width: 110%;
+      height: 110%;
+      object-fit: contain;
+      /* Breathing pulse inside the container */
+      animation: logoPulse 3s ease-in-out infinite alternate;
+    }
+
+    .bootSubLayout {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      margin-top: 24px;
+      opacity: 0;
+      transform: translateY(10px);
+      animation: subReveal 1s cubic-bezier(0.25, 1, 0.25, 1) forwards 3.6s;
+    }
+
+    .bootSubMarker {
+      color: #ff8a3d;
+      font-weight: 700;
+      font-size: 11px;
+      text-shadow: 0 0 8px rgba(255, 138, 61, 0.5);
+    }
+
+    .bootSubText {
+      color: rgba(140, 156, 178, 0.85);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 4px;
+      animation: blinkSoft 2.5s infinite;
+    }
+
+    /* --------------------------------------------------------------
+       KEYFRAMES
+       -------------------------------------------------------------- */
+
+    @keyframes bootPushIn {
+      0% {
+        opacity: 0;
+        transform: scale(0.95);
       }
-      .bootCard {
-        width: min(420px, 100%);
-        border-radius: 16px;
-        border: 1px solid rgba(255,255,255,0.06);
-        background: rgba(18, 22, 32, 0.86);
-        box-shadow: 0 18px 50px rgba(0,0,0,0.44);
-        padding: 18px 18px 16px;
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
+
+      10% {
+        opacity: 1;
+        transform: scale(0.96);
       }
-      .bootTop { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-      .bootLogo {
-        width: 38px; height: 38px;
-        border-radius: 10px;
-        background: #f5a623;
-        display: flex; align-items: center; justify-content: center;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-weight: 800;
-        font-size: 12px;
-        color: #050608;
-        flex-shrink: 0;
+
+      100% {
+        opacity: 1;
+        transform: scale(1.02);
       }
-      .bootTitle {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-weight: 700;
-        font-size: 18px;
-        margin: 0;
+    }
+
+    @keyframes auroraSpin {
+      100% {
+        transform: rotate(360deg);
       }
-      .bootSub { margin-top: 4px; color: rgba(184, 198, 220, 0.92); font-size: 13px; line-height: 1.5; }
-      .bootHint { margin-top: 10px; color: rgba(110, 127, 152, 0.92); font-size: 12px; line-height: 1.45; }
-      .bootErr {
-        margin-top: 12px;
-        padding: 10px 12px;
-        border-radius: 12px;
-        border: 1px solid rgba(239, 68, 68, 0.22);
-        background: rgba(239, 68, 68, 0.08);
-        color: rgba(255, 226, 226, 0.95);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 12px;
-        white-space: pre-wrap;
-        display: none;
+    }
+
+    @keyframes logoSpawn {
+      0% {
+        opacity: 0;
+        transform: scale(0.1) translateZ(-500px);
       }
-      .bootPill {
-        display: inline-block;
-        margin-top: 10px;
-        padding: 6px 10px;
-        border-radius: 999px;
-        border: 1px solid rgba(255,255,255,0.08);
-        background: rgba(255,255,255,0.05);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 12px;
-        color: rgba(229, 234, 244, 0.92);
+
+      100% {
+        opacity: 1;
+        transform: scale(1) translateZ(0);
       }
-    </style>
-  </head>
-  <body>
-    <div id="boot" class="boot">
-      <div class="bootCard">
-        <div class="bootTop">
-          <div class="bootLogo">FYP</div>
-          <div>
-            <div class="bootTitle">FromYourPhone</div>
-            <div id="bootSub" class="bootSub">Loading UI...</div>
+    }
+
+    @keyframes logoMove {
+
+      /* Smooth cubic-bezier curve crossing and slightly overshooting the text */
+      0% {
+        left: 0%;
+        transform: translateY(0px);
+      }
+
+      100% {
+        left: 100%;
+        transform: translateX(36px) translateY(0);
+      }
+    }
+
+    @keyframes textUnmask {
+      0% {
+        clip-path: inset(-50% 100% -50% -50%);
+        opacity: 1;
+      }
+
+      100% {
+        clip-path: inset(-50% -20% -50% -50%);
+        opacity: 1;
+      }
+    }
+
+    @keyframes gimbalPop {
+      to {
+        transform: scale(1) rotate(0deg);
+      }
+    }
+
+    @keyframes gimbalSpinMove {
+      0% {
+        transform: scale(1) rotate(0deg);
+      }
+
+      100% {
+        transform: scale(1) rotate(360deg);
+      }
+    }
+
+    @keyframes ringPop {
+      0% {
+        opacity: 0;
+        transform: scale(0.5);
+      }
+
+      100% {
+        opacity: 1;
+        transform: scale(1);
+      }
+    }
+
+    /* 3D Astrolabe Gimbal Spins */
+    @keyframes spinRing1 {
+      0% {
+        transform: rotateX(65deg) rotateY(20deg) rotateZ(0deg);
+      }
+
+      100% {
+        transform: rotateX(65deg) rotateY(20deg) rotateZ(360deg);
+      }
+    }
+
+    @keyframes spinRing2 {
+      0% {
+        transform: rotateX(45deg) rotateY(-35deg) rotateZ(0deg);
+      }
+
+      100% {
+        transform: rotateX(45deg) rotateY(-35deg) rotateZ(-360deg);
+      }
+    }
+
+    @keyframes spinRing3 {
+      0% {
+        transform: rotateX(80deg) rotateY(10deg) rotateZ(0deg);
+      }
+
+      100% {
+        transform: rotateX(80deg) rotateY(10deg) rotateZ(360deg);
+      }
+    }
+
+    @keyframes logoPulse {
+      0% {
+        transform: scale(0.95);
+        filter: drop-shadow(0 0 8px rgba(255, 138, 61, 0.4));
+      }
+
+      100% {
+        transform: scale(1.05);
+        filter: drop-shadow(0 0 20px rgba(255, 138, 61, 0.8));
+      }
+    }
+
+    @keyframes subReveal {
+      0% {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+
+      100% {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @keyframes fastDiagGlint {
+      0% {
+        background-position: 200% center;
+      }
+
+      25% {
+        background-position: -100% center;
+      }
+
+      100% {
+        background-position: -100% center;
+      }
+    }
+
+    @keyframes blinkSoft {
+
+      0%,
+      100% {
+        opacity: 1;
+      }
+
+      50% {
+        opacity: 0.4;
+      }
+    }
+
+    /* Errors / Warnings overlay */
+    .bootErr {
+      position: absolute;
+      bottom: 32px;
+      left: 24px;
+      right: 24px;
+      margin: 0 auto;
+      max-width: 400px;
+      padding: 14px 18px;
+      border-radius: 16px;
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      background: rgba(239, 68, 68, 0.15);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      color: rgba(255, 226, 226, 0.95);
+      font-family: inherit;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+      display: none;
+      z-index: 20;
+      animation: popErr 0.5s cubic-bezier(0.25, 1, 0.25, 1) forwards;
+    }
+
+    @keyframes popErr {
+      0% {
+        transform: translateY(20px);
+        opacity: 0;
+      }
+
+      100% {
+        transform: translateY(0);
+        opacity: 1;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Ultra-Premium Boot Sequence -->
+  <div id="boot" class="boot">
+    <div class="bootBackground"></div>
+
+    <div class="bootCenter">
+      <div class="magicTrailWrapper">
+        <h1 class="bootTitle bootTitleInvisible">vibecodefromanywhere</h1>
+
+        <h1 class="bootTitle bootTitleVisible">vibecodefromanywhere</h1>
+
+        <div class="bootLogoContainer">
+          <div class="bootLogoGimbal">
+            <div class="bootRing bootRing1"></div>
+            <div class="bootRing bootRing2"></div>
+            <div class="bootRing bootRing3"></div>
+
+            <div class="bootLogoMask">
+              <img src="/logo.png" alt="Logo" class="bootLogoImg" />
+            </div>
           </div>
         </div>
-        <div class="bootHint">
-          If this stays blank: hard refresh, open in Chrome/Safari (not an in-app browser), and confirm you opened the host IP (not 127.0.0.1).
-        </div>
-        <div id="bootErr" class="bootErr"></div>
-        <div class="bootPill" id="bootUrl"></div>
+      </div>
+
+      <div id="bootSub" class="bootSubLayout">
+        <span class="bootSubMarker">/></span>
+        <span class="bootSubText">INITIALIZING_SYSTEM...</span>
       </div>
     </div>
-    <div id="root"></div>
-    <script>
-      (() => {
-        const boot = document.getElementById("boot");
-        const root = document.getElementById("root");
-        const sub = document.getElementById("bootSub");
-        const err = document.getElementById("bootErr");
-        const url = document.getElementById("bootUrl");
-        if (url) url.textContent = String(window.location.href || "");
 
-        // Once React mounts, the inline boot UI must never "take over" again.
-        // The app has its own error boundary for runtime crashes.
-        let bootDone = false;
+    <div id="bootErr" class="bootErr"></div>
+  </div>
 
-        const showErr = (msg) => {
-          try {
-            if (boot) boot.style.display = "flex";
-          } catch {}
-          if (!err) return;
-          err.style.display = "block";
-          err.textContent = "UI failed to start.\n\n" + String(msg || "unknown error");
-          if (sub) sub.textContent = "Startup error";
-        };
+  <div id="root"></div>
 
-        const onError = (e) => {
-          if (bootDone) return;
-          try {
-            showErr(e && (e.message || (e.error && e.error.message) || e.error));
-          } catch {}
-        };
-        const onRejection = (e) => {
-          if (bootDone) return;
-          try {
-            showErr(e && (e.reason && (e.reason.message || e.reason)));
-          } catch {}
-        };
-        window.addEventListener("error", onError);
-        window.addEventListener("unhandledrejection", onRejection);
+  <script>
+    (() => {
+      const bootStartTime = performance.now();
+      const boot = document.getElementById("boot");
+      const root = document.getElementById("root");
+      const sub = document.getElementById("bootSub");
+      const err = document.getElementById("bootErr");
 
-        window.__FYP_BOOT_OK = () => {
-          bootDone = true;
-          try { if (boot) boot.style.display = "none"; } catch {}
-          try { window.removeEventListener("error", onError); } catch {}
-          try { window.removeEventListener("unhandledrejection", onRejection); } catch {}
+      let safeHref = String(window.location.href || "");
+      try {
+        const u = new URL(window.location.href);
+        const token = u.searchParams.get("token");
+        const pair = u.searchParams.get("pair");
+        window.__FYP_BOOT_QUERY = {
+          token: token || "",
+          pair: pair || "",
         };
-        window.__FYP_BOOT_FAIL = (msg) => {
-          if (bootDone) {
-            try { console.error("[FromYourPhone] bootFail after mount:", msg); } catch {}
-            return;
+        let changed = false;
+        if (token) {
+          u.searchParams.delete("token");
+          changed = true;
+        }
+        if (pair) {
+          u.searchParams.delete("pair");
+          changed = true;
+        }
+        safeHref = u.toString();
+        if (changed) window.history.replaceState({}, "", safeHref);
+      } catch {
+        // ignore
+      }
+
+      let bootDone = false;
+
+      const showErr = (msg) => {
+        try {
+          if (boot) {
+            boot.classList.remove("done");
+            boot.style.display = "flex";
           }
-          try { showErr(msg); } catch {}
+        } catch { }
+        if (!err) return;
+        err.style.display = "block";
+        err.textContent = "CRITICAL BOOT FAILURE\n\n" + String(msg || "Unknown error occurred.");
+      };
+
+      const onError = (e) => {
+        if (bootDone) return;
+        try { showErr(e && (e.message || (e.error && e.error.message) || e.error)); } catch { }
+      };
+      const onRejection = (e) => {
+        if (bootDone) return;
+        try { showErr(e && (e.reason && (e.reason.message || e.reason))); } catch { }
+      };
+      window.addEventListener("error", onError);
+      window.addEventListener("unhandledrejection", onRejection);
+
+      window.__FYP_BOOT_OK = () => {
+        if (bootDone) return;
+        bootDone = true;
+
+        const subTextNode = document.querySelector('.bootSubText');
+        if (subTextNode) subTextNode.textContent = "SYSTEM_ONLINE";
+
+        const finishBoot = () => {
+          if (boot) boot.classList.add("done");
+          setTimeout(() => { if (boot && boot.parentNode) boot.parentNode.removeChild(boot); }, 1000);
         };
 
-        setTimeout(() => {
-          if (bootDone) return;
-          try {
-            const hasUi = root && root.children && root.children.length > 0;
-            if (!hasUi && sub) sub.textContent = "Still loading...";
-            if (!hasUi) {
-              showErr("No UI mounted. This usually means the JS bundle failed to load or crashed at startup.");
-            } else {
-              window.__FYP_BOOT_OK();
-            }
-          } catch (e) {
-            showErr(e && e.message ? e.message : String(e));
+        const elapsed = performance.now() - bootStartTime;
+        // extended wait time for all animations to complete (~6.0s)
+        const minTime = 6000;
+        const delay = Math.max(0, minTime - elapsed);
+
+        setTimeout(finishBoot, delay);
+
+        try { window.removeEventListener("error", onError); } catch { }
+        try { window.removeEventListener("unhandledrejection", onRejection); } catch { }
+      };
+
+      window.__FYP_BOOT_FAIL = (msg) => {
+        if (bootDone) return;
+        try { showErr(msg); } catch { }
+      };
+
+      // If no successful mount within 5 seconds, show an error.
+      setTimeout(() => {
+        if (bootDone) return;
+        try {
+          const hasUi = root && root.children && root.children.length > 0;
+          if (!hasUi) {
+            showErr("No UI mounted. The JS bundle may have failed to load.");
+          } else {
+            window.__FYP_BOOT_OK();
           }
-        }, 3500);
-      })();
-    </script>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+        } catch (e) {
+          showErr(e && e.message ? e.message : String(e));
+        }
+      }, 7000);
+    })();
+  </script>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+
 </html>

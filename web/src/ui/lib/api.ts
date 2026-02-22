@@ -12,6 +12,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
         else if (typeof body?.reason === "string" && body.reason.trim())
           msg = `${typeof body?.error === "string" ? body.error : "error"}: ${body.reason.trim()}`;
         else if (typeof body?.error === "string" && body.error.trim()) msg = body.error.trim();
+        const issues = Array.isArray(body?.issues) ? body.issues.map((x: any) => String(x ?? "").trim()).filter(Boolean) : [];
+        const unmet = Array.isArray(body?.unmet) ? body.unmet.map((x: any) => String(x ?? "").trim()).filter(Boolean) : [];
+        if (issues.length > 0) msg = `${msg} (${issues.slice(0, 4).join("; ")})`;
+        else if (unmet.length > 0) msg = `${msg} (unmet: ${unmet.slice(0, 4).join(", ")})`;
       } catch {
         // ignore
       }
@@ -27,4 +31,3 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   }
   return (isJson ? await res.json() : ((await res.text()) as any)) as T;
 }
-

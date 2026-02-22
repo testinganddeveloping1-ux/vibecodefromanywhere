@@ -1,40 +1,43 @@
 import React from "react";
 import type { SessionRow } from "../types";
-import { IconSettings } from "./icons";
+import { IconSettings, IconLogo } from "./icons";
+import styles from "./HeaderBar.module.css";
 
 export function HeaderBar(props: {
   online: boolean;
   globalWsState: "closed" | "connecting" | "open";
   activeSession: SessionRow | null;
+  activeSessionRunning?: boolean;
   onOpenSettings: () => void;
 }) {
-  const status = !props.online
-    ? "offline"
-    : props.globalWsState === "open"
-      ? "live"
-      : props.globalWsState === "connecting"
-        ? "reconnecting"
-        : "disconnected";
-  const chipOn = props.online && props.globalWsState === "open";
+  const connected = props.online && props.globalWsState === "open";
 
   return (
-    <header className="hdr">
-      <div className="hdrLeft">
-        <div className="logo">FYP</div>
-        <span className={`chip ${chipOn ? "chipOn" : ""}`}>{status}</span>
-        {props.activeSession ? <span className="chip mono" style={{ fontSize: 10 }}>{props.activeSession.tool}</span> : null}
+    <header className={styles.header}>
+      <div className={styles.left}>
+        <div className={styles.logo}>
+          <IconLogo />
+        </div>
+
+        {/* Connection dot — sleek dynamic pill */}
+        <div className={styles.statusPill} title={connected ? "Connected" : "Disconnected"}>
+          <div className={`${styles.dot} ${connected ? styles.dotOnline : ""}`} />
+        </div>
+
+        {/* Session context when actively viewing a session */}
+        {props.activeSession && (
+          <div className={styles.contextPill}>
+            <span className={styles.sessionTool}>{props.activeSession.tool}</span>
+            {props.activeSessionRunning && <span className={styles.liveRipple} />}
+          </div>
+        )}
       </div>
-      <div className="hdrRight">
-        <button
-          className="btn ghost"
-          onClick={props.onOpenSettings}
-          aria-label="Settings"
-          style={{ padding: "6px 8px" }}
-        >
+
+      <div className={styles.right}>
+        <button className={styles.settingsBtn} onClick={props.onOpenSettings} aria-label="Settings">
           <IconSettings />
         </button>
       </div>
     </header>
   );
 }
-

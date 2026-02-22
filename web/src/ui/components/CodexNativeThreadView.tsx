@@ -1,5 +1,7 @@
 import React from "react";
 import { FencedMessage } from "./FencedMessage";
+import { Chip } from "./Chip";
+import styles from "./CodexNativeThreadView.module.css";
 
 export type CodexNativeBubble = {
   id: string;
@@ -27,49 +29,53 @@ export function CodexNativeThreadView(props: {
   innerRef?: React.RefObject<HTMLDivElement> | null;
 }) {
   return (
-    <div className="nativeChat" ref={props.innerRef ?? undefined}>
-      <div className="nativeHead">
-        <span className="chip chipOn">codex native</span>
-        <span className="mono nativeMeta">{String(props.threadId ?? "").slice(0, 12)}</span>
-        <div className="spacer" />
-        {props.loading ? <span className="chip mono">loading</span> : null}
+    <div className={styles.chat} ref={props.innerRef ?? undefined}>
+      <div className={styles.head}>
+        <Chip active>codex native</Chip>
+        <span className={styles.meta}>{String(props.threadId ?? "").slice(0, 12)}</span>
+        <div className={styles.spacer} />
+        {props.loading ? <Chip mono>loading</Chip> : null}
       </div>
-      {props.error ? <div className="nativeError mono">{props.error}</div> : null}
-      <div className="nativeMsgs">
+      {props.error ? <div className={styles.error}>{props.error}</div> : null}
+      <div className={styles.msgs}>
         {props.messages.length === 0 && !props.live ? (
-          <div className="nativeEmpty">
-            <div className="help">No messages yet. Send something below.</div>
-          </div>
+          <div className={styles.empty}>No messages yet. Send something below.</div>
         ) : null}
-        {props.messages.map((m) => (
-          <div key={m.id} className={`bubbleRow ${m.role === "user" ? "bubbleUser" : "bubbleAssistant"}`}>
+        {props.messages.map((m) => {
+          const bubbleCls = [
+            styles.bubble,
+            m.tone === "thinking" ? styles.bubbleThinking : null,
+            m.tone === "toolUse" ? styles.bubbleToolUse : null,
+            m.tone === "toolResult" ? styles.bubbleToolResult : null,
+          ]
+            .filter(Boolean)
+            .join(" ");
+          return (
             <div
-              className={`bubble ${
-                m.tone === "thinking"
-                  ? "bubbleThinking"
-                  : m.tone === "toolUse"
-                    ? "bubbleToolUse"
-                    : m.tone === "toolResult"
-                      ? "bubbleToolResult"
-                      : ""
-              }`}
+              key={m.id}
+              className={[
+                styles.bubbleRow,
+                m.role === "user" ? styles.bubbleUser : styles.bubbleAssistant,
+              ].join(" ")}
             >
-              <div className="bubbleKind mono">{kindLabel(m.kind)}</div>
-              <FencedMessage text={m.text} />
+              <div className={bubbleCls}>
+                <div className={styles.bubbleKind}>{kindLabel(m.kind)}</div>
+                <FencedMessage text={m.text} />
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
         {props.live ? (
-          <div className="bubbleRow bubbleAssistant">
-            <div className="bubble">
-              <div className="bubbleKind mono">{props.live.kind}</div>
+          <div className={[styles.bubbleRow, styles.bubbleAssistant].join(" ")}>
+            <div className={styles.bubble}>
+              <div className={styles.bubbleKind}>{props.live.kind}</div>
               <FencedMessage text={props.live.text} />
             </div>
           </div>
         ) : null}
         {props.diff ? (
-          <details className="nativeDiff">
-            <summary className="mono">Diff</summary>
+          <details className={styles.diff}>
+            <summary>Diff</summary>
             <pre className="mdCode">
               <code>{props.diff}</code>
             </pre>

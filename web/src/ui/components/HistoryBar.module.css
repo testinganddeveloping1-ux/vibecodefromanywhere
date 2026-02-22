@@ -1,0 +1,54 @@
+.bar {
+  background: rgba(18, 18, 18, 0.4);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 16px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.scroll {
+  flex: 1;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  touch-action: pan-x;
+  scrollbar-width: none;
+  padding: 2px 0;
+}
+
+.scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.item {
+  border-radius: 12px;
+  padding: 6px 12px;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+  color: #8b949e;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  flex-shrink: 0;
+  font-family: var(--mono, monospace);
+  transition: all 0.2s ease;
+}
+
+.itemInput {
+  background: rgba(255, 138, 61, 0.1);
+  color: #ff8a3d;
+  border-color: rgba(255, 138, 61, 0.2);
+}
+
+.itemAction {
+  background: rgba(255, 59, 48, 0.1);
+  color: #ff3b30;
+  border-color: rgba(255, 59, 48, 0.2);
+}

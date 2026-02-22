@@ -59,6 +59,9 @@ if (process.argv.includes("models")) {
 if (process.env.FYP_PRINT_CODEX_THREAD_ID === "1") {
   process.stdout.write(`CODEX_THREAD_ID=${process.env.CODEX_THREAD_ID || ""}\n`);
 }
+if (process.env.FYP_PRINT_ANTHROPIC_API_KEY === "1") {
+  process.stdout.write(`ANTHROPIC_API_KEY=${process.env.ANTHROPIC_API_KEY || ""}\n`);
+}
 
 // Best-effort: honor `--cd <dir>` in case tests pass it through.
 try {

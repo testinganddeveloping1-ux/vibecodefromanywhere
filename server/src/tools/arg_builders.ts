@@ -15,6 +15,7 @@ export function buildArgsForSession(input: {
     if (input.cwd) args.push("--cd", input.cwd);
 
     const c = p?.codex;
+    if (c?.model) args.push("--model", c.model);
     if (c?.sandbox) args.push("--sandbox", c.sandbox);
     if (c?.askForApproval) {
       // `on-failure` is deprecated in newer Codex CLI builds. Map it to `on-request`
@@ -32,11 +33,8 @@ export function buildArgsForSession(input: {
 
   if (input.tool === "claude") {
     const c = p?.claude;
-    if (c?.permissionMode) {
-      const allowed = new Set(["default", "acceptEdits", "plan", "bypassPermissions", "delegate", "dontAsk"]);
-      if (allowed.has(c.permissionMode)) args.push("--permission-mode", c.permissionMode);
-      else notes.push(`claude.permissionMode ignored (unsupported): ${c.permissionMode}`);
-    }
+    if (c?.model) args.push("--model", c.model);
+    if (c?.permissionMode) args.push("--permission-mode", c.permissionMode);
     if (c?.dangerouslySkipPermissions) args.push("--dangerously-skip-permissions");
     for (const d of c?.addDir ?? []) args.push("--add-dir", d);
   }

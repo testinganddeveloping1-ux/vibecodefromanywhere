@@ -9,6 +9,7 @@ export type CodexCaps = {
   approvalPolicies: string[];
   supports: {
     cd: boolean;
+    model: boolean;
     addDir: boolean;
     search: boolean;
     fullAuto: boolean;
@@ -26,6 +27,7 @@ export type ClaudeCaps = {
   supports: {
     permissionMode: boolean;
     dangerouslySkipPermissions: boolean;
+    model: boolean;
     addDir: boolean;
     settings: boolean;
   };

@@ -7,24 +7,29 @@ export type AuthOptions = {
 
 function extractToken(req: { headers: Record<string, any>; query?: any; cookies?: any }): {
   token: string | null;
-  fromQuery: boolean;
+  source: "none" | "bearer" | "header" | "cookie" | "query";
 } {
   const h = req.headers ?? {};
   const auth = typeof h.authorization === "string" ? h.authorization : "";
   if (auth.toLowerCase().startsWith("bearer "))
-    return { token: auth.slice(7).trim(), fromQuery: false };
+    return { token: auth.slice(7).trim(), source: "bearer" };
 
   const x = typeof h["x-fyp-token"] === "string" ? h["x-fyp-token"] : "";
-  if (x) return { token: x.trim(), fromQuery: false };
+  if (x) return { token: x.trim(), source: "header" };
 
   const c = req.cookies && typeof req.cookies.fyp_token === "string" ? req.cookies.fyp_token : "";
-  if (c) return { token: c.trim(), fromQuery: false };
+  if (c) return { token: c.trim(), source: "cookie" };
 
-  const q = (req as any).query;
-  const qt = q && typeof q.token === "string" ? q.token : "";
-  if (qt) return { token: qt.trim(), fromQuery: true };
+  const allowQueryToken =
+    String(process.env.FYP_ALLOW_QUERY_TOKEN_AUTH ?? "").trim().toLowerCase() === "1" ||
+    String(process.env.FYP_ALLOW_QUERY_TOKEN_AUTH ?? "").trim().toLowerCase() === "true";
+  if (allowQueryToken) {
+    const q = (req as any).query;
+    const qt = q && typeof q.token === "string" ? q.token : "";
+    if (qt) return { token: qt.trim(), source: "query" };
+  }
 
-  return { token: null, fromQuery: false };
+  return { token: null, source: "none" };
 }
 
 export const authPlugin: FastifyPluginAsync<AuthOptions> = async (app, opts) => {
@@ -45,13 +50,13 @@ export function addAuthGuard(
       if (!only.some((p) => String(url).startsWith(p))) return;
     }
 
-    const { token: tok, fromQuery } = extractToken(req as any);
+    const { token: tok, source } = extractToken(req as any);
     if (!tok || tok !== token) {
       return reply.code(401).send({ error: "unauthorized" });
     }
 
-    // If you arrived with ?token=..., upgrade to a cookie so asset requests work.
-    if (fromQuery) {
+    // Upgrade explicit token auth to a cookie for smoother browser sessions.
+    if (source === "query" || source === "header") {
       try {
         reply.setCookie("fyp_token", tok, {
           httpOnly: true,

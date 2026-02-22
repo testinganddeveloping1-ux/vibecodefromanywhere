@@ -27,6 +27,7 @@ export type Config = {
         sandbox?: "read-only" | "workspace-write" | "danger-full-access";
         // Codex CLI `--ask-for-approval` values. `on-failure` is deprecated but kept for back-compat.
         askForApproval?: "untrusted" | "on-request" | "never" | "on-failure";
+        model?: string;
         fullAuto?: boolean;
         bypassApprovalsAndSandbox?: boolean;
         search?: boolean;
@@ -37,7 +38,12 @@ export type Config = {
         // Claude Code `--permission-mode` values.
         permissionMode?: "default" | "acceptEdits" | "plan" | "bypassPermissions" | "delegate" | "dontAsk";
         dangerouslySkipPermissions?: boolean;
+        model?: string;
         addDir?: string[];
+        // Auth mode:
+        // - subscription: prefer Claude Pro/Max account auth (default).
+        // - api: use API key-based auth if configured.
+        authMode?: "subscription" | "api";
       };
       opencode?: {
         // In OpenCode, models are specified as "provider/model".
@@ -109,27 +115,28 @@ export function defaultConfig(): Config {
       "claude.default": {
         tool: "claude",
         title: "Claude: Default",
+        claude: { authMode: "subscription" },
         startup: [],
         sendSuffix: "\r",
       },
       "claude.plan": {
         tool: "claude",
         title: "Claude: Plan (Permission Mode)",
-        claude: { permissionMode: "plan" },
+        claude: { permissionMode: "plan", authMode: "subscription" },
         startup: [],
         sendSuffix: "\r",
       },
       "claude.accept_edits": {
         tool: "claude",
         title: "Claude: Accept Edits (Permission Mode)",
-        claude: { permissionMode: "acceptEdits" },
+        claude: { permissionMode: "acceptEdits", authMode: "subscription" },
         startup: [],
         sendSuffix: "\r",
       },
       "claude.bypass_plan": {
         tool: "claude",
         title: "Claude: Bypass Permissions + Plan",
-        claude: { dangerouslySkipPermissions: true, permissionMode: "plan" },
+        claude: { dangerouslySkipPermissions: true, permissionMode: "plan", authMode: "subscription" },
         startup: [],
         sendSuffix: "\r",
       },

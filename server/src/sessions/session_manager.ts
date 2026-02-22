@@ -2,6 +2,23 @@ import type { IPty } from "node-pty";
 import pty from "node-pty";
 import { nanoid } from "nanoid";
 
+let ptyWriteNoiseFilterInstalled = false;
+
+function installPtyWriteNoiseFilter() {
+  if (ptyWriteNoiseFilterInstalled) return;
+  ptyWriteNoiseFilterInstalled = true;
+  const orig = console.error.bind(console);
+  console.error = (...args: any[]) => {
+    const head = String(args?.[0] ?? "");
+    const err = args?.[1] as any;
+    const code = String(err?.code ?? "");
+    if (head === "Unhandled pty write error" && (code === "EBADF" || code === "EIO" || code === "ECONNRESET")) {
+      return;
+    }
+    orig(...args);
+  };
+}
+
 export type ToolId = "codex" | "claude" | "opencode";
 
 export type ToolCommand = {
@@ -21,6 +38,7 @@ export type Session = {
   tool: ToolId;
   profileId: string;
   pty: IPty;
+  codexSubmitWithTab: boolean;
   status: SessionStatus;
   outputListeners: Set<(chunk: string) => void>;
   exitListeners: Set<(status: SessionStatus) => void>;
@@ -34,16 +52,29 @@ export type SessionManagerOptions = {
 
 export class SessionManager {
   private sessions = new Map<string, Session>();
+  private closingSessions = new Set<string>();
   // Codex requires CR then (later) LF to reliably submit prompts. We serialize these
   // writes per-session so interleaved HTTP/WS inputs can't reorder the synthetic LF.
   private codexWriteQueues = new Map<string, { draining: boolean; queue: string[] }>();
+  private codexSubmitWithTabDefault: boolean;
   private opts: SessionManagerOptions;
 
   constructor(opts: SessionManagerOptions) {
     this.opts = opts;
+    const raw = String(process.env.FYP_CODEX_SUBMIT_WITH_TAB ?? "").trim().toLowerCase();
+    this.codexSubmitWithTabDefault = raw === "" ? true : !(raw === "0" || raw === "false" || raw === "no");
+    installPtyWriteNoiseFilter();
   }
 
-  createSession(input: { id?: string; tool: ToolId; profileId: string; cwd?: string; extraArgs?: string[]; env?: Record<string, string> }): string {
+  createSession(input: {
+    id?: string;
+    tool: ToolId;
+    profileId: string;
+    cwd?: string;
+    extraArgs?: string[];
+    env?: Record<string, string>;
+    claudeAuthMode?: "subscription" | "api";
+  }): string {
     const id = input.id ?? nanoid(12);
     if (this.sessions.has(id)) throw new Error(`session already exists: ${id}`);
     const tool = input.tool;
@@ -66,11 +97,42 @@ export class SessionManager {
       delete (inheritedEnv as any).CODEX_CI;
     }
 
+    // Claude defaults to subscription auth mode unless explicitly set to API mode.
+    // This avoids accidentally inheriting host-level API/proxy env and charging API billing.
+    const claudeAuthMode: "subscription" | "api" =
+      tool === "claude" && input.claudeAuthMode === "api" ? "api" : "subscription";
+    if (tool === "claude" && claudeAuthMode !== "api") {
+      delete (inheritedEnv as any).ANTHROPIC_API_KEY;
+      delete (inheritedEnv as any).ANTHROPIC_AUTH_TOKEN;
+      delete (inheritedEnv as any).ANTHROPIC_BASE_URL;
+      delete (inheritedEnv as any).ANTHROPIC_MODEL;
+      delete (inheritedEnv as any).ANTHROPIC_DEFAULT_OPUS_MODEL;
+      delete (inheritedEnv as any).ANTHROPIC_DEFAULT_SONNET_MODEL;
+      delete (inheritedEnv as any).ANTHROPIC_DEFAULT_HAIKU_MODEL;
+      delete (inheritedEnv as any).CLAUDE_CODE_SUBAGENT_MODEL;
+      delete (inheritedEnv as any).CLAUDE_CODE_USE_BEDROCK;
+      delete (inheritedEnv as any).AWS_BEARER_TOKEN_BEDROCK;
+    }
+
     const env: Record<string, string> = {
       ...inheritedEnv,
       ...(input.env ?? {}),
       TERM: "xterm-256color",
     };
+
+    // Enforce Claude auth mode after merging explicit env overrides.
+    if (tool === "claude" && claudeAuthMode !== "api") {
+      delete (env as any).ANTHROPIC_API_KEY;
+      delete (env as any).ANTHROPIC_AUTH_TOKEN;
+      delete (env as any).ANTHROPIC_BASE_URL;
+      delete (env as any).ANTHROPIC_MODEL;
+      delete (env as any).ANTHROPIC_DEFAULT_OPUS_MODEL;
+      delete (env as any).ANTHROPIC_DEFAULT_SONNET_MODEL;
+      delete (env as any).ANTHROPIC_DEFAULT_HAIKU_MODEL;
+      delete (env as any).CLAUDE_CODE_SUBAGENT_MODEL;
+      delete (env as any).CLAUDE_CODE_USE_BEDROCK;
+      delete (env as any).AWS_BEARER_TOKEN_BEDROCK;
+    }
 
     const p = pty.spawn(spec.command, args, {
       name: "xterm-256color",
@@ -87,14 +149,33 @@ export class SessionManager {
       tool,
       profileId: input.profileId,
       pty: p,
+      codexSubmitWithTab: this.codexSubmitWithTabDefault,
       status: { running: true, pid: p.pid ?? null, exitCode: null, signal: null },
       outputListeners: new Set(),
       exitListeners: new Set(),
     };
 
     p.onData((d) => {
+      // Newer Codex terminal UIs can require Tab+Enter for submission.
+      // We detect the hint once and switch to that submit mode automatically.
+      if (sess.tool === "codex") {
+        const plain = String(d ?? "").toLowerCase();
+        if (!sess.codexSubmitWithTab && plain.includes("tab to queue message")) {
+          sess.codexSubmitWithTab = true;
+        }
+      }
       for (const fn of sess.outputListeners) fn(d);
     });
+
+    // `node-pty` can emit transport-level errors (EBADF/ECONNRESET) while a PTY is
+    // being torn down. Treat them as non-fatal session shutdown noise.
+    try {
+      (p as any).on?.("error", () => {
+        // ignore
+      });
+    } catch {
+      // ignore
+    }
 
     p.onExit((e) => {
       sess.status.running = false;
@@ -129,24 +210,28 @@ export class SessionManager {
     };
 
     const wasRunning = Boolean(sess.status.running);
-
-    if (sess.status.running) {
-      // Graceful: Ctrl+C first.
-      this.interrupt(id);
-      await waitStopped(graceMs);
-    }
-
-    if (force) {
-      const cur = this.sessions.get(id);
-      if (cur?.status.running) {
-        this.kill(id);
-        await waitStopped(900);
+    this.closingSessions.add(id);
+    try {
+      if (sess.status.running) {
+        // During shutdown prefer process-level SIGINT and avoid PTY writes to reduce EBADF races.
+        this.interrupt(id, { signalOnly: true });
+        await waitStopped(graceMs);
       }
-    }
 
-    // Always forget to clear listeners/queues and release PTY references.
-    this.forget(id);
-    return { existed: true, wasRunning };
+      if (force) {
+        const cur = this.sessions.get(id);
+        if (cur?.status.running) {
+          this.kill(id);
+          await waitStopped(900);
+        }
+      }
+
+      // Always forget to clear listeners/queues and release PTY references.
+      this.forget(id);
+      return { existed: true, wasRunning };
+    } finally {
+      this.closingSessions.delete(id);
+    }
   }
 
   forget(id: string): void {
@@ -171,6 +256,7 @@ export class SessionManager {
     }
     this.sessions.delete(id);
     this.codexWriteQueues.delete(id);
+    this.closingSessions.delete(id);
   }
 
   onOutput(id: string, fn: (chunk: string) => void): () => void {
@@ -187,15 +273,25 @@ export class SessionManager {
 
   write(id: string, data: string): void {
     const sess = this.must(id);
+    if (!sess.status.running || this.closingSessions.has(id)) return;
     if (sess.tool !== "codex") {
-      sess.pty.write(data);
+      try {
+        sess.pty.write(String(data ?? ""));
+      } catch {
+        // Session may have just exited/closed between routing and write.
+        // Ignore to avoid noisy unhandled EBADF/EIO races.
+      }
       return;
     }
 
     const rec = this.codexWriteQueues.get(id);
     if (!rec) {
       // Shouldn't happen, but don't crash if the queue was GC'd for some reason.
-      sess.pty.write(String(data ?? ""));
+      try {
+        sess.pty.write(String(data ?? ""));
+      } catch {
+        // Ignore short race windows while session is tearing down.
+      }
       return;
     }
     rec.queue.push(String(data ?? ""));
@@ -208,20 +304,24 @@ export class SessionManager {
     this.must(id).pty.resize(cols, rows);
   }
 
-  interrupt(id: string): void {
+  interrupt(id: string, opts?: { signalOnly?: boolean }): void {
     const sess = this.must(id);
     if (!sess.status.running) return;
+    const signalOnly = opts?.signalOnly === true;
 
-    // First: write ^C (what a real terminal does). This is the least surprising for interactive TUIs.
+    // Default interactive behavior: write ^C first (what a real terminal does).
     // Some TUIs disable ISIG (raw mode) though, so ^C may become just input instead of SIGINT.
-    try {
-      sess.pty.write("\u0003");
-    } catch {
-      // ignore
+    if (!signalOnly) {
+      try {
+        sess.pty.write("\u0003");
+      } catch {
+        // ignore
+      }
     }
 
     // Second (fallback): if it's still running shortly after, send SIGINT to the child PID.
-    // Delaying avoids EBADF write noise when SIGINT makes the process exit immediately.
+    // Delaying avoids duplicate signals in normal interactive mode. For signal-only shutdown
+    // path, dispatch immediately to avoid PTY write races while descriptors are closing.
     const pid = sess.status.pid;
     setTimeout(() => {
       if (!sess.status.running) return;
@@ -230,7 +330,7 @@ export class SessionManager {
       } catch {
         // ignore
       }
-    }, 80).unref?.();
+    }, signalOnly ? 0 : 80).unref?.();
   }
 
   stop(id: string): void {
@@ -257,6 +357,7 @@ export class SessionManager {
     }
     this.sessions.clear();
     this.codexWriteQueues.clear();
+    this.closingSessions.clear();
   }
 
   private must(id: string): Session {
@@ -275,14 +376,24 @@ export class SessionManager {
     // - press Enter (CR)
     // - linefeed (LF) shortly after
     const textToCrDelayMs = 15;
+    const tabToCrDelayMs = 20;
     const crToLfDelayMs = 25;
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const safeWrite = (sess: Session, data: string): boolean => {
+      if (!sess.status.running || this.closingSessions.has(id)) return false;
+      try {
+        sess.pty.write(data);
+        return true;
+      } catch {
+        return false;
+      }
+    };
 
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
         const sess = this.sessions.get(id);
-        if (!sess || !sess.status.running) break;
+        if (!sess || !sess.status.running || this.closingSessions.has(id)) break;
         const next = rec.queue.shift();
         if (next == null) break;
 
@@ -294,22 +405,27 @@ export class SessionManager {
           const j = s.indexOf("\r", i);
           if (j === -1) {
             const tail = s.slice(i);
-            if (tail) sess.pty.write(tail);
+            if (tail && !safeWrite(sess, tail)) break;
             break;
           }
 
           const head = s.slice(i, j);
-          if (head) sess.pty.write(head);
+          if (head && !safeWrite(sess, head)) break;
 
           // Enter key: CR then LF (separate writes, with tiny delays).
+          // In "tab to queue message" mode, submit with Tab then Enter.
           // Give the TUI a beat to process the typed text before Enter.
           if (head) await sleep(textToCrDelayMs);
-          sess.pty.write("\r");
+          if (sess.codexSubmitWithTab) {
+            if (!safeWrite(sess, "\t")) break;
+            await sleep(tabToCrDelayMs);
+          }
+          if (!safeWrite(sess, "\r")) break;
           await sleep(crToLfDelayMs);
 
           const cur = this.sessions.get(id);
           if (!cur || !cur.status.running) break;
-          cur.pty.write("\n");
+          if (!safeWrite(cur, "\n")) break;
 
           i = j + 1;
           // If caller already sent CRLF, skip the LF to avoid doubling.
@@ -319,11 +435,20 @@ export class SessionManager {
     } finally {
       const cur = this.codexWriteQueues.get(id);
       if (cur) cur.draining = false;
+      const sess = this.sessions.get(id);
       // If new items arrived while we were finishing up, drain again.
       const again = this.codexWriteQueues.get(id);
-      if (again && again.queue.length > 0 && !again.draining) {
+      if (
+        again &&
+        again.queue.length > 0 &&
+        !again.draining &&
+        sess?.status.running &&
+        !this.closingSessions.has(id)
+      ) {
         again.draining = true;
         void this.drainCodexWrites(id);
+      } else if (again && (!sess || !sess.status.running || this.closingSessions.has(id))) {
+        again.queue.length = 0;
       }
     }
   }

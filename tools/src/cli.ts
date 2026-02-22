@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as TOML from "@iarna/toml";
 import qrcode from "qrcode-terminal";
@@ -109,11 +109,51 @@ Commands:
   start        Start the server (dev-friendly)
               Default: local-only (bind 127.0.0.1)
               Options: --lan (bind 0.0.0.0), --local (bind 127.0.0.1)
+  orchestrate  Launch a coordinator + worker orchestration from a JSON spec
+              Options: --file <spec.json>  or  --json '<spec-json>'
+  orchestrations
+              List recent orchestrations
+  orchestration <id>
+              Show orchestration details/status
+  orchestration-sync <id>
+              Push a read-only worker digest to the coordinator
+              Options: --force --no-deliver --trigger <text>
+  orchestration-policy <id>
+              Configure orchestration sync policy
+              Options: --mode <off|manual|interval> --interval-ms <n> --deliver --no-deliver --run-now
+  orchestration-cleanup <id>
+              Cleanup sessions/worktrees for an orchestration
+              Options: --delete-sessions --remove-record
   stop         Stop the running server (best-effort)
   status       Show whether the server is running
   doctor       Print install + server diagnostics
   config       Print config path
 `);
+}
+
+function readFlag(args: string[], name: string): string {
+  const i = args.indexOf(name);
+  if (i < 0) return "";
+  return args[i + 1] ?? "";
+}
+
+async function callServer(cfg: any, pathAndQuery: string, init?: RequestInit): Promise<{ status: number; json: any }> {
+  const port = Number(cfg?.server?.port ?? 7337);
+  const token = String(cfg?.auth?.token ?? "");
+  const url = `http://127.0.0.1:${port}${pathAndQuery}`;
+  const headers = {
+    authorization: `Bearer ${token}`,
+    ...(init?.headers ?? {}),
+  } as Record<string, string>;
+  const res = await fetch(url, { ...init, headers });
+  const text = await res.text();
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = { raw: text };
+  }
+  return { status: res.status, json };
 }
 
 function findRepoRoot(startDir: string): string | null {
@@ -128,6 +168,77 @@ function findRepoRoot(startDir: string): string | null {
     dir = parent;
   }
   return null;
+}
+
+function isDevRepoRoot(dir: string): boolean {
+  const pkg = path.join(dir, "package.json");
+  const serverSrc = path.join(dir, "server", "src", "index.ts");
+  const webSrc = path.join(dir, "web", "src", "ui", "App.tsx");
+  return fs.existsSync(pkg) && fs.existsSync(serverSrc) && fs.existsSync(webSrc);
+}
+
+function runBuild(repoRoot: string): boolean {
+  const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
+  const r = spawnSync(npmBin, ["run", "build"], {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env: process.env as any,
+  });
+  return Number(r?.status ?? 1) === 0;
+}
+
+async function stopRunningServerByPid(cfg: any): Promise<boolean> {
+  const pp = pidPath();
+  if (!fs.existsSync(pp)) return false;
+
+  let pid = 0;
+  try {
+    const raw = fs.readFileSync(pp, "utf8");
+    const j = JSON.parse(raw) as any;
+    pid = Number(j?.pid ?? 0);
+  } catch {
+    pid = 0;
+  }
+  if (!pid || !Number.isFinite(pid)) return false;
+
+  try {
+    process.kill(pid, "SIGINT");
+  } catch {
+    try {
+      fs.unlinkSync(pp);
+    } catch {
+      // ignore
+    }
+    return true;
+  }
+
+  const deadline = Date.now() + 4500;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      try {
+        fs.unlinkSync(pp);
+      } catch {
+        // ignore
+      }
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 120));
+  }
+
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // ignore
+  }
+  try {
+    fs.unlinkSync(pp);
+  } catch {
+    // ignore
+  }
+  const stillRunning = await probeExistingServer(cfg);
+  return !stillRunning;
 }
 
 async function main() {
@@ -165,6 +276,267 @@ async function main() {
     } catch {
       // ignore
     }
+    return;
+  }
+  if (cmd === "orchestrate") {
+    if (!fs.existsSync(configPath())) {
+      console.error("Config missing. Start the server once first: fromyourphone start");
+      process.exit(1);
+    }
+    const cfg = readConfig();
+    const running = await probeExistingServer(cfg);
+    if (!running) {
+      console.error("Server is not running. Start it first: fromyourphone start");
+      process.exit(1);
+    }
+
+    const file = readFlag(cmdArgs, "--file");
+    const rawJson = readFlag(cmdArgs, "--json");
+    if (!file && !rawJson) {
+      console.error("Provide a spec via --file <spec.json> or --json '<spec-json>'");
+      process.exit(2);
+    }
+
+    let spec: any = null;
+    try {
+      const raw = file ? fs.readFileSync(path.resolve(file), "utf8") : rawJson;
+      spec = JSON.parse(String(raw || ""));
+    } catch (e: any) {
+      console.error(typeof e?.message === "string" ? e.message : "invalid JSON spec");
+      process.exit(2);
+    }
+
+    const out = await callServer(cfg, "/api/orchestrations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(spec),
+    });
+    if (out.status !== 200 || !out.json?.ok) {
+      console.error("Failed to create orchestration:");
+      console.error(JSON.stringify(out.json, null, 2));
+      process.exit(1);
+    }
+
+    const id = String(out.json.id || "");
+    const { url } = getAdminUrl(cfg);
+    console.log(`Orchestration created: ${id}`);
+    console.log(`Coordinator session: ${out.json.orchestratorSessionId}`);
+    console.log(`Workers: ${Array.isArray(out.json.workers) ? out.json.workers.length : 0}`);
+    console.log(`Check status: fromyourphone orchestration ${id}`);
+    console.log(`Open on phone: ${url}`);
+    return;
+  }
+  if (cmd === "orchestrations") {
+    if (!fs.existsSync(configPath())) {
+      console.error("Config missing. Start the server once first: fromyourphone start");
+      process.exit(1);
+    }
+    const cfg = readConfig();
+    const running = await probeExistingServer(cfg);
+    if (!running) {
+      console.error("Server is not running. Start it first: fromyourphone start");
+      process.exit(1);
+    }
+    const out = await callServer(cfg, "/api/orchestrations");
+    if (out.status !== 200 || !out.json?.ok) {
+      console.error("Failed to list orchestrations:");
+      console.error(JSON.stringify(out.json, null, 2));
+      process.exit(1);
+    }
+    const items = Array.isArray(out.json.items) ? out.json.items : [];
+    if (!items.length) {
+      console.log("No orchestrations yet.");
+      return;
+    }
+    for (const it of items) {
+      const id = String(it?.id ?? "");
+      const name = String(it?.name ?? "");
+      const runningWorkers = Number(it?.runningWorkers ?? 0);
+      const workerCount = Number(it?.workerCount ?? 0);
+      const attention = Number(it?.attentionTotal ?? 0);
+      console.log(`${id}  ${name}  workers:${runningWorkers}/${workerCount}  attention:${attention}`);
+    }
+    return;
+  }
+  if (cmd === "orchestration") {
+    const id = String(cmdArgs[0] ?? "").trim();
+    if (!id) {
+      console.error("Usage: fromyourphone orchestration <id>");
+      process.exit(2);
+    }
+    if (!fs.existsSync(configPath())) {
+      console.error("Config missing. Start the server once first: fromyourphone start");
+      process.exit(1);
+    }
+    const cfg = readConfig();
+    const running = await probeExistingServer(cfg);
+    if (!running) {
+      console.error("Server is not running. Start it first: fromyourphone start");
+      process.exit(1);
+    }
+    const out = await callServer(cfg, `/api/orchestrations/${encodeURIComponent(id)}`);
+    if (out.status !== 200 || !out.json?.ok) {
+      console.error("Failed to load orchestration:");
+      console.error(JSON.stringify(out.json, null, 2));
+      process.exit(1);
+    }
+    const it = out.json.item ?? {};
+    console.log(`${it.id}  ${it.name}`);
+    console.log(`Project: ${it.projectPath}`);
+    console.log(`Coordinator: ${it.orchestratorSessionId}  running:${Boolean(it?.orchestrator?.running) ? "yes" : "no"}`);
+    console.log(`Workers: ${Number(it?.runningWorkers ?? 0)}/${Number(it?.workerCount ?? 0)} running`);
+    const sp = it?.sync?.policy ?? {};
+    const smode = typeof sp?.mode === "string" ? sp.mode : "manual";
+    const sint = Number(sp?.intervalMs ?? 0);
+    const sdeliver = sp?.deliverToOrchestrator === false ? "no" : "yes";
+    const slast = Number(it?.sync?.lastDigestAt ?? 0);
+    console.log(`Sync: mode:${smode}  intervalMs:${sint || "-"}  deliver:${sdeliver}  last:${slast ? new Date(slast).toISOString() : "-"}`);
+    console.log("");
+    const workers = Array.isArray(it?.workers) ? it.workers : [];
+    for (const w of workers) {
+      const nm = String(w?.name ?? "");
+      const sid = String(w?.sessionId ?? "");
+      const runningW = Boolean(w?.running);
+      const branch = typeof w?.branch === "string" ? w.branch : "";
+      const wt = typeof w?.worktreePath === "string" ? w.worktreePath : "";
+      console.log(`- ${nm}  session:${sid}  running:${runningW ? "yes" : "no"}`);
+      if (branch) console.log(`  branch: ${branch}`);
+      if (wt) console.log(`  worktree: ${wt}`);
+    }
+    return;
+  }
+  if (cmd === "orchestration-sync") {
+    const id = String(cmdArgs[0] ?? "").trim();
+    if (!id) {
+      console.error("Usage: fromyourphone orchestration-sync <id> [--force] [--no-deliver] [--trigger <text>]");
+      process.exit(2);
+    }
+    if (!fs.existsSync(configPath())) {
+      console.error("Config missing. Start the server once first: fromyourphone start");
+      process.exit(1);
+    }
+    const cfg = readConfig();
+    const running = await probeExistingServer(cfg);
+    if (!running) {
+      console.error("Server is not running. Start it first: fromyourphone start");
+      process.exit(1);
+    }
+    const trigger = readFlag(cmdArgs, "--trigger");
+    const force = cmdArgs.includes("--force");
+    const noDeliver = cmdArgs.includes("--no-deliver");
+    const out = await callServer(cfg, `/api/orchestrations/${encodeURIComponent(id)}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        force,
+        trigger: trigger || undefined,
+        deliverToOrchestrator: noDeliver ? false : undefined,
+      }),
+    });
+    if (out.status !== 200 || !out.json?.ok) {
+      console.error("Sync failed:");
+      console.error(JSON.stringify(out.json, null, 2));
+      process.exit(1);
+    }
+    const s = out.json.sync ?? {};
+    const h = String(s?.digest?.hash ?? "");
+    console.log(`Sync ${s?.sent ? "sent" : "not sent"} (${String(s?.reason ?? "unknown")})`);
+    if (h) console.log(`Digest: ${h}`);
+    const preview = typeof s?.digest?.text === "string" ? s.digest.text.split("\n").slice(0, 10).join("\n") : "";
+    if (preview) {
+      console.log("");
+      console.log(preview);
+      if (String(s?.digest?.text ?? "").split("\n").length > 10) console.log("...");
+    }
+    if (!s?.sent && s?.reason !== "unchanged" && s?.reason !== "collect_only") process.exit(1);
+    return;
+  }
+  if (cmd === "orchestration-policy") {
+    const id = String(cmdArgs[0] ?? "").trim();
+    if (!id) {
+      console.error("Usage: fromyourphone orchestration-policy <id> --mode <off|manual|interval> [--interval-ms <n>] [--deliver|--no-deliver] [--run-now]");
+      process.exit(2);
+    }
+    if (!fs.existsSync(configPath())) {
+      console.error("Config missing. Start the server once first: fromyourphone start");
+      process.exit(1);
+    }
+    const cfg = readConfig();
+    const running = await probeExistingServer(cfg);
+    if (!running) {
+      console.error("Server is not running. Start it first: fromyourphone start");
+      process.exit(1);
+    }
+
+    const mode = readFlag(cmdArgs, "--mode");
+    const intervalRaw = readFlag(cmdArgs, "--interval-ms");
+    const runNow = cmdArgs.includes("--run-now");
+    const force = cmdArgs.includes("--force");
+    const payload: any = {};
+    if (mode) payload.mode = mode;
+    if (intervalRaw) payload.intervalMs = Number(intervalRaw);
+    if (cmdArgs.includes("--deliver")) payload.deliverToOrchestrator = true;
+    if (cmdArgs.includes("--no-deliver")) payload.deliverToOrchestrator = false;
+    if (runNow) payload.runNow = true;
+    if (force) payload.force = true;
+
+    const out = await callServer(cfg, `/api/orchestrations/${encodeURIComponent(id)}/sync-policy`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (out.status !== 200 || !out.json?.ok) {
+      console.error("Policy update failed:");
+      console.error(JSON.stringify(out.json, null, 2));
+      process.exit(1);
+    }
+    const sp = out.json?.sync?.policy ?? {};
+    const last = Number(out.json?.sync?.lastDigestAt ?? 0);
+    console.log(
+      `Policy updated: mode=${String(sp?.mode ?? "manual")} intervalMs=${Number(sp?.intervalMs ?? 0) || "-"} deliver=${sp?.deliverToOrchestrator === false ? "no" : "yes"}`
+    );
+    console.log(`Last digest: ${last ? new Date(last).toISOString() : "-"}`);
+    if (out.json?.sync?.run) {
+      console.log(`Run now: ${out.json.sync.run.sent ? "sent" : "not sent"} (${String(out.json.sync.run.reason ?? "unknown")})`);
+    }
+    return;
+  }
+  if (cmd === "orchestration-cleanup") {
+    const id = String(cmdArgs[0] ?? "").trim();
+    if (!id) {
+      console.error("Usage: fromyourphone orchestration-cleanup <id> [--delete-sessions] [--remove-record]");
+      process.exit(2);
+    }
+    if (!fs.existsSync(configPath())) {
+      console.error("Config missing. Start the server once first: fromyourphone start");
+      process.exit(1);
+    }
+    const cfg = readConfig();
+    const running = await probeExistingServer(cfg);
+    if (!running) {
+      console.error("Server is not running. Start it first: fromyourphone start");
+      process.exit(1);
+    }
+    const deleteSessions = cmdArgs.includes("--delete-sessions");
+    const removeRecord = cmdArgs.includes("--remove-record");
+    const out = await callServer(cfg, `/api/orchestrations/${encodeURIComponent(id)}/cleanup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        stopSessions: true,
+        deleteSessions,
+        removeWorktrees: true,
+        removeRecord,
+      }),
+    });
+    if (out.status !== 200 || typeof out.json?.ok !== "boolean") {
+      console.error("Cleanup failed:");
+      console.error(JSON.stringify(out.json, null, 2));
+      process.exit(1);
+    }
+    console.log(`Cleanup ${out.json.ok ? "completed" : "completed with errors"} for ${id}`);
+    console.log(JSON.stringify(out.json.summary ?? {}, null, 2));
+    if (!out.json.ok) process.exit(1);
     return;
   }
   if (cmd === "status") {
@@ -264,6 +636,16 @@ async function main() {
     console.error("Choose only one: --lan or --local");
     process.exit(2);
   }
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const repoRoot = findRepoRoot(moduleDir) ?? findRepoRoot(process.cwd()) ?? process.cwd();
+  if (isDevRepoRoot(repoRoot)) {
+    console.log("Building latest files...");
+    if (!runBuild(repoRoot)) {
+      console.error("Build failed. Start aborted.");
+      process.exit(1);
+    }
+  }
+
   const envOverride: Record<string, string> = {};
   // Secure-by-default: bind locally unless user opts into LAN exposure explicitly.
   envOverride.FYP_BIND = wantsLan ? "0.0.0.0" : "127.0.0.1";
@@ -278,19 +660,14 @@ async function main() {
     try {
       const cfg = readConfig();
       if (await probeExistingServer(cfg)) {
-        const { host, port, url } = getAdminUrl(cfg);
-        const bind = String(cfg?.server?.bind ?? "127.0.0.1");
-        const token = String(cfg?.auth?.token ?? "");
-        console.log(`Already running: http://${host}:${port}`);
-        if (isLoopbackBind(bind)) {
-          console.log(`\nLocal-only mode (bind ${bind}).`);
-          console.log(`Open on this computer:\n  ${url}\n`);
-          console.log("To use on your phone over WiFi, restart with:");
-          console.log("  fromyourphone start --lan\n");
-        } else {
-          await printRemoteAccess(host, port, token);
+        console.log("Server already running. Restarting to apply latest build...");
+        const stopped = await stopRunningServerByPid(cfg);
+        if (!stopped) {
+          const { host, port } = getAdminUrl(cfg);
+          console.error(`Could not stop existing server on http://${host}:${port}.`);
+          console.error("Run `fromyourphone stop` first, then `fromyourphone start`.");
+          process.exit(1);
         }
-        return;
       }
     } catch {
       // ignore
@@ -298,14 +675,14 @@ async function main() {
   }
 
   // Resolve server entry relative to the installed CLI, not the user's cwd.
-  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
   const distServer = path.join(moduleDir, "server", "index.js"); // when installed: dist/cli.js -> dist/server/index.js
-
-  const repoRoot = findRepoRoot(moduleDir) ?? findRepoRoot(process.cwd()) ?? process.cwd();
+  const localDistServer = path.join(repoRoot, "dist", "server", "index.js");
   const devServer = path.join(repoRoot, "server", "src", "index.ts");
+  const preferLocalDist = isDevRepoRoot(repoRoot) && fs.existsSync(localDistServer);
+  const selectedDistServer = preferLocalDist ? localDistServer : distServer;
 
-  const runner = fs.existsSync(distServer)
-    ? { bin: process.execPath, args: [distServer] }
+  const runner = fs.existsSync(selectedDistServer)
+    ? { bin: process.execPath, args: [selectedDistServer] }
     : { bin: "npx", args: ["tsx", devServer] };
 
   const child = spawn(runner.bin, runner.args, { stdio: "inherit", env: { ...(process.env as any), ...envOverride } });

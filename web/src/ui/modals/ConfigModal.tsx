@@ -1,4 +1,7 @@
 import React from "react";
+import { Modal, ModalHeader, ModalBody, ModalSpacer } from "../components/Modal";
+import { Button } from "../components/Button";
+import { Chip } from "../components/Chip";
 
 export function ConfigModal(props: {
   open: boolean;
@@ -8,27 +11,21 @@ export function ConfigModal(props: {
   onClose: () => void;
   onSave: () => void | Promise<void>;
 }) {
-  if (!props.open) return null;
   return (
-    <div className="modalOverlay" role="dialog" aria-modal="true">
-      <div className="modal">
-        <div className="modalHead">
-          <b>config.toml</b>
-          <span className="chip">live profiles</span>
-          <div className="spacer" />
-          <button className="btn" onClick={props.onClose}>
-            Close
-          </button>
-          <button className="btn primary" onClick={props.onSave}>
-            Save
-          </button>
-        </div>
-        <div className="modalBody">
-          <textarea className="codebox" value={props.toml} onChange={(e) => props.onChange(e.target.value)} />
-          <div className="help">{props.msg ? props.msg : "Tip: use tool-native fields, not startup macros."}</div>
-        </div>
-      </div>
-    </div>
+    <Modal open={props.open}>
+      <ModalHeader>
+        <b>config.toml</b>
+        <Chip>live profiles</Chip>
+        <ModalSpacer />
+        <Button onClick={props.onClose}>Close</Button>
+        <Button variant="primary" onClick={props.onSave}>
+          Save
+        </Button>
+      </ModalHeader>
+      <ModalBody>
+        <textarea className="codebox" value={props.toml} onChange={(e) => props.onChange(e.target.value)} />
+        <div className="help">{props.msg ? props.msg : "Tip: use tool-native fields, not startup macros."}</div>
+      </ModalBody>
+    </Modal>
   );
 }
-

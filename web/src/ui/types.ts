@@ -21,6 +21,10 @@ export type SessionRow = {
   closing?: boolean;
   attention?: number;
   preview?: string | null;
+  taskId?: string | null;
+  taskRole?: "parent" | "child" | "solo" | "helper" | null;
+  taskMode?: "wrap" | "terminal" | null;
+  taskVisibility?: "user" | "internal" | null;
 };
 
 export type WorktreeInfo = {
@@ -43,6 +47,7 @@ export type WorkspaceItem = {
 
 export type InboxItem = {
   id: number;
+  taskId?: string | null;
   sessionId: string;
   ts: number;
   status: "open" | "sent" | "resolved" | "dismissed";
@@ -53,6 +58,43 @@ export type InboxItem = {
   signature: string;
   options: { id: string; label: string; send: string }[];
   session: SessionRow | null;
+};
+
+export type TaskMode = "wrap" | "terminal";
+export type TaskKind = "single" | "group" | "orchestrator";
+export type TaskStatus = "active" | "paused" | "archived" | "error";
+export type TaskMember = {
+  id: number;
+  taskId: string;
+  sessionId: string;
+  role: "parent" | "child" | "solo" | "helper";
+  ordinal: number;
+  title: string | null;
+  isInternal: boolean;
+  defaultHidden: boolean;
+  modeOverride: TaskMode | null;
+  mode: TaskMode;
+  attention: number;
+  running: boolean;
+  preview: string | null;
+  session: SessionRow | null;
+};
+
+export type TaskCard = {
+  id: string;
+  title: string;
+  kind: TaskKind;
+  status: TaskStatus;
+  goal: string | null;
+  defaultMode: TaskMode;
+  visibility: "user" | "internal";
+  source: "manual" | "planner" | "migration";
+  pendingCount: number;
+  runningCount: number;
+  memberCount: number;
+  lastActivityAt: number;
+  primarySessionId: string | null;
+  members: TaskMember[];
 };
 
 export type TuiAssist = {
@@ -109,8 +151,26 @@ export type Doctor = {
     claude: { permissionModes: string[]; supports: any; version?: string };
     opencode: { supports: any; version?: string };
   };
+  features?: {
+    terminalModeEnabled?: boolean;
+  };
   workspaceRoots: string[];
 };
 
 export type EventItem = { id: number; ts: number; kind: string; data: any };
 export type RecentWorkspace = { path: string; lastUsed: number };
+
+export type OrchestrictionAutomationPolicy = {
+  questionMode?: "off" | "orchestrator";
+  steeringMode?: "off" | "passive_review" | "active_steering";
+  questionTimeoutMs?: number;
+  reviewIntervalMs?: number;
+  yoloMode?: boolean;
+};
+
+export type OrchestrationSyncPolicy = {
+  mode: "off" | "manual" | "interval";
+  intervalMs: number;
+  deliverToOrchestrator: boolean;
+  minDeliveryGapMs: number;
+};

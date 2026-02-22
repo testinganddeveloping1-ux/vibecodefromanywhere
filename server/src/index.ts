@@ -77,13 +77,16 @@ function advertisedHost(bind: string): string {
 async function startPairUrl(host: string, port: number): Promise<string> {
   let pairUrl = "";
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/api/auth/pair/start?token=${encodeURIComponent(cfg.auth.token)}`, {
+    const r = await fetch(`http://127.0.0.1:${port}/api/auth/pair/start`, {
       method: "POST",
+      headers: { authorization: `Bearer ${cfg.auth.token}` },
     });
     if (r.ok) {
       const j = (await r.json()) as any;
-      const code = typeof j?.code === "string" ? j.code : "";
-      if (code) pairUrl = `http://${host}:${port}/?pair=${encodeURIComponent(code)}`;
+      const code = typeof j?.code === "string" ? String(j.code).trim().toUpperCase() : "";
+      if (/^[A-Z0-9]{6,12}$/.test(code)) {
+        pairUrl = `http://${host}:${port}/?pair=${encodeURIComponent(code)}`;
+      }
     }
   } catch {
     // ignore

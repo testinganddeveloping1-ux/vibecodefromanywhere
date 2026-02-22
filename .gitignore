@@ -1,3 +1,4 @@
+# Dependencies / build output
 node_modules
 node_modules.*
 node_modules_*
@@ -6,12 +7,25 @@ dist
 .turbo
 coverage
 out/
+
+# Runtime/internal orchestration state (never commit)
+.agents/
+.fyp/
+memory/
+.fyp-worktrees-*/
+**/.fyp-worktrees-*/
+
+# Local environment / secrets
+.env
+.env.*
+.venv*
+
+# Local logs / debug artifacts
+*.log
 projects-scrolled.png
 run-tab.png
-*.log
-.env.*
-.DS_Store
-.env
-.venv*
 playwright-*.png
 playwright-*.webm
+
+# OS junk
+.DS_Store

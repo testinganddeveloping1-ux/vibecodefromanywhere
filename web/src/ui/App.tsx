@@ -1,4007 +1,3360 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import type { Terminal as XTermTerminal } from "@xterm/xterm";
-import type { FitAddon as XTermFitAddon } from "@xterm/addon-fit";
-
-import type {
-  Doctor,
-  EventItem,
-  InboxItem,
-  Profile,
-  RecentWorkspace,
-  SessionRow,
-  TabId,
-  ToolId,
-  ToolSessionMessage,
-  ToolSessionSummary,
-  ToolSessionTool,
-  TuiAssist,
-  WorkspaceItem,
-} from "./types";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./lib/api";
-import { groupByRecent, treeLabel } from "./lib/grouping";
-import { dirsFromText, normalizeEvent } from "./lib/text";
-import { lsGet, lsRemove, lsSet } from "./lib/storage";
-import { HeaderBar } from "./components/HeaderBar";
-import { ConnectingScreen, UnlockScreen } from "./components/LoginScreens";
+import { lsGet, lsSet } from "./lib/storage";
 import { BottomNav } from "./components/BottomNav";
-import { PinnedSlotsBar } from "./components/PinnedSlotsBar";
-
-import { TerminalAssistOverlay } from "./components/TerminalAssistOverlay";
-import { CodexNativeThreadView } from "./components/CodexNativeThreadView";
-import { ToolChip } from "./components/ToolChip";
+import { HeaderBar } from "./components/HeaderBar";
+import { WrapperChatView } from "./components/WrapperChatView";
+import { OrchestrationCommandPanel } from "./components/OrchestrationCommandPanel";
+import { ConnectingScreen, UnlockScreen } from "./components/LoginScreens";
+import type { Doctor, InboxItem, SessionRow, TaskCard, ToolId, ToolSessionMessage, ToolSessionMessageBlock, ToolSessionSummary } from "./types";
+import { TerminalView } from "./components/TerminalView";
 import { PickerModal } from "./modals/PickerModal";
-import { ConfigModal } from "./modals/ConfigModal";
-import { ModelPickerModal } from "./modals/ModelPickerModal";
-import { ToolChatModal } from "./modals/ToolChatModal";
-import { LogModal } from "./modals/LogModal";
-import { ControlsModal } from "./modals/ControlsModal";
 
-function cleanPreviewLine(raw: string): string {
-  let s = String(raw ?? "");
-  if (!s.trim()) return "";
-  // Control chars (including C1) can leak into previews and render as weird fragments on phones.
-  s = s.replace(/[\u0000-\u001F\u007F-\u009F]/g, " ");
-  // Some terminals emit cursor-position sequences as visible text when partially stripped (e.g. "4;2H").
-  s = s.replace(/\b\d{1,3}(?:;\d{1,3})+[A-Za-z]\b/g, " ");
+// ── Preset system ────────────────────────────────────────────────────────────
+type PresetAgent = {
+  role: "orchestrator" | "worker";
+  name: string;
+  tool: ToolId;
+  profileId: string;
+  label: string;
+  taskPrompt?: string; // {objective} placeholder supported
+};
 
-  // Codex prompts often include a "›" marker. Keeping the last one makes previews far more readable.
-  const lastPrompt = s.lastIndexOf("›");
-  if (lastPrompt >= 0) s = s.slice(lastPrompt);
+type PresetDef = {
+  id: string;
+  name: string;
+  desc: string;
+  detail: string;
+  agents: PresetAgent[];
+  kind: "session" | "orchestration";
+};
 
-  // De-noise common Codex footer hints when they appear.
-  s = s.replace(/\s*\?\s*for shortcuts\b/gi, "?");
-  s = s.replace(/\s*\b\d{1,3}%\s*context left\b\s*$/gi, "");
+type ProfileOption = { id: string; label: string };
 
-  s = s.replace(/\s{2,}/g, " ").trim();
-  return s;
+type CustomWorkerGroup = {
+  id: string;
+  tool: ToolId;
+  profileId: string;
+  model: string;
+  count: number;
+  role: string;
+  taskTemplate: string;
+};
+
+type CustomTeamAutomationMode = "manual" | "guided" | "autopilot";
+
+type DirectoryPickerTarget = "createProjectPath" | "soloCwd";
+
+const PRESETS: PresetDef[] = [
+  {
+    id: "solo",
+    name: "Solo",
+    desc: "1 agent",
+    detail: "Single mirrored terminal session. You pick Codex, Claude Code, or OpenCode and control it directly.",
+    kind: "session",
+    agents: [
+      { role: "worker", tool: "codex", profileId: "codex.default", name: "Terminal Agent", label: "Direct terminal control" },
+    ],
+  },
+  {
+    id: "debug",
+    name: "Debug Team",
+    desc: "3 agents",
+    detail: "Codex orchestrator plus two Codex workers for debugging, tests, and targeted fixes.",
+    kind: "orchestration",
+    agents: [
+      { role: "orchestrator", tool: "codex", profileId: "codex.default", name: "Orchestrator", label: "Owns plan and dispatch" },
+      { role: "worker", tool: "codex", profileId: "codex.full_auto", name: "Worker A", label: "Finds and fixes backend issues", taskPrompt: "Debug backend behavior and implement focused fixes for: {objective}" },
+      { role: "worker", tool: "codex", profileId: "codex.default", name: "Worker B", label: "Runs tests and validates", taskPrompt: "Run tests, verify changes, and harden edge cases for: {objective}" },
+    ],
+  },
+  {
+    id: "custom-team",
+    name: "Custom Team",
+    desc: "1+ agents",
+    detail: "Configure one orchestrator plus one or more worker groups with explicit counts, roles, and model/profile overrides.",
+    kind: "orchestration",
+    agents: [
+      { role: "orchestrator", tool: "codex", profileId: "codex.default", name: "Orchestrator", label: "Coordinates plan, dispatch, and review" },
+      { role: "worker", tool: "codex", profileId: "codex.default", name: "Workers", label: "Customizable worker groups and counts" },
+    ],
+  },
+];
+
+type ModelOption = { value: string; label: string };
+const COMMON_MODELS: Record<ToolId, ModelOption[]> = {
+  codex: [
+    { value: "gpt-5.3-codex", label: "GPT-5.3 Codex (default)" },
+    { value: "gpt-5.3-codex-high", label: "GPT-5.3 Codex High" },
+    { value: "gpt-5.3-codex-xhigh", label: "GPT-5.3 Codex XHigh" },
+    { value: "gpt-5.3-spark", label: "GPT-5.3 Spark" },
+    { value: "gpt-5.3-spark-high", label: "GPT-5.3 Spark High" },
+    { value: "gpt-5.3-spark-xhigh", label: "GPT-5.3 Spark XHigh" },
+  ],
+  claude: [
+    { value: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 Thinking" },
+    { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
+    { value: "claude-opus-4-5-thinking", label: "Claude Opus 4.5 Thinking" },
+    { value: "claude-sonnet-4-5-thinking", label: "Claude Sonnet 4.5 Thinking" },
+  ],
+  opencode: [
+    { value: "opencode/kimi-k2.5-free", label: "Kimi K2.5 (Free)" },
+    { value: "opencode/minimax-m2.5-free", label: "Minimax M2.5 (Free)" },
+  ],
+};
+
+const FALLBACK_PROFILES: Record<ToolId, ProfileOption[]> = {
+  codex: [
+    { id: "codex.default", label: "codex.default" },
+    { id: "codex.full_auto", label: "codex.full_auto" },
+    { id: "codex.review", label: "codex.review" },
+  ],
+  claude: [
+    { id: "claude.default", label: "claude.default" },
+    { id: "claude.full_auto", label: "claude.full_auto" },
+  ],
+  opencode: [
+    { id: "opencode.default", label: "opencode.default" },
+  ],
+};
+
+const CUSTOM_TEAM_MAX_WORKERS = 8;
+const CUSTOM_TEAM_MAX_GROUP_COUNT = 6;
+const PATH_PRIVACY_MODE_KEY = "fyp.ui.pathPrivacyMode";
+const CLAUDE_SHARE_TRUST_KEY = "fyp.ui.claudeAutoTrustShareMode";
+type PathPrivacyMode = "full" | "share";
+
+type NativeThreadResp = { ok?: boolean; thread?: any };
+type PendingEcho = { id: string; sessionId: string; ts: number; text: string };
+type OrchestrationProgressWorker = {
+  workerIndex: number;
+  name: string;
+  sessionId: string;
+  running: boolean;
+  attention: number;
+  branch: string | null;
+  worktreePath: string | null;
+  projectPath: string | null;
+  taskPrompt: string;
+  preview?: string | null;
+  previewSource?: "none" | "progress" | "live";
+  previewTs?: number | null;
+  lastEvent?: { id?: number | null; kind?: string | null; ts?: number | null } | null;
+  activity?: {
+    state?: "live" | "needs_input" | "waiting_or_done" | "idle";
+    stale?: boolean;
+    staleAfterMs?: number;
+    lastActivityAt?: number | null;
+    idleForMs?: number | null;
+  };
+  progress: {
+    found: boolean;
+    relPath: string | null;
+    updatedAt: number | null;
+    checklistDone: number;
+    checklistTotal: number;
+    preview: string | null;
+    excerpt: string | null;
+  };
+};
+type OrchestrationProgressItem = {
+  orchestrationId: string;
+  generatedAt: number;
+  startup?: {
+    dispatchMode?: "orchestrator-first" | "worker-first";
+    state?: "auto-released" | "waiting-first-dispatch" | "running";
+    deferredInitialDispatch?: string[];
+    dispatchedSessionIds?: string[];
+    pendingSessionIds?: string[];
+    pendingWorkerNames?: string[];
+  };
+  workers: OrchestrationProgressWorker[];
+};
+
+function extractAnyText(v: any, depth = 0): string {
+  if (depth > 5) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (!v) return "";
+  if (Array.isArray(v)) {
+    return v
+      .map((it) => extractAnyText(it, depth + 1))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (typeof v !== "object") return "";
+  if (typeof v.text === "string") return v.text;
+  if (typeof v.delta === "string") return v.delta;
+  if (typeof v.output === "string") return v.output;
+  if (typeof v.message === "string") return v.message;
+  if (Array.isArray(v.content)) return extractAnyText(v.content, depth + 1);
+  return "";
 }
 
-function isPhoneLikeDevice(): boolean {
-  try {
-    const ua = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
-    const coarse =
-      typeof window !== "undefined" && typeof window.matchMedia === "function"
-        ? window.matchMedia("(pointer: coarse)").matches
-        : false;
-    return coarse || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
-  } catch {
-    return false;
+function parseMs(v: any, fallback: number): number {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Date.parse(v);
+    if (Number.isFinite(n)) return n;
   }
+  return fallback;
+}
+
+function fmtTime(ts: number): string {
+  try {
+    return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+function fmtIdleAge(ms: number | null | undefined): string {
+  const n = Number(ms ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n < 60_000) return `${Math.max(1, Math.floor(n / 1000))}s`;
+  if (n < 60 * 60 * 1000) return `${Math.floor(n / 60_000)}m`;
+  return `${Math.floor(n / (60 * 60 * 1000))}h`;
+}
+
+function detectHomePrefixFromPath(raw: string): string | null {
+  const p = String(raw || "").trim();
+  if (!p) return null;
+  const unix = p.match(/^\/home\/[^/]+/i) || p.match(/^\/Users\/[^/]+/);
+  if (unix?.[0]) return unix[0];
+  const win = p.match(/^[A-Za-z]:[\\/]+Users[\\/]+[^\\/]+/);
+  if (win?.[0]) return win[0].replace(/\\/g, "/");
+  return null;
+}
+
+function detectUserHomePrefix(candidates: Array<string | null | undefined>): string | null {
+  for (const candidate of candidates) {
+    const found = detectHomePrefixFromPath(String(candidate || ""));
+    if (found) return found.replace(/\\/g, "/");
+  }
+  return null;
+}
+
+function formatPathForUi(rawPath: string | null | undefined, mode: PathPrivacyMode, homePrefix: string | null): string {
+  const raw = String(rawPath || "").trim();
+  if (!raw) return "";
+  if (mode !== "share") return raw;
+
+  const normalized = raw.replace(/\\/g, "/");
+  const prefix = (homePrefix || detectHomePrefixFromPath(normalized) || "").replace(/\\/g, "/");
+  if (!prefix) return normalized;
+  if (normalized === prefix) return "~";
+  if (normalized.startsWith(`${prefix}/`)) return `~${normalized.slice(prefix.length)}`;
+  return normalized;
+}
+
+function parseProgressPreviewMeta(raw: string): {
+  cleanText: string;
+  generatedAt: string | null;
+  orchestrationId: string | null;
+} {
+  const text = String(raw ?? "").trim();
+  if (!text) return { cleanText: "", generatedAt: null, orchestrationId: null };
+
+  const generatedPattern = /\bGenerated:\s*`?([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]*Z?)`?/i;
+  const generatedAt =
+    text.match(generatedPattern)?.[1]?.trim() ?? null;
+  const orchestrationId = text.match(/\bOrchestration ID:\s*`?([^`·]+)`?/i)?.[1]?.trim() ?? null;
+
+  let clean = text
+    .replace(/\s*·?\s*Generated:\s*`?[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]*Z?`?/gi, "")
+    .replace(/\s*·?\s*Orchestration ID:\s*`?[^`·]+`?/gi, "")
+    .replace(/\s*·\s*·\s*/g, " · ")
+    .replace(/^·\s*|\s*·$/g, "")
+    .trim();
+
+  if (!clean) clean = "Metadata hidden";
+  return { cleanText: clean, generatedAt, orchestrationId };
+}
+
+function toolCallText(name: string, input: any): string {
+  let body = "";
+  if (typeof input === "string") body = input;
+  else if (input != null) {
+    try {
+      body = JSON.stringify(input, null, 2);
+    } catch {
+      body = "";
+    }
+  }
+  return body ? `Tool: ${name}\n${body}` : `Tool: ${name}`;
+}
+
+function isRecord(v: any): v is Record<string, any> {
+  return Boolean(v) && typeof v === "object" && !Array.isArray(v);
+}
+
+function modelOptionsForTool(tool: ToolId): ModelOption[] {
+  return COMMON_MODELS[tool] ?? [];
+}
+
+function profileOptionsForTool(tool: ToolId, profiles: ProfileOption[]): ProfileOption[] {
+  const opts = profiles.filter((p) => p.id.startsWith(`${tool}.`));
+  if (opts.length > 0) return opts;
+  return FALLBACK_PROFILES[tool] ?? [{ id: `${tool}.default`, label: `${tool}.default` }];
+}
+
+function normalizeProfileIdForTool(tool: ToolId, profileId: string, profiles: ProfileOption[]): string {
+  const id = String(profileId || "").trim();
+  const allowed = profileOptionsForTool(tool, profiles);
+  if (id && allowed.some((p) => p.id === id)) return id;
+  return allowed[0]?.id || `${tool}.default`;
+}
+
+function materializeTaskPrompt(templateRaw: string, objectiveRaw: string): string {
+  const template = String(templateRaw || "").trim();
+  const objective = String(objectiveRaw || "").trim();
+  if (!template) return objective;
+  if (!objective) return template;
+
+  if (/\{objective\}/i.test(template)) {
+    return template.replace(/\{objective\}/gi, objective);
+  }
+  const templateNorm = template.toLowerCase();
+  const objectiveNorm = objective.toLowerCase();
+  if (
+    templateNorm.includes(objectiveNorm.slice(0, 140)) ||
+    /\bobjective\b/i.test(template) ||
+    /\bgoal\b/i.test(template)
+  ) {
+    return template;
+  }
+  return `${template}\n\nObjective: ${objective}`;
+}
+
+function summarizeOrchestrationForInbox(progress: OrchestrationProgressItem | null | undefined): null | { line1: string; line2: string } {
+  if (!progress || !Array.isArray(progress.workers) || progress.workers.length === 0) return null;
+  const workers = progress.workers;
+  const live = workers.filter((w) => Boolean(w.running)).length;
+  const attention = workers.reduce((n, w) => n + Math.max(0, Number(w.attention ?? 0)), 0);
+  const done = workers.reduce((n, w) => n + Math.max(0, Number(w.progress?.checklistDone ?? 0)), 0);
+  const total = workers.reduce((n, w) => n + Math.max(0, Number(w.progress?.checklistTotal ?? 0)), 0);
+  const line1Parts = [`${live}/${workers.length} live`];
+  if (total > 0) line1Parts.push(`checklist ${done}/${total}`);
+  if (attention > 0) line1Parts.push(`${attention} attention`);
+
+  let latest: OrchestrationProgressWorker | null = null;
+  let latestTs = 0;
+  for (const w of workers) {
+    const ts = Math.max(
+      Number(w.progress?.updatedAt ?? 0) || 0,
+      Number(w.previewTs ?? 0) || 0,
+      Number(w.lastEvent?.ts ?? 0) || 0,
+    );
+    if (ts >= latestTs) {
+      latestTs = ts;
+      latest = w;
+    }
+  }
+
+  if (!latest) return { line1: line1Parts.join(" · "), line2: "No worker summary yet." };
+  const rawPreview = String(latest.preview ?? latest.progress?.preview ?? "").trim();
+  const clean = rawPreview ? parseProgressPreviewMeta(rawPreview).cleanText : "";
+  const line2 = clean ? `${latest.name}: ${clean}` : `${latest.name}: no summary yet`;
+  return { line1: line1Parts.join(" · "), line2 };
+}
+
+function makeCustomWorkerGroup(seed?: Partial<CustomWorkerGroup>): CustomWorkerGroup {
+  const tool = (seed?.tool ?? "codex") as ToolId;
+  return {
+    id: seed?.id || `wg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    tool,
+    profileId: String(seed?.profileId || `${tool}.default`),
+    model: String(seed?.model || ""),
+    count: Math.max(1, Math.min(CUSTOM_TEAM_MAX_GROUP_COUNT, Number(seed?.count ?? 1) || 1)),
+    role: String(seed?.role || "debug"),
+    taskTemplate: String(seed?.taskTemplate || "Implement and verify {objective}"),
+  };
+}
+
+function modelOverridesForTool(tool: ToolId, modelRaw: string): Record<string, any> {
+  const model = String(modelRaw ?? "").trim();
+  if (!model) return {};
+  if (tool === "codex") return { codex: { model } };
+  if (tool === "claude") return { claude: { model } };
+  if (tool === "opencode") return { opencode: { model } };
+  return {};
+}
+
+function mergeToolOverrides(base: any, patch: any): Record<string, any> {
+  const out: Record<string, any> = isRecord(base) ? { ...base } : {};
+  const p: Record<string, any> = isRecord(patch) ? patch : {};
+  for (const key of ["codex", "claude", "opencode"]) {
+    const cur = isRecord(out[key]) ? out[key] : {};
+    const add = isRecord(p[key]) ? p[key] : {};
+    const merged = { ...cur, ...add };
+    if (Object.keys(merged).length > 0) out[key] = merged;
+  }
+  return out;
+}
+
+function extractNativeCallId(item: any): string | undefined {
+  const candidates = [
+    item?.callId,
+    item?.call_id,
+    item?.id,
+    item?.tool_use_id,
+    item?.toolUseId,
+    item?.requestId,
+    item?.request_id,
+    item?.payload?.callId,
+    item?.payload?.call_id,
+    item?.payload?.id,
+    item?.payload?.tool_use_id,
+    item?.item?.callId,
+    item?.item?.call_id,
+    item?.item?.id,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c.trim();
+  }
+  return undefined;
+}
+
+function extractNativeToolName(type: string, item: any): string {
+  const candidates = [
+    item?.name,
+    item?.tool,
+    item?.toolName,
+    item?.payload?.name,
+    item?.payload?.tool,
+    item?.item?.name,
+    item?.item?.tool,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c.trim();
+  }
+  if (type.endsWith("_call")) return type.slice(0, -5);
+  if (type.endsWith("_output")) return type.slice(0, -7);
+  return type || "tool";
+}
+
+function extractNativeToolInput(item: any): any {
+  const candidates = [
+    item?.input,
+    item?.arguments,
+    item?.args,
+    item?.params,
+    item?.payload?.input,
+    item?.payload?.arguments,
+    item?.payload?.args,
+    item?.payload?.params,
+    item?.item?.input,
+    item?.item?.arguments,
+  ];
+  for (const c of candidates) {
+    if (c != null) return c;
+  }
+  if (typeof item?.command === "string") return { command: item.command };
+  if (typeof item?.payload?.command === "string") return { command: item.payload.command };
+  return item;
+}
+
+function extractNativeToolOutput(item: any): string {
+  return extractAnyText(
+    item?.output ??
+    item?.result ??
+    item?.content ??
+    item?.text ??
+    item?.payload?.output ??
+    item?.payload?.result ??
+    item?.payload?.content ??
+    item?.item?.output ??
+    item?.item?.result ??
+    item?.item?.content ??
+    "",
+  );
+}
+
+function normalizeNativeItem(rawItem: any): Array<{ type: string; item: any }> {
+  if (!isRecord(rawItem)) return [];
+  const out: Array<{ type: string; item: any }> = [];
+  const queue: any[] = [rawItem];
+
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    if (!isRecord(cur)) continue;
+    const type = String(cur.type ?? "").trim().toLowerCase();
+    if (type === "response_item" && isRecord(cur.payload)) {
+      queue.unshift(cur.payload);
+      continue;
+    }
+    if (type === "item.completed" && isRecord(cur.item)) {
+      queue.unshift(cur.item);
+      continue;
+    }
+    if (type === "item.started" && isRecord(cur.item)) {
+      queue.unshift(cur.item);
+      continue;
+    }
+    if (isRecord(cur.payload) && typeof cur.payload.type === "string") {
+      queue.unshift(cur.payload);
+      continue;
+    }
+    if (isRecord(cur.item) && typeof cur.item.type === "string") {
+      queue.unshift(cur.item);
+      continue;
+    }
+    if (Array.isArray(cur.items)) {
+      for (const nested of cur.items) queue.push(nested);
+    }
+    out.push({ type, item: cur });
+  }
+
+  return out;
+}
+
+function parseCodexNativeThreadMessages(thread: any): ToolSessionMessage[] {
+  const out: Array<ToolSessionMessage & { _seq: number }> = [];
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  let seq = 0;
+
+  const push = (msg: ToolSessionMessage) => {
+    out.push({ ...msg, _seq: seq++ });
+  };
+
+  for (let tIdx = 0; tIdx < turns.length; tIdx++) {
+    const turn = turns[tIdx] ?? {};
+    const baseTs = parseMs(turn?.startedAt ?? turn?.createdAt ?? turn?.timestamp, Date.now() + tIdx);
+    const userInput = extractAnyText(turn?.input ?? turn?.userInput ?? turn?.prompt ?? "");
+    if (userInput.trim()) {
+      push({
+        role: "user",
+        ts: baseTs,
+        text: userInput.trim(),
+        blocks: [{ type: "text", text: userInput.trim() }],
+      });
+    }
+
+    const items = Array.isArray(turn?.items)
+      ? turn.items
+      : Array.isArray(turn?.output?.items)
+        ? turn.output.items
+        : [];
+    for (let i = 0; i < items.length; i++) {
+      const raw = items[i] ?? {};
+      const ts = parseMs(raw?.updatedAt ?? raw?.createdAt ?? raw?.timestamp, baseTs + i + 1);
+      const normalized = normalizeNativeItem(raw);
+      for (const rec of normalized) {
+        const type = String(rec.type || "").trim().toLowerCase();
+        const item = rec.item;
+        const callId = extractNativeCallId(item);
+
+        const pushBlock = (block: ToolSessionMessageBlock, role: "assistant" | "user" = "assistant") => {
+          if (!String(block.text ?? "").trim()) return;
+          push({
+            role,
+            ts,
+            text: String(block.text),
+            blocks: [block],
+          });
+        };
+
+        if (type === "reasoning" || type === "plan" || type === "thinking") {
+          pushBlock({ type: "thinking", text: extractAnyText(item?.text ?? item?.summary ?? item) });
+          continue;
+        }
+        if (type === "message") {
+          const roleRaw = String(item?.role ?? "assistant").toLowerCase();
+          const role: "assistant" | "user" = roleRaw === "user" ? "user" : "assistant";
+          pushBlock({ type: "text", text: extractAnyText(item?.text ?? item?.content ?? item?.message ?? item) }, role);
+          continue;
+        }
+        if (type === "agent_message" || type === "assistant_message") {
+          pushBlock({ type: "text", text: extractAnyText(item?.text ?? item?.content ?? item?.message ?? item) });
+          continue;
+        }
+        if (
+          type === "command_execution" ||
+          type === "file_change" ||
+          type === "function_call" ||
+          type === "custom_tool_call" ||
+          type.endsWith("_call")
+        ) {
+          const name = extractNativeToolName(type, item);
+          const input = extractNativeToolInput(item);
+          pushBlock({ type: "tool_use", text: toolCallText(name, input), name, callId });
+          const output = extractNativeToolOutput(item);
+          if (output.trim()) pushBlock({ type: "tool_result", text: output, callId });
+          continue;
+        }
+        if (type === "function_call_output" || type === "custom_tool_call_output" || type.endsWith("_output") || type === "tool_result") {
+          pushBlock({ type: "tool_result", text: extractNativeToolOutput(item), callId });
+          continue;
+        }
+
+        const fallback = extractAnyText(item?.text ?? item?.content ?? item?.message ?? "");
+        if (fallback.trim()) pushBlock({ type: "text", text: fallback });
+      }
+    }
+  }
+
+  out.sort((a, b) => {
+    const dt = Number(a.ts ?? 0) - Number(b.ts ?? 0);
+    if (dt !== 0) return dt;
+    return Number(a._seq ?? 0) - Number(b._seq ?? 0);
+  });
+  return out.map(({ _seq: _ignored, ...msg }) => msg);
 }
 
 export function App() {
   const [authed, setAuthed] = useState<"unknown" | "yes" | "no">("unknown");
   const [token, setToken] = useState("");
-
-  const [tab, setTab] = useState<TabId>("workspace");
-  const [tools, setTools] = useState<ToolId[]>(["codex", "claude", "opencode"]);
-  const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [doctor, setDoctor] = useState<Doctor | null>(null);
-
-  const [tool, setTool] = useState<ToolId>("codex");
-  const [profileId, setProfileId] = useState<string>("codex.default");
-  const [cwd, setCwd] = useState<string>("");
-  const [advanced, setAdvanced] = useState(false);
-
-  const [selectedWorkspaceKey, setSelectedWorkspaceKey] = useState<string | null>(() => {
-    const raw = lsGet("fyp_ws");
-    return raw ? String(raw) : null;
-  });
-  const [selectedTreePath, setSelectedTreePath] = useState<string>(() => {
-    const ws = lsGet("fyp_ws");
-    const mapRaw = lsGet("fyp_tree_map");
-    if (ws && mapRaw) {
-      try {
-        const m = JSON.parse(mapRaw) as any;
-        const v = m && typeof m === "object" ? m[String(ws)] : null;
-        if (typeof v === "string") return v;
-      } catch {
-        // ignore
-      }
-    }
-    // Back-compat fallback (old single-key value).
-    const raw = lsGet("fyp_tree");
-    return raw ? String(raw) : "";
-  });
-  const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([]);
-  const [workspaceQuery, setWorkspaceQuery] = useState("");
-  const [inbox, setInbox] = useState<InboxItem[]>([]);
-  const [toolSessions, setToolSessions] = useState<ToolSessionSummary[]>([]);
-  const [toolSessionsLoading, setToolSessionsLoading] = useState(false);
-  const [toolSessionsMsg, setToolSessionsMsg] = useState<string | null>(null);
-
-  const [showToolChat, setShowToolChat] = useState(false);
-  const [toolChatSession, setToolChatSession] = useState<ToolSessionSummary | null>(null);
-  const [toolChatMessages, setToolChatMessages] = useState<ToolSessionMessage[]>([]);
-  const [toolChatLoading, setToolChatLoading] = useState(false);
-  const [toolChatMsg, setToolChatMsg] = useState<string | null>(null);
-  const [toolChatLimit, setToolChatLimit] = useState<number>(240);
-
-  // Codex Native (app-server) thread view
-  const [codexNativeThread, setCodexNativeThread] = useState<any | null>(null);
-  const [codexNativeLoading, setCodexNativeLoading] = useState(false);
-  const [codexNativeMsg, setCodexNativeMsg] = useState<string | null>(null);
-  const [codexNativeLive, setCodexNativeLive] = useState<{ kind: string; threadId: string; turnId: string; itemId: string; text: string } | null>(null);
-  const [codexNativeDiff, setCodexNativeDiff] = useState<string | null>(null);
-
-  const [slotCfg, setSlotCfg] = useState<{ slots: 3 | 4 | 6 }>(() => {
-    const raw = lsGet("fyp_slots");
-    const n = raw ? Number(raw) : 3;
-    return { slots: n === 6 ? 6 : n === 4 ? 4 : 3 };
-  });
-  const [autoPinNew, setAutoPinNew] = useState<boolean>(() => {
-    const raw = lsGet("fyp_autopin");
-    if (raw == null) return true;
-    return raw === "1" || raw === "true" || raw === "yes";
-  });
-
-  const [codexOpt, setCodexOpt] = useState(() => {
-    const rawTransport = lsGet("fyp_codex_transport");
-    const transport =
-      rawTransport === "pty" || rawTransport === "codex-app-server" ? rawTransport : "codex-app-server";
-    return {
-      transport,
-      sandbox: "",
-      askForApproval: "",
-      fullAuto: false,
-      bypassApprovalsAndSandbox: false,
-      search: false,
-      noAltScreen: true,
-      addDirText: "",
-    };
-  });
-  const [claudeOpt, setClaudeOpt] = useState({
-    permissionMode: "",
-    dangerouslySkipPermissions: false,
-    addDirText: "",
-  });
-  const [opencodeOpt, setOpenCodeOpt] = useState({
-    model: "",
-    agent: "",
-    prompt: "",
-    cont: false,
-    session: "",
-    fork: false,
-  });
-
-  const [sessions, setSessions] = useState<SessionRow[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const activeSession = useMemo(
-    () => (activeId ? sessions.find((s) => s.id === activeId) ?? null : null),
-    [activeId, sessions],
-  );
-  const activeIsCodexNative =
-    activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
-  const activeIsRawTerminal = Boolean(activeSession) && !activeIsCodexNative;
-  const activeSessionClosing = Boolean(activeSession?.closing);
-  const activeCanInput = useMemo(() => {
-    if (!activeSession) return false;
-    if (activeSessionClosing) return false;
-    if (activeIsCodexNative) return true;
-    // For PTY sessions, require the underlying process to be running.
-    return Boolean(activeSession.running);
-  }, [activeSession, activeSessionClosing, activeIsCodexNative]);
-  const activeToolSessionId = useMemo(() => {
-    const v = typeof activeSession?.toolSessionId === "string" ? String(activeSession.toolSessionId).trim() : "";
-    return v || "";
-  }, [activeSession?.toolSessionId]);
-  const activeCanOpenChatHistory =
-    !activeIsCodexNative &&
-    (activeSession?.tool === "codex" || activeSession?.tool === "claude" || activeSession?.tool === "opencode") &&
-    Boolean(activeToolSessionId);
-  const activeWorkspaceKey = (activeSession?.workspaceKey ?? selectedWorkspaceKey ?? null) as string | null;
-  const pinnedBySlot = useMemo(() => {
-    const out: Record<number, SessionRow> = {};
-    if (!activeWorkspaceKey) return out;
-    for (const s of sessions) {
-      const gk = String(s.workspaceKey ?? (s.cwd ? `dir:${s.cwd}` : `dir:${s.id}`));
-      if (gk !== activeWorkspaceKey) continue;
-      const slot = typeof s.pinnedSlot === "number" ? s.pinnedSlot : null;
-      if (!slot || slot < 1 || slot > 6) continue;
-      out[slot] = s;
-    }
-    return out;
-  }, [sessions, activeWorkspaceKey]);
-  const pinnedOrder = useMemo(() => {
-    const ids: string[] = [];
-    for (let i = 1; i <= slotCfg.slots; i++) {
-      const s = pinnedBySlot[i];
-      if (s?.id) ids.push(s.id);
-    }
-    return ids;
-  }, [pinnedBySlot, slotCfg.slots]);
-  const workspaceSessionsSorted = useMemo(() => {
-    const norm = (v: unknown): string => String(v ?? "").trim().replace(/\/+$/g, "");
-    const key = String(activeWorkspaceKey ?? "").trim();
-    const activeRoot = norm(activeSession?.workspaceRoot || activeSession?.treePath || activeSession?.cwd || "");
-    const byId = new Map<string, SessionRow>();
-
-    for (const s of sessions) {
-      const gk = String(s.workspaceKey ?? (s.cwd ? `dir:${s.cwd}` : `dir:${s.id}`));
-      let include = false;
-      if (key && gk === key) include = true;
-
-      if (!include && activeRoot) {
-        const roots = [s.workspaceRoot, s.treePath, s.cwd].map((x) => norm(x)).filter(Boolean);
-        include = roots.some((r) => r === activeRoot || r.startsWith(activeRoot + "/") || activeRoot.startsWith(r + "/"));
-      }
-
-      if (!include) continue;
-      const prev = byId.get(s.id);
-      if (!prev || Number(s.updatedAt ?? 0) >= Number(prev.updatedAt ?? 0)) byId.set(s.id, s);
-    }
-
-    return Array.from(byId.values()).sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
-  }, [sessions, activeWorkspaceKey, activeSession?.workspaceRoot, activeSession?.treePath, activeSession?.cwd]);
-  const workspaceSessionOrder = useMemo(
-    () => workspaceSessionsSorted.map((s) => s.id),
-    [workspaceSessionsSorted],
-  );
-  const fallbackSwitchOrder = useMemo(() => {
-    if (!activeSession) return [] as string[];
-    return sessions
-      .filter((s) => s.tool === activeSession.tool)
-      .slice()
-      .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0))
-      .map((s) => s.id);
-  }, [sessions, activeSession?.tool]);
-  const sessionSwitchOrder = useMemo(
-    () => {
-      const primary = pinnedOrder.length >= 2 ? pinnedOrder : workspaceSessionOrder;
-      if (primary.length >= 2) return primary;
-      if (fallbackSwitchOrder.length >= 2) return fallbackSwitchOrder;
-      return primary;
-    },
-    [pinnedOrder, workspaceSessionOrder, fallbackSwitchOrder],
-  );
-  const [composer, setComposer] = useState("");
-
-  const [showPicker, setShowPicker] = useState(false);
-  const [pickPath, setPickPath] = useState<string>("");
-  const [pickEntries, setPickEntries] = useState<{ name: string; path: string; kind: string }[]>([]);
-  const [pickParent, setPickParent] = useState<string | null>(null);
-  const [pickShowHidden, setPickShowHidden] = useState(false);
-
-  const [showConfig, setShowConfig] = useState(false);
-  const [configToml, setConfigToml] = useState("");
-  const [configMsg, setConfigMsg] = useState<string | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
-  const [showLog, setShowLog] = useState(false);
-  const [showControls, setShowControls] = useState(false);
-  const [labelDraft, setLabelDraft] = useState("");
-  const [events, setEvents] = useState<EventItem[]>([]);
-  const [tuiAssist, setTuiAssist] = useState<TuiAssist | null>(null);
-  const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>([]);
-  const [workspacePreset, setWorkspacePreset] = useState<{ profileId: string; overrides: any } | null>(null);
-  const [presetMsg, setPresetMsg] = useState<string | null>(null);
-  const [autoPreset, setAutoPreset] = useState(true);
-  const [savePreset, setSavePreset] = useState(true);
   const [pairCode, setPairCode] = useState("");
-  const [pairInfo, setPairInfo] = useState<{ code: string; url: string; expiresAt: number } | null>(null);
   const [pairMsg, setPairMsg] = useState<string | null>(null);
   const [unlockMsg, setUnlockMsg] = useState<string | null>(null);
 
-  const [showModelPicker, setShowModelPicker] = useState(false);
-  const [modelProvider, setModelProvider] = useState<string>("opencode");
-  const [modelQuery, setModelQuery] = useState<string>("");
-  const [modelList, setModelList] = useState<string[]>([]);
-  const [modelListMsg, setModelListMsg] = useState<string | null>(null);
-  const [modelLoading, setModelLoading] = useState(false);
+  const [tab, setTab] = useState<"inbox" | "workspace" | "run" | "new" | "settings">("inbox");
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
 
-  const termRef = useRef<HTMLDivElement | null>(null);
-  const runSurfaceRef = useRef<HTMLDivElement | null>(null);
-  const composerRef = useRef<HTMLTextAreaElement | null>(null);
-  const term = useRef<XTermTerminal | null>(null);
-  const fit = useRef<XTermFitAddon | null>(null);
-  const roRef = useRef<ResizeObserver | null>(null);
-  const termInit = useRef<Promise<void> | null>(null);
-  const termInitFailAt = useRef<number>(0);
-  const ttyResizeCtl = useRef<{
-    last: { cols: number; rows: number } | null;
-    raf: number;
-    timers: any[];
-    badFits: number;
-    badAt: number;
-  }>({
-    last: null,
-    raf: 0,
-    timers: [],
-    badFits: 0,
-    badAt: 0,
-  });
-  const nativeChatRef = useRef<HTMLDivElement | null>(null);
-  const ws = useRef<WebSocket | null>(null);
-  const globalWs = useRef<WebSocket | null>(null);
-  const connectedSessionId = useRef<string | null>(null);
-  const pendingInputBySession = useRef<Record<string, string[]>>({});
-  const termOutBuf = useRef<{ chunks: string[]; bytes: number; timer: any } | null>(null);
-  const termReplay = useRef<{ sessionId: string | null; inProgress: boolean }>({ sessionId: null, inProgress: false });
-  const selectedWorkspaceKeyRef = useRef<string | null>(null);
-  const activeIdRef = useRef<string | null>(null);
-  const tabRef = useRef<TabId>("workspace");
-  const authedRef = useRef<"unknown" | "yes" | "no">("unknown");
-  const dismissedAssistSig = useRef<string>("");
-  const sessionCtl = useRef<{ id: string | null; attempt: number; timer: any; ping: any }>({ id: null, attempt: 0, timer: null, ping: null });
-  const globalCtl = useRef<{ attempt: number; timer: any; ping: any }>({ attempt: 0, timer: null, ping: null });
+  const [doctor, setDoctor] = useState<Doctor | null>(null);
+  const [features, setFeatures] = useState<{ terminalModeEnabled?: boolean }>({});
+  const [sessions, setSessions] = useState<SessionRow[]>([]);
+  const [tasks, setTasks] = useState<TaskCard[]>([]);
+  const [inbox, setInbox] = useState<InboxItem[]>([]);
 
-  const [sessionWsState, setSessionWsState] = useState<"closed" | "connecting" | "open">("closed");
+  const [toolSession, setToolSession] = useState<ToolSessionSummary | null>(null);
+  const [toolMessages, setToolMessages] = useState<ToolSessionMessage[]>([]);
+  const [toolMessagesSourceKey, setToolMessagesSourceKey] = useState("");
+  const [nativeThreadMessages, setNativeThreadMessages] = useState<ToolSessionMessage[]>([]);
+  const [nativeMessagesSourceKey, setNativeMessagesSourceKey] = useState("");
+  const [nativeLiveBlock, setNativeLiveBlock] = useState<ToolSessionMessageBlock | null>(null);
+  const [pendingEchoes, setPendingEchoes] = useState<PendingEcho[]>([]);
+  const [composerText, setComposerText] = useState("");
+  const [sendBusy, setSendBusy] = useState(false);
+  const [runMsg, setRunMsg] = useState<string | null>(null);
+  const [runLaunchMsg, setRunLaunchMsg] = useState<string | null>(null);
   const [globalWsState, setGlobalWsState] = useState<"closed" | "connecting" | "open">("closed");
-  const [online, setOnline] = useState<boolean>(() => (typeof navigator !== "undefined" ? navigator.onLine : true));
-  const [fontSize, setFontSize] = useState<number>(() => {
-    const v = lsGet("fyp_font");
-    // Phone-first default: smaller font gives more columns so TUIs wrap less.
-    const n = v ? Number(v) : isPhoneLikeDevice() ? 13 : 15;
-    return Number.isFinite(n) ? Math.min(22, Math.max(11, n)) : 15;
+  const activeSessionWsRef = useRef<WebSocket | null>(null);
+  const activeToolSessionKeyRef = useRef("");
+  const activeNativeThreadKeyRef = useRef("");
+  const refreshDebounceTimerRef = useRef<any>(null);
+  const orchestrationProgressPullAtRef = useRef<Record<string, number>>({});
+
+  const [createObjective, setCreateObjective] = useState("");
+  const [createProjectPath, setCreateProjectPath] = useState("");
+  const [soloTool, setSoloTool] = useState<ToolId>("claude");
+  const [soloProfile, setSoloProfile] = useState("claude.default");
+  const [soloModel, setSoloModel] = useState("");
+  const [manualAgentModels, setManualAgentModels] = useState<Record<number, string>>({});
+  const [autoOrchestratorModel, setAutoOrchestratorModel] = useState("");
+  const [autoWorkerModels, setAutoWorkerModels] = useState<Record<number, string>>({});
+  const [soloCwd, setSoloCwd] = useState("");
+  const [createBusy, setCreateBusy] = useState<null | "orchestration" | "session" | "analyzing">(null);
+  const [createMsg, setCreateMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [syncMsg, setSyncMsg] = useState<string | null>(null);
+  const [taskActionMsg, setTaskActionMsg] = useState<string | null>(null);
+  const [removeBusyKey, setRemoveBusyKey] = useState<string | null>(null);
+  const [progressMetaOpen, setProgressMetaOpen] = useState<Record<string, boolean>>({});
+  const [orchestrationProgressByTask, setOrchestrationProgressByTask] = useState<Record<string, OrchestrationProgressItem>>({});
+  const [showOrchestrationCommands, setShowOrchestrationCommands] = useState(false);
+  const [newMode, setNewMode] = useState<"smart" | "manual">("smart");
+  const [selectedPreset, setSelectedPreset] = useState<string>("solo");
+  const selectedPresetDef = useMemo(() => PRESETS.find(p => p.id === selectedPreset) ?? PRESETS[0]!, [selectedPreset]);
+  const [configProfiles, setConfigProfiles] = useState<ProfileOption[]>([]);
+  const [customOrchestratorTool, setCustomOrchestratorTool] = useState<ToolId>("codex");
+  const [customOrchestratorProfile, setCustomOrchestratorProfile] = useState("codex.default");
+  const [customOrchestratorModel, setCustomOrchestratorModel] = useState("");
+  const [customTeamAutomationMode, setCustomTeamAutomationMode] = useState<CustomTeamAutomationMode>("guided");
+  const [customTeamQuestionTimeoutMs, setCustomTeamQuestionTimeoutMs] = useState<number>(120_000);
+  const [customTeamReviewIntervalMs, setCustomTeamReviewIntervalMs] = useState<number>(60_000);
+  const [customTeamYoloMode, setCustomTeamYoloMode] = useState(false);
+  const [customWorkerGroups, setCustomWorkerGroups] = useState<CustomWorkerGroup[]>([
+    makeCustomWorkerGroup({
+      tool: "codex",
+      profileId: "codex.default",
+      count: 2,
+      role: "debug",
+      taskTemplate: "Debug backend behavior and implement focused fixes for: {objective}",
+    }),
+  ]);
+  const [budget, setBudget] = useState<"low" | "balanced" | "high">("balanced");
+  const [recommendation, setRecommendation] = useState<any | null>(null);
+  const [dirPickerOpen, setDirPickerOpen] = useState(false);
+  const [dirPickerTarget, setDirPickerTarget] = useState<DirectoryPickerTarget | null>(null);
+  const [dirPickerPath, setDirPickerPath] = useState("");
+  const [dirPickerParent, setDirPickerParent] = useState<string | null>(null);
+  const [dirPickerEntries, setDirPickerEntries] = useState<Array<{ name: string; path: string; kind: "dir" | "file" }>>([]);
+  const [dirPickerShowHidden, setDirPickerShowHidden] = useState(false);
+  const [dirPickerBusy, setDirPickerBusy] = useState(false);
+  const [dirPickerMsg, setDirPickerMsg] = useState<string | null>(null);
+  const [pathPrivacyMode, setPathPrivacyMode] = useState<PathPrivacyMode>(() => {
+    const saved = lsGet(PATH_PRIVACY_MODE_KEY);
+    return saved === "share" ? "share" : "full";
   });
-  const [lineHeight, setLineHeight] = useState<number>(() => {
-    const v = lsGet("fyp_lh");
-    const n = v ? Number(v) : isPhoneLikeDevice() ? 1.52 : 1.4;
-    return Number.isFinite(n) ? Math.min(1.9, Math.max(1.1, n)) : isPhoneLikeDevice() ? 1.52 : 1.4;
+  const [claudeAutoTrustShareMode, setClaudeAutoTrustShareMode] = useState<boolean>(() => {
+    const saved = lsGet(CLAUDE_SHARE_TRUST_KEY);
+    if (saved == null) return true;
+    return saved !== "0";
   });
 
-  const orderedProfiles = useMemo(() => {
-    const base = profiles.filter((p) => p.tool === tool);
-    const prio: Record<string, number> =
-      tool === "codex"
-        ? {
-            "codex.default": 0,
-            "codex.plan": 1,
-            "codex.full_auto": 2,
-            "codex.danger": 3,
-          }
-        : tool === "claude"
-          ? {
-              "claude.default": 0,
-              "claude.plan": 1,
-              "claude.accept_edits": 2,
-              "claude.bypass_plan": 3,
-            }
-          : {
-              "opencode.default": 0,
-              "opencode.plan_build": 1,
-            };
-    return base
-      .slice()
-      .sort((a, b) => (prio[a.id] ?? 999) - (prio[b.id] ?? 999) || a.title.localeCompare(b.title));
-  }, [profiles, tool]);
-  const selectedProfile = useMemo(() => profiles.find((p) => p.id === profileId) ?? null, [profiles, profileId]);
-  const recentForPicker = useMemo(() => recentWorkspaces.map((r) => r.path).filter(Boolean).slice(0, 8), [recentWorkspaces]);
-  const mergedWorkspaces = useMemo(() => {
-    const norm = (v: string) => String(v || "").trim().replace(/\/+$/g, "");
-    const byRoot = new Map<string, WorkspaceItem>();
-
-    for (const w of workspaces) {
-      const rootNorm = norm(String(w.root || ""));
-      const mergeKey = rootNorm || String(w.key || "");
-      const prev = byRoot.get(mergeKey);
-      if (!prev) {
-        byRoot.set(mergeKey, {
-          ...w,
-          trees: Array.isArray(w.trees) ? [...w.trees] : [],
-          sessions: Array.isArray(w.sessions) ? [...w.sessions] : [],
-        });
-        continue;
-      }
-
-      const out: WorkspaceItem = {
-        ...prev,
-        trees: Array.isArray(prev.trees) ? [...prev.trees] : [],
-        sessions: Array.isArray(prev.sessions) ? [...prev.sessions] : [],
-      };
-
-      const prevIsDir = String(prev.key || "").startsWith("dir:");
-      const curIsDir = String(w.key || "").startsWith("dir:");
-      if (prevIsDir && !curIsDir) out.key = w.key;
-
-      if ((!prev.root || prev.root === "(unknown)") && w.root && w.root !== "(unknown)") out.root = w.root;
-      out.isGit = Boolean(prev.isGit || w.isGit);
-
-      const treeMap = new Map<string, any>();
-      for (const t of [...(prev.trees ?? []), ...(w.trees ?? [])]) {
-        const p = String((t as any)?.path ?? "");
-        if (!p) continue;
-        treeMap.set(p, t);
-      }
-      out.trees = Array.from(treeMap.values());
-
-      const sessMap = new Map<string, SessionRow>();
-      for (const s of [...(prev.sessions ?? []), ...(w.sessions ?? [])]) {
-        const sid = String((s as any)?.id ?? "");
-        if (!sid) continue;
-        const cur = sessMap.get(sid);
-        if (!cur || Number((s as any)?.updatedAt ?? 0) >= Number((cur as any)?.updatedAt ?? 0)) {
-          sessMap.set(sid, s as SessionRow);
-        }
-      }
-      out.sessions = Array.from(sessMap.values()).sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
-      out.lastUsed = Math.max(Number(prev.lastUsed ?? 0), Number(w.lastUsed ?? 0), ...out.sessions.map((s) => Number(s.updatedAt ?? 0)));
-
-      byRoot.set(mergeKey, out);
-    }
-
-    return Array.from(byRoot.values()).sort((a, b) => Number(b.lastUsed ?? 0) - Number(a.lastUsed ?? 0));
-  }, [workspaces]);
-  const filteredWorkspaces = useMemo(() => {
-    const q = workspaceQuery.trim().toLowerCase();
-    if (!q) return mergedWorkspaces;
-    return mergedWorkspaces.filter((w) => String(w.root).toLowerCase().includes(q) || String(w.key).toLowerCase().includes(q));
-  }, [workspaceQuery, mergedWorkspaces]);
-
-  async function ensureTerminalReady(): Promise<void> {
-    if (term.current && fit.current) return;
-    if (termInit.current) return termInit.current;
-    termInit.current = (async () => {
-      const el = termRef.current;
-      if (!el) return;
-
-      const [{ Terminal }, { FitAddon }] = await Promise.all([
-        import("@xterm/xterm"),
-        import("@xterm/addon-fit"),
-      ]);
-
-      const el2 = termRef.current;
-      if (!el2) return;
-      if (term.current) return;
-
-      // Best-effort: wait for web fonts so xterm measures cell height correctly.
-      // This reduces "lines clipping into each other" on some mobile browsers.
-      try {
-        const fonts: any = (document as any).fonts;
-        if (fonts && typeof fonts.ready?.then === "function") {
-          await Promise.race([
-            fonts.ready,
-            new Promise((r) => setTimeout(r, 700)),
-          ]);
-        }
-      } catch {
-        // ignore
-      }
-
-      const monoStack = (() => {
-        try {
-          const v = getComputedStyle(document.documentElement).getPropertyValue("--mono").trim();
-          return v || "\"IBM Plex Mono\", ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Monaco, Consolas, monospace";
-        } catch {
-          return "\"IBM Plex Mono\", ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Monaco, Consolas, monospace";
-        }
-      })();
-      const isPhoneLike = isPhoneLikeDevice();
-      const safeFontSize = fontSize;
-      const safeLineHeight = lineHeight;
-
-      const t = new Terminal({
-        cursorBlink: true,
-        // Canvas renderer is more consistent across mobile browsers and avoids a class of
-        // DOM renderer measurement glitches that can lead to "vertical text" artifacts.
-        // (xterm v6 types don't include rendererType even though it's supported at runtime.)
-        rendererType: "canvas",
-        fontFamily: monoStack,
-        fontSize: safeFontSize,
-        lineHeight: safeLineHeight,
-        theme: {
-          background: "#060810",
-          foreground: "#e4eaf4",
-          cursor: "#f5a623",
-          selectionBackground: "rgba(148,163,184,.14)",
-          selectionForeground: "#eaf0fa",
-        },
-        scrollback: 8000,
-        allowTransparency: !isPhoneLike,
-        rightClickSelectsWord: false,
-      } as any);
-      try {
-        (t.options as any).customGlyphs = !isPhoneLike;
-      } catch {
-        // ignore
-      }
-      const f = new FitAddon();
-      t.loadAddon(f);
-      t.open(el2);
-      try {
-        f.fit();
-      } catch {
-        // ignore
-      }
-      try {
-        t.refresh(0, Math.max(0, t.rows - 1));
-      } catch {
-        // ignore
-      }
-      term.current = t;
-      fit.current = f;
-
-      // If the web font loads after xterm mounts (slow mobile networks), the initial measurements
-      // can be wrong and cause vertical clipping. Re-fit once fonts settle.
-      try {
-        const fonts: any = (document as any).fonts;
-        if (fonts && typeof fonts.ready?.then === "function") {
-          fonts.ready.then(() => {
-            if (term.current !== t) return;
-            try {
-              f.fit();
-              t.refresh(0, Math.max(0, t.rows - 1));
-            } catch {
-              // ignore
-            }
-          });
-        }
-      } catch {
-        // ignore
-      }
-
-      try {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            fit.current?.fit();
-            t.refresh(0, Math.max(0, t.rows - 1));
-          });
-        });
-      } catch {
-        // ignore
-      }
-
-      // Make the terminal interactive: forward keystrokes to the remote PTY.
-      t.onData((data) => {
-        if (!ws.current || ws.current.readyState !== WebSocket.OPEN || !connectedSessionId.current) return;
-        // Filter out focus tracking sequences which can confuse some TUIs.
-        const filtered = String(data ?? "").replace(/\x1b\[\[?[IO]/g, "");
-        if (!filtered) return;
-        ws.current.send(JSON.stringify({ type: "input", text: filtered }));
-      });
-
-      roRef.current?.disconnect();
-      roRef.current = new ResizeObserver(() => {
-        scheduleFitAndResize({});
-      });
-      roRef.current.observe(el2);
-    })()
-      .catch((e) => {
-        // Terminal load failures should not "black screen" the whole app.
-        // We show a toast (rate-limited) and keep the rest of the UI usable.
-        try {
-          const now = Date.now();
-          if (now - termInitFailAt.current > 1800) {
-            termInitFailAt.current = now;
-            const msg = typeof (e as any)?.message === "string" ? String((e as any).message) : "";
-            setToast(msg ? `Terminal failed to load: ${msg}` : "Terminal failed to load. Try refreshing.");
-          }
-        } catch {
-          // ignore
-        }
-      })
-      .finally(() => {
-        termInit.current = null;
-      });
-    return termInit.current;
-  }
-
-  function normalizeTtySize(cols: number, rows: number): { cols: number; rows: number } | null {
-    const c = Math.floor(Number(cols));
-    const r = Math.floor(Number(rows));
-    if (!Number.isFinite(c) || !Number.isFinite(r)) return null;
-    // Ignore pathological values which can break PTY rendering (e.g. 1-3 columns => "vertical text").
-    if (c < 12 || r < 6) return null;
-    return { cols: Math.min(400, c), rows: Math.min(220, r) };
-  }
-
-  function canFitNow(): boolean {
-    if (tabRef.current !== "run") return false;
-    if (activeIsCodexNative) return false;
-    const el = runSurfaceRef.current ?? termRef.current;
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    // `hidden` sections report 0x0; avoid fitting in that state.
-    if (rect.width < 160 || rect.height < 120) return false;
-    return true;
-  }
-
-  function scheduleFitAndResize(opts: { force?: boolean; burst?: boolean } = {}) {
-    const ctl = ttyResizeCtl.current;
-    const force = Boolean(opts.force);
-    const burst = Boolean(opts.burst);
-
-    const repairIfBad = () => {
-      // If xterm ever ends up at 1-3 columns, the UI looks like "vertical text".
-      // This can happen transiently during layout/keyboard transitions (esp. iOS Safari).
-      // Even if we can't safely fit right now, we should never leave the terminal in a pathological size.
-      if (!term.current) return;
-      const cur = normalizeTtySize(term.current.cols, term.current.rows);
-      if (cur) return;
-      const restore = ctl.last ?? { cols: 100, rows: 30 };
-      try {
-        term.current.resize(restore.cols, restore.rows);
-        term.current.refresh(0, Math.max(0, term.current.rows - 1));
-      } catch {
-        // ignore
-      }
-      if (!ctl.last) ctl.last = restore;
-    };
-
-    const runOnce = () => {
-      if (!term.current || !fit.current) return;
-      if (!canFitNow()) return;
-      const before = { cols: term.current.cols, rows: term.current.rows };
-      try {
-        fit.current.fit();
-      } catch {
-        // ignore
-      }
-
-      const norm = normalizeTtySize(term.current.cols, term.current.rows);
-      if (!norm) {
-        // xterm-fit can occasionally measure a tiny width/huge cell size during layout transitions,
-        // resulting in a 1-3 column terminal ("vertical text"). Never leave the terminal in that state:
-        // revert to the last known-good size and retry a few times.
-        const now = Date.now();
-        if (!ctl.badAt || now - ctl.badAt > 1500) ctl.badFits = 0;
-        ctl.badAt = now;
-        ctl.badFits += 1;
-
-        const restore =
-          ctl.last ??
-          normalizeTtySize(before.cols, before.rows) ??
-          {
-            cols: 100,
-            rows: 30,
-          };
-        try {
-          term.current.resize(restore.cols, restore.rows);
-          term.current.refresh(0, Math.max(0, term.current.rows - 1));
-        } catch {
-          // ignore
-        }
-
-        if (ctl.badFits <= 4) {
-          const t = setTimeout(() => scheduleFitAndResize({ force: true, burst: false }), 80);
-          ctl.timers.push(t);
-        }
-        return;
-      }
-
-      ctl.badFits = 0;
-      ctl.badAt = 0;
-      try {
-        term.current.refresh(0, Math.max(0, term.current.rows - 1));
-      } catch {
-        // ignore
-      }
-      if (!force && ctl.last && ctl.last.cols === norm.cols && ctl.last.rows === norm.rows) return;
-      ctl.last = norm;
-
-      if (ws.current && ws.current.readyState === WebSocket.OPEN && connectedSessionId.current) {
-        try {
-          ws.current.send(JSON.stringify({ type: "resize", cols: norm.cols, rows: norm.rows }));
-        } catch {
-          // ignore
-        }
-      }
-    };
-
-    if (ctl.raf) cancelAnimationFrame(ctl.raf);
-    ctl.raf = requestAnimationFrame(() => {
-      ctl.raf = 0;
-      if (!canFitNow()) {
-        repairIfBad();
-        return;
-      }
-      runOnce();
-    });
-
-    if (burst) {
-      try {
-        for (const t of ctl.timers) clearTimeout(t);
-      } catch {
-        // ignore
-      }
-      ctl.timers = [];
-      // Layout + font metrics can stabilize over a few frames; refit a couple more times.
-      for (const d of [60, 220]) {
-        const t = setTimeout(() => scheduleFitAndResize({ force, burst: false }), d);
-        ctl.timers.push(t);
-      }
-    }
-  }
-
-  async function loadWorkspacePreset(pathStr: string, toolId: ToolId) {
-    if (!pathStr.trim()) {
-      setWorkspacePreset(null);
-      return;
-    }
-    try {
-      const r = await api<{ ok: true; preset: any | null }>(
-        `/api/workspaces/preset?path=${encodeURIComponent(pathStr)}&tool=${encodeURIComponent(toolId)}`,
-      );
-      if (r.preset && typeof r.preset.profileId === "string") {
-        setWorkspacePreset({ profileId: r.preset.profileId, overrides: r.preset.overrides ?? {} });
-      } else {
-        setWorkspacePreset(null);
-      }
-    } catch {
-      setWorkspacePreset(null);
-    }
-  }
-
-  function applyPresetNow(p: { profileId: string; overrides: any }) {
-    setPresetMsg(null);
-    setProfileId(p.profileId);
-    const o = p.overrides ?? {};
-    if (tool === "codex" && o.codex) {
-      setCodexOpt((prev) => ({
-        ...prev,
-        sandbox: typeof o.codex.sandbox === "string" ? o.codex.sandbox : prev.sandbox,
-        askForApproval: typeof o.codex.askForApproval === "string" ? o.codex.askForApproval : prev.askForApproval,
-        fullAuto: typeof o.codex.fullAuto === "boolean" ? o.codex.fullAuto : prev.fullAuto,
-        bypassApprovalsAndSandbox:
-          typeof o.codex.bypassApprovalsAndSandbox === "boolean" ? o.codex.bypassApprovalsAndSandbox : prev.bypassApprovalsAndSandbox,
-        search: typeof o.codex.search === "boolean" ? o.codex.search : prev.search,
-        addDirText: Array.isArray(o.codex.addDir) ? o.codex.addDir.join("\n") : prev.addDirText,
-      }));
-    }
-    if (tool === "claude" && o.claude) {
-      setClaudeOpt((prev) => ({
-        ...prev,
-        permissionMode: typeof o.claude.permissionMode === "string" ? o.claude.permissionMode : prev.permissionMode,
-        dangerouslySkipPermissions:
-          typeof o.claude.dangerouslySkipPermissions === "boolean" ? o.claude.dangerouslySkipPermissions : prev.dangerouslySkipPermissions,
-        addDirText: Array.isArray(o.claude.addDir) ? o.claude.addDir.join("\n") : prev.addDirText,
-      }));
-    }
-    if (tool === "opencode" && o.opencode) {
-      setOpenCodeOpt((prev) => ({
-        ...prev,
-        agent: typeof o.opencode.agent === "string" ? o.opencode.agent : prev.agent,
-        prompt: typeof o.opencode.prompt === "string" ? o.opencode.prompt : prev.prompt,
-        cont: typeof o.opencode.continue === "boolean" ? o.opencode.continue : prev.cont,
-        session: typeof o.opencode.session === "string" ? o.opencode.session : prev.session,
-        fork: typeof o.opencode.fork === "boolean" ? o.opencode.fork : prev.fork,
-      }));
-    }
-    setPresetMsg("Applied workspace defaults");
-  }
-
-  async function refreshSessions(): Promise<SessionRow[] | null> {
-    try {
-      const rows = await api<SessionRow[]>("/api/sessions");
-      setSessions(rows);
-      // Keep the UI stable: if the current active session was deleted, fall back to the newest session (or none).
-      setActiveId((prev) => {
-        if (prev && rows.some((s) => s.id === prev)) return prev;
-        return rows.length > 0 ? rows[0]!.id : null;
-      });
-      return rows;
-    } catch {
-      // ignore
-      return null;
-    }
-  }
-
-  async function refreshRecentWorkspaces() {
-    try {
-      const r = await api<{ ok: true; items: RecentWorkspace[] }>("/api/workspaces/recent?limit=12");
-      setRecentWorkspaces(r.items ?? []);
-      const most = String(r.items?.[0]?.path ?? "");
-      // Friendly default: if user hasn't typed anything, start from the most recent workspace.
-      if (most) setCwd((prev) => (prev.trim() ? prev : most));
-    } catch {
-      // ignore
-    }
-  }
-
-  async function refreshWorkspaces() {
-    try {
-      const r = await api<{ ok: true; items: WorkspaceItem[] }>("/api/workspaces");
-      setWorkspaces(r.items ?? []);
-      const cur = selectedWorkspaceKeyRef.current ?? selectedWorkspaceKey;
-      if (cur && r.items?.some((w) => String(w.key) === String(cur))) return;
-      if (r.items?.[0]?.key ?? "") setSelectedWorkspaceKey(String(r.items[0]!.key));
-    } catch {
-      // ignore
-    }
-  }
-
-  async function refreshInbox(opts?: { workspaceKey?: string | null; sessionId?: string | null }) {
-    const qs = new URLSearchParams();
-    if (opts?.workspaceKey) qs.set("workspaceKey", String(opts.workspaceKey));
-    if (opts?.sessionId) qs.set("sessionId", String(opts.sessionId));
-    try {
-      const r = await api<{ ok: true; items: InboxItem[] }>(`/api/inbox?${qs.toString()}`);
-      setInbox(r.items ?? []);
-    } catch {
-      // ignore
-    }
-  }
-
-  async function refreshToolSessions(opts?: { under?: string; refresh?: boolean }) {
-    const under = typeof opts?.under === "string" ? opts.under.trim() : "";
-    const refresh = Boolean(opts?.refresh);
-    setToolSessionsMsg(null);
-    setToolSessionsLoading(true);
-    try {
-      const qs = new URLSearchParams();
-      if (under) qs.set("under", under);
-      if (refresh) qs.set("refresh", "1");
-      const r = await api<{ ok: true; items: ToolSessionSummary[] }>(`/api/tool-sessions?${qs.toString()}`);
-      setToolSessions(Array.isArray(r.items) ? r.items : []);
-    } catch (e: any) {
-      setToolSessions([]);
-      setToolSessionsMsg(typeof e?.message === "string" ? e.message : "failed to load tool sessions");
-    } finally {
-      setToolSessionsLoading(false);
-    }
-  }
+  const defaultWorkspacePath = useMemo(
+    () => doctor?.process?.cwd || doctor?.workspaceRoots?.[0] || "",
+    [doctor],
+  );
+  const userHomePrefix = useMemo(
+    () =>
+      detectUserHomePrefix([
+        doctor?.process?.cwd,
+        ...(doctor?.workspaceRoots ?? []),
+        ...sessions.map((s) => s.cwd || ""),
+      ]),
+    [doctor, sessions],
+  );
+  const formatDisplayPath = useCallback(
+    (pathRaw: string | null | undefined) => formatPathForUi(pathRaw, pathPrivacyMode, userHomePrefix),
+    [pathPrivacyMode, userHomePrefix],
+  );
+  const formatDisplayPathTail = useCallback(
+    (pathRaw: string | null | undefined, segments = 2) => {
+      const shown = formatDisplayPath(pathRaw);
+      if (!shown) return "";
+      if (shown === "~") return shown;
+      const normalized = shown.replace(/\\/g, "/");
+      const parts = normalized.split("/").filter(Boolean);
+      if (parts.length === 0) return shown;
+      const tail = parts.slice(-Math.max(1, segments)).join("/");
+      if (normalized.startsWith("~/")) return `~/${tail}`;
+      return tail;
+    },
+    [formatDisplayPath],
+  );
 
   useEffect(() => {
-    // Mobile soft keyboard handling:
-    // When the keyboard opens, the VisualViewport shrinks (esp. iOS Safari).
-    // We expose the inset as a CSS var so the bottom UI doesn't get clipped.
-    const root = document.documentElement;
-    let raf = 0;
+    lsSet(PATH_PRIVACY_MODE_KEY, pathPrivacyMode);
+  }, [pathPrivacyMode]);
+  useEffect(() => {
+    lsSet(CLAUDE_SHARE_TRUST_KEY, claudeAutoTrustShareMode ? "1" : "0");
+  }, [claudeAutoTrustShareMode]);
 
-    const update = () => {
-      if (raf) cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        try {
-          const vv: any = (window as any).visualViewport;
-          const layoutH = window.innerHeight;
-          const vvHeight = typeof vv?.height === "number" ? vv.height : layoutH;
-          // iOS Safari can report non-zero offsetTop during address-bar transitions/zoom.
-          // Using it here causes false "keyboard closed" states, so we ignore it.
-          const kb = Math.max(0, layoutH - vvHeight);
-          root.style.setProperty("--kb", `${Math.round(kb)}px`);
-          if (kb > 30) root.dataset.kb = "1";
-          else delete root.dataset.kb;
-        } catch {
-          // ignore
-        }
-      });
-    };
+  const claudeSupportsDangerousSkip = Boolean((doctor?.tools as any)?.claude?.supports?.dangerouslySkipPermissions);
+  const shareModeAutoTrustClaude = pathPrivacyMode === "share" && claudeAutoTrustShareMode && claudeSupportsDangerousSkip;
+  const shareModeClaudeOverridesForTool = useCallback(
+    (tool: ToolId) => {
+      if (!shareModeAutoTrustClaude || tool !== "claude") return {};
+      return { claude: { dangerouslySkipPermissions: true } };
+    },
+    [shareModeAutoTrustClaude],
+  );
+  const withShareModeClaudeTrust = useCallback(
+    (tool: ToolId, baseOverrides: any) => mergeToolOverrides(baseOverrides, shareModeClaudeOverridesForTool(tool)),
+    [shareModeClaudeOverridesForTool],
+  );
 
-    const vv: any = (window as any).visualViewport;
-    update();
-    vv?.addEventListener?.("resize", update);
-    vv?.addEventListener?.("scroll", update);
-    window.addEventListener("resize", update);
-    window.addEventListener("orientationchange", update);
-    return () => {
-      if (raf) cancelAnimationFrame(raf);
-      vv?.removeEventListener?.("resize", update);
-      vv?.removeEventListener?.("scroll", update);
-      window.removeEventListener("resize", update);
-      window.removeEventListener("orientationchange", update);
-    };
-  }, []);
+  const customTeamAutomationPayload = useMemo(() => {
+    const mode = customTeamAutomationMode;
+    const steeringMode =
+      mode === "autopilot"
+        ? "active_steering"
+        : mode === "guided"
+          ? "passive_review"
+          : "off";
+    return {
+      questionMode: mode === "manual" ? "off" : "orchestrator",
+      steeringMode,
+      questionTimeoutMs: Math.max(30_000, Math.floor(customTeamQuestionTimeoutMs || 120_000)),
+      reviewIntervalMs: Math.max(30_000, Math.floor(customTeamReviewIntervalMs || 60_000)),
+      yoloMode: customTeamYoloMode,
+    } as const;
+  }, [customTeamAutomationMode, customTeamQuestionTimeoutMs, customTeamReviewIntervalMs, customTeamYoloMode]);
 
+  // Boot: detect token/pair from URL
   useEffect(() => {
     const u = new URL(window.location.href);
-    const t = u.searchParams.get("token");
-    const pair = u.searchParams.get("pair");
-    if (t) {
-      u.searchParams.delete("token");
-      window.history.replaceState({}, "", u.toString());
-    }
+    const bootQuery = (((window as any).__FYP_BOOT_QUERY ?? {}) as { token?: string; pair?: string }) || {};
+    const t = u.searchParams.get("token") || (typeof bootQuery.token === "string" ? bootQuery.token : "");
+    const pair = u.searchParams.get("pair") || (typeof bootQuery.pair === "string" ? bootQuery.pair : "");
+    if ((window as any).__FYP_BOOT_QUERY) (window as any).__FYP_BOOT_QUERY = { token: "", pair: "" };
+    if (t) { u.searchParams.delete("token"); window.history.replaceState({}, "", u.toString()); }
     if (pair) {
       u.searchParams.delete("pair");
       window.history.replaceState({}, "", u.toString());
       (async () => {
         try {
-          await api("/api/auth/pair/claim", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ code: pair }),
-          });
+          await api("/api/auth/pair/claim", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: pair }) });
           window.location.reload();
         } catch {
           setAuthed("no");
-          setPairMsg("Pair link expired or invalid. Generate a new one from host.");
+          setPairMsg("Pair link expired or invalid.");
         }
       })();
       return;
     }
-
     (async () => {
       try {
-        await api("/api/doctor" + (t ? `?token=${encodeURIComponent(t)}` : ""));
+        const d = await api<Doctor>("/api/doctor", t ? { headers: { "x-fyp-token": t } } : undefined);
+        setDoctor(d);
         setAuthed("yes");
-      } catch {
+      } catch (e: any) {
         setAuthed("no");
+        if (typeof e?.message === "string" && e.message !== "unauthorized") {
+          setUnlockMsg(`Connection failed: ${e.message}`);
+        }
       }
     })();
   }, []);
 
-  useEffect(() => {
+  const refresh = useCallback(async () => {
     if (authed !== "yes") return;
-    (async () => {
-      const cfg = await api<{ tools: string[]; profiles: Profile[] }>("/api/config");
-      setTools(cfg.tools.filter(Boolean) as ToolId[]);
-      setProfiles(cfg.profiles);
-      if (cfg.profiles.some((p) => p.id === `${tool}.default`)) setProfileId(`${tool}.default`);
-      await refreshSessions();
-      await refreshRecentWorkspaces();
-
-      const d = await api<Doctor>("/api/doctor");
-      setDoctor(d);
-
-      setCodexOpt((p) => ({
-        ...p,
-        sandbox: d.tools.codex.sandboxModes?.includes("read-only")
-          ? "read-only"
-          : d.tools.codex.sandboxModes?.includes("workspace-write")
-            ? "workspace-write"
-            : (d.tools.codex.sandboxModes?.[0] ?? ""),
-        askForApproval: d.tools.codex.approvalPolicies?.includes("on-request") ? "on-request" : (d.tools.codex.approvalPolicies?.[0] ?? ""),
-      }));
-      setClaudeOpt((p) => ({
-        ...p,
-        permissionMode: d.tools.claude.permissionModes?.includes("default") ? "default" : (d.tools.claude.permissionModes?.[0] ?? ""),
-      }));
-    })();
-  }, [authed]);
-
-  useEffect(() => {
-    // Persist the user's preferred Codex transport (Native vs Terminal).
-    // This is especially important on mobile where the default should be stable.
     try {
-      lsSet("fyp_codex_transport", String((codexOpt as any).transport ?? "codex-app-server"));
-    } catch {
-      // ignore
-    }
-  }, [String((codexOpt as any).transport ?? "")]);
-
-  useEffect(() => {
-    if (authed !== "yes") return;
-    if (!autoPreset) return;
-    const p = cwd.trim();
-    if (!p) return;
-    const t = setTimeout(() => loadWorkspacePreset(p, tool), 180);
-    return () => clearTimeout(t);
-  }, [cwd, tool, authed, autoPreset]);
-
-  useEffect(() => {
-    selectedWorkspaceKeyRef.current = selectedWorkspaceKey;
-  }, [selectedWorkspaceKey]);
-
-  useEffect(() => {
-    if (!selectedWorkspaceKey) return;
-    if (mergedWorkspaces.some((w) => String(w.key) === String(selectedWorkspaceKey))) return;
-    const first = String(mergedWorkspaces[0]?.key ?? "").trim();
-    if (first) setSelectedWorkspaceKey(first);
-  }, [selectedWorkspaceKey, mergedWorkspaces]);
-
-  useEffect(() => {
-    activeIdRef.current = activeId;
-  }, [activeId]);
-
-  useEffect(() => {
-    tabRef.current = tab;
-  }, [tab]);
-
-  useEffect(() => {
-    authedRef.current = authed;
-  }, [authed]);
-
-  useEffect(() => {
-    const on = () => setOnline(true);
-    const off = () => setOnline(false);
-    window.addEventListener("online", on);
-    window.addEventListener("offline", off);
-    return () => {
-      window.removeEventListener("online", on);
-      window.removeEventListener("offline", off);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (authed !== "yes") return;
-    // Mobile browsers frequently suspend background tabs and can leave websockets half-open.
-    // When the app becomes visible again, force a clean reconnect.
-    const onVis = () => {
-      try {
-        if (document.hidden) return;
-      } catch {
-        // ignore
-      }
-      try {
-        globalWs.current?.close();
-      } catch {
-        // ignore
-      }
-      try {
-        ws.current?.close();
-      } catch {
-        // ignore
-      }
-    };
-    document.addEventListener("visibilitychange", onVis);
-    return () => document.removeEventListener("visibilitychange", onVis);
-  }, [authed]);
-
-  useEffect(() => {
-    if (selectedWorkspaceKey) lsSet("fyp_ws", selectedWorkspaceKey);
-    else lsRemove("fyp_ws");
-  }, [selectedWorkspaceKey]);
-
-  useEffect(() => {
-    // Back-compat: store last chosen tree path.
-    if (selectedTreePath) lsSet("fyp_tree", selectedTreePath);
-    else lsRemove("fyp_tree");
-
-    // Preferred: store per-workspace selection for git workspaces.
-    if (!selectedWorkspaceKey || selectedWorkspaceKey.startsWith("dir:")) return;
-    const raw = lsGet("fyp_tree_map");
-    let m: any = {};
-    try {
-      m = raw ? JSON.parse(raw) : {};
-    } catch {
-      m = {};
-    }
-    if (!m || typeof m !== "object") m = {};
-    if (selectedTreePath) m[String(selectedWorkspaceKey)] = selectedTreePath;
-    else delete m[String(selectedWorkspaceKey)];
-    lsSet("fyp_tree_map", JSON.stringify(m));
-  }, [selectedWorkspaceKey, selectedTreePath]);
-
-  useEffect(() => {
-    // Keep the selected tree consistent per workspace.
-    if (!selectedWorkspaceKey) return;
-    const w = mergedWorkspaces.find((x) => x.key === selectedWorkspaceKey) ?? null;
-    if (!w) return;
-
-    if (!w.isGit) {
-      if (selectedTreePath) setSelectedTreePath("");
-      return;
-    }
-
-    let saved = "";
-    try {
-      const raw = lsGet("fyp_tree_map");
-      if (raw) {
-        const m = JSON.parse(raw) as any;
-        const v = m && typeof m === "object" ? m[String(selectedWorkspaceKey)] : null;
-        if (typeof v === "string") saved = v;
-      }
-    } catch {
-      // ignore
-    }
-
-    const allowed = new Set<string>([String(w.root || ""), ...(w.trees ?? []).map((t) => String(t.path || "")).filter(Boolean)]);
-    let desired = saved || String(w.root || "");
-    if (desired && !allowed.has(desired)) desired = String(w.root || "");
-    if (desired && desired !== selectedTreePath) setSelectedTreePath(desired);
-  }, [selectedWorkspaceKey, mergedWorkspaces]);
-
-  useEffect(() => {
-    if (authed !== "yes") return;
-    let stopped = false;
-
-    function cleanup() {
-      if (globalCtl.current.timer) clearTimeout(globalCtl.current.timer);
-      globalCtl.current.timer = null;
-      if (globalCtl.current.ping) clearInterval(globalCtl.current.ping);
-      globalCtl.current.ping = null;
-      try {
-        globalWs.current?.close();
-      } catch {
-        // ignore
-      }
-      globalWs.current = null;
-      setGlobalWsState("closed");
-    }
-
-    function connect(attempt = 0) {
-      if (stopped) return;
-      if (globalCtl.current.timer) clearTimeout(globalCtl.current.timer);
-      globalCtl.current.timer = null;
-      if (globalCtl.current.ping) clearInterval(globalCtl.current.ping);
-      globalCtl.current.ping = null;
-
-      setGlobalWsState(attempt === 0 ? "connecting" : "connecting");
-      globalCtl.current.attempt = attempt;
-
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      const s = new WebSocket(`${proto}://${window.location.host}/ws/global`);
-      globalWs.current = s;
-
-      s.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(String(ev.data));
-          if (msg?.type === "pong") return;
-          if (msg?.type === "sessions.changed") refreshSessions();
-          if (msg?.type === "workspaces.changed") {
-            refreshRecentWorkspaces();
-            refreshWorkspaces();
-          }
-          if (msg?.type === "inbox.changed") {
-            refreshInbox({ workspaceKey: selectedWorkspaceKeyRef.current });
-            refreshSessions();
-            refreshWorkspaces();
-          }
-          if (msg?.type === "session.preview" && typeof msg.sessionId === "string" && typeof msg.line === "string") {
-            const sid = msg.sessionId;
-            const line = cleanPreviewLine(msg.line);
-            setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, preview: line } : s)));
-            setWorkspaces((prev) =>
-              prev.map((w) => ({
-                ...w,
-                sessions: (w.sessions ?? []).map((s) => (s.id === sid ? { ...s, preview: line } : s)),
-              })),
-            );
-          }
-        } catch {
-          // ignore
-        }
-      };
-
-      s.onopen = () => {
-        if (stopped) {
-          try {
-            s.close();
-          } catch {
-            // ignore
-          }
-          return;
-        }
-        globalCtl.current.attempt = 0;
-        setGlobalWsState("open");
-        globalCtl.current.ping = startPing(s);
-        // Immediately sync once.
-        refreshSessions();
-        refreshRecentWorkspaces();
-        refreshWorkspaces();
-        refreshInbox({ workspaceKey: selectedWorkspaceKeyRef.current });
-      };
-
-      s.onerror = () => {
-        try {
-          s.close();
-        } catch {
-          // ignore
-        }
-      };
-
-      s.onclose = () => {
-        if (globalWs.current === s) globalWs.current = null;
-        if (globalCtl.current.ping) clearInterval(globalCtl.current.ping);
-        globalCtl.current.ping = null;
-        setGlobalWsState("closed");
-        if (stopped) return;
-        const nextAttempt = Math.min(9, (globalCtl.current.attempt ?? 0) + 1);
-        globalCtl.current.attempt = nextAttempt;
-        const delay = backoffMs(nextAttempt);
-        setGlobalWsState("connecting");
-        globalCtl.current.timer = setTimeout(() => connect(nextAttempt), delay);
-      };
-    }
-
-    cleanup();
-    connect(0);
-    return () => {
-      stopped = true;
-      cleanup();
-    };
+      const [f, s, t, i] = await Promise.all([
+        api<{ terminalModeEnabled?: boolean }>("/api/features").catch(() => ({})),
+        api<SessionRow[]>("/api/sessions?includeInternal=0").catch(() => []),
+        api<{ ok: true; items: TaskCard[] }>("/api/tasks?includeInternal=0").catch(() => ({ items: [] as TaskCard[] })),
+        api<{ ok: true; items: InboxItem[] }>("/api/inbox").catch(() => ({ items: [] as InboxItem[] })),
+      ]);
+      const nextSessions = Array.isArray(s) ? s.filter(isRecord) as SessionRow[] : [];
+      const nextTasks = Array.isArray(t?.items)
+        ? t.items
+          .filter(isRecord)
+          .map((task: any) => ({
+            ...task,
+            members: Array.isArray(task?.members) ? task.members.filter(isRecord) : [],
+          })) as TaskCard[]
+        : [];
+      const nextInbox = Array.isArray(i?.items) ? i.items.filter(isRecord) as InboxItem[] : [];
+      setFeatures((f as any)?.features && typeof (f as any).features === "object" ? (f as any).features : (f as any));
+      setSessions(nextSessions);
+      setTasks(nextTasks);
+      setInbox(nextInbox);
+    } catch (e: any) { console.error(e); }
   }, [authed]);
 
   useEffect(() => {
     if (authed !== "yes") return;
-    refreshInbox({ workspaceKey: selectedWorkspaceKey });
-  }, [selectedWorkspaceKey, authed]);
-
-  useEffect(() => {
-    if (authed !== "yes") return;
-    const w = selectedWorkspaceKey ? mergedWorkspaces.find((x) => x.key === selectedWorkspaceKey) ?? null : null;
-    const under = String(w?.root ?? "").trim();
-    if (!under) {
-      setToolSessions([]);
-      return;
-    }
-    const t = setTimeout(() => refreshToolSessions({ under }), 160);
-    return () => clearTimeout(t);
-  }, [selectedWorkspaceKey, mergedWorkspaces, authed]);
-
-  useEffect(() => {
-    lsSet("fyp_slots", String(slotCfg.slots));
-  }, [slotCfg]);
-
-  useEffect(() => {
-    lsSet("fyp_autopin", autoPinNew ? "1" : "0");
-  }, [autoPinNew]);
-
-  useEffect(() => {
-    return () => {
-      try {
-        if (termOutBuf.current?.timer) clearTimeout(termOutBuf.current.timer);
-      } catch {
-        // ignore
-      }
-      termOutBuf.current = null;
-      try {
-        const ctl = ttyResizeCtl.current;
-        if (ctl.raf) cancelAnimationFrame(ctl.raf);
-        for (const t of ctl.timers) clearTimeout(t);
-        ctl.timers = [];
-        ctl.raf = 0;
-      } catch {
-        // ignore
-      }
-      roRef.current?.disconnect();
-      roRef.current = null;
-      term.current?.dispose();
-      term.current = null;
-      fit.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (tab !== "run") return;
-    (async () => {
-      try {
-        await ensureTerminalReady();
-        scheduleFitAndResize({ force: true, burst: true });
-      } catch {
-        // ignore
-      }
-    })();
-  }, [tab]);
-
-  useEffect(() => {
-    if (!term.current) return;
-    term.current.options.fontSize = fontSize;
-    lsSet("fyp_font", String(fontSize));
-    setTimeout(() => {
-      try {
-        scheduleFitAndResize({ force: true, burst: true });
-        term.current?.refresh(0, Math.max(0, (term.current?.rows ?? 1) - 1));
-      } catch {
-        // ignore
-      }
-    }, 10);
-  }, [fontSize]);
-
-  useEffect(() => {
-    if (!term.current) return;
-    term.current.options.lineHeight = lineHeight;
-    lsSet("fyp_lh", String(lineHeight));
-    setTimeout(() => {
-      try {
-        scheduleFitAndResize({ force: true, burst: true });
-        term.current?.refresh(0, Math.max(0, (term.current?.rows ?? 1) - 1));
-      } catch {
-        // ignore
-      }
-    }, 10);
-  }, [lineHeight]);
-
-  useEffect(() => {
-    if (tab !== "run") return;
-    setTimeout(() => scheduleFitAndResize({ force: true }), 50);
-  }, [tab, activeId]);
-
-  useEffect(() => {
-    // Mobile browsers (esp. iOS) often change the visual viewport when the address bar or keyboard
-    // appears. ResizeObserver doesn't always fire in those cases, so we explicitly refit xterm.
-    const onResize = () => {
-      try {
-        scheduleFitAndResize({ burst: true });
-      } catch {
-        // ignore
-      }
-    };
-
-    window.addEventListener("resize", onResize, { passive: true } as any);
-    window.addEventListener("orientationchange", onResize, { passive: true } as any);
-    const vv: any = (window as any).visualViewport;
-    if (vv && typeof vv.addEventListener === "function") {
-      vv.addEventListener("resize", onResize, { passive: true } as any);
-    }
-
-    return () => {
-      window.removeEventListener("resize", onResize as any);
-      window.removeEventListener("orientationchange", onResize as any);
-      if (vv && typeof vv.removeEventListener === "function") {
-        vv.removeEventListener("resize", onResize as any);
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (tab !== "run") return;
-    if (!activeId) return;
     let cancelled = false;
-    const id = activeId;
     (async () => {
       try {
-        const isCodexNative =
-          activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
-
-        // Codex Native: load structured thread + connect session socket for live deltas.
-        if (isCodexNative) {
-          termReplay.current = { sessionId: null, inProgress: false };
-          setCodexNativeDiff(null);
-          setCodexNativeLive(null);
-          setCodexNativeThread(null);
-          setCodexNativeMsg(null);
-          setEvents([]);
-          if (!(connectedSessionId.current === id && ws.current && ws.current.readyState === WebSocket.OPEN)) {
-            connectWs(id);
-          }
-          const threadId = typeof activeSession?.toolSessionId === "string" ? String(activeSession.toolSessionId) : "";
-          if (threadId) await loadCodexNativeThread(threadId);
-          await loadSessionEvents(id);
-          return;
-        }
-
-        // PTY: replay transcript + events, then stream live output.
-        await ensureTerminalReady();
+        const cfg = await api<{ ok: boolean; profiles?: Array<{ id?: string; title?: string; tool?: string }> }>("/api/config");
         if (cancelled) return;
-        termReplay.current = { sessionId: id, inProgress: true };
-        setEvents([]);
-        if (!(connectedSessionId.current === id && ws.current && ws.current.readyState === WebSocket.OPEN)) {
-          connectWs(id);
-        }
-        await Promise.all([loadSessionEvents(id), loadSessionTranscriptToTerm(id)]);
+        const profs = Array.isArray(cfg?.profiles)
+          ? cfg.profiles
+            .map((p) => {
+              const id = String(p?.id ?? "").trim();
+              if (!id) return null;
+              const label = String(p?.title ?? "").trim() || id;
+              return { id, label };
+            })
+            .filter(Boolean) as ProfileOption[]
+          : [];
+        setConfigProfiles(profs);
       } catch {
-        // ignore
-      } finally {
-        if (termReplay.current.sessionId === id) {
-          termReplay.current.inProgress = false;
-          flushTermOutput();
-        }
+        // fallback profiles are used automatically
       }
     })();
     return () => {
       cancelled = true;
-      if (termReplay.current.sessionId === id) termReplay.current.inProgress = false;
     };
-  }, [tab, activeId, activeSession?.tool, activeSession?.transport, activeSession?.toolSessionId]);
+  }, [authed]);
+
+  const queueRefresh = useCallback((delayMs = 350) => {
+    if (refreshDebounceTimerRef.current) return;
+    refreshDebounceTimerRef.current = setTimeout(() => {
+      refreshDebounceTimerRef.current = null;
+      void refresh();
+    }, Math.max(80, Math.floor(delayMs)));
+  }, [refresh]);
 
   useEffect(() => {
-    if (tab !== "run") return;
-    if (!activeIsCodexNative) return;
-    const el = nativeChatRef.current;
-    if (!el) return;
-    const t = setTimeout(() => {
-      try {
-        el.scrollTop = el.scrollHeight;
-      } catch {
-        // ignore
-      }
-    }, 30);
-    return () => clearTimeout(t);
-  }, [tab, activeIsCodexNative, codexNativeThread, codexNativeLive?.text, codexNativeDiff]);
-
-  useEffect(() => {
-    if (tab !== "run") return;
-    if (activeId) return;
-
-    // If there is no active session (e.g. user deleted the last one), stop reconnect loops and close the socket.
-    if (sessionCtl.current.timer) clearTimeout(sessionCtl.current.timer);
-    sessionCtl.current.timer = null;
-    if (sessionCtl.current.ping) clearInterval(sessionCtl.current.ping);
-    sessionCtl.current.ping = null;
-    try {
-      ws.current?.close();
-    } catch {
-      // ignore
-    }
-    ws.current = null;
-    connectedSessionId.current = null;
-    setSessionWsState("closed");
-    try {
-      if (termOutBuf.current?.timer) clearTimeout(termOutBuf.current.timer);
-    } catch {
-      // ignore
-    }
-    termOutBuf.current = null;
-
-    dismissedAssistSig.current = "";
-    setTuiAssist(null);
-  }, [tab, activeId]);
-
-  useEffect(() => {
-    // Swipe left/right on the terminal area to switch sessions.
-    // Keep this very light-touch so scrolling/typing in mobile browsers stays reliable.
-    if (tab !== "run") return;
-    if (activeIsCodexNative) return;
-    if (activeSessionClosing) return;
-    const el = termRef.current;
-    if (!el) return;
-    let pointerId: number | null = null;
-    let startX = 0;
-    let startY = 0;
-    let startTs = 0;
-
-    const reset = () => {
-      pointerId = null;
-      startTs = 0;
-    };
-
-    const onDown = (e: PointerEvent) => {
-      if (e.pointerType === "mouse") return;
-      pointerId = e.pointerId;
-      startX = e.clientX;
-      startY = e.clientY;
-      startTs = Date.now();
-    };
-
-    const onUp = (e: PointerEvent) => {
-      if (e.pointerType === "mouse") return;
-      if (pointerId == null || e.pointerId !== pointerId) return;
-
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
-      const ax = Math.abs(dx);
-      const ay = Math.abs(dy);
-      const dt = startTs > 0 ? Date.now() - startTs : 9999;
-      reset();
-
-      if (dt > 760) return;
-      if (ax < 70 || ax <= ay * 1.25) return;
-      void switchSessionRelative(dx < 0 ? 1 : -1, "swipe");
-    };
-
-    const onCancel = (e: PointerEvent) => {
-      if (e.pointerType === "mouse") return;
-      if (pointerId == null || e.pointerId !== pointerId) return;
-      reset();
-    };
-
-    el.addEventListener("pointerdown", onDown, { passive: true });
-    el.addEventListener("pointerup", onUp, { passive: true });
-    el.addEventListener("pointercancel", onCancel, { passive: true });
     return () => {
-      el.removeEventListener("pointerdown", onDown);
-      el.removeEventListener("pointerup", onUp);
-      el.removeEventListener("pointercancel", onCancel);
+      try {
+        if (refreshDebounceTimerRef.current) clearTimeout(refreshDebounceTimerRef.current);
+      } catch {
+        // ignore
+      }
+      refreshDebounceTimerRef.current = null;
     };
-  }, [tab, activeId, sessionSwitchOrder, activeIsCodexNative, activeSessionClosing]);
+  }, []);
 
-  function backoffMs(attempt: number): number {
-    const base = 140;
-    const cap = 6000;
-    const exp = Math.min(7, Math.max(0, attempt));
-    const ms = Math.min(cap, base * Math.pow(2, exp));
-    const jitter = Math.floor(Math.random() * 200);
-    return ms + jitter;
-  }
-
-  function ingestEventRaw(raw: any) {
-    const ev2 = normalizeEvent(raw);
-    if (!ev2) return;
-    setEvents((prev) => {
-      // de-dupe by event id (ws replay + http fallback can overlap)
-      if (prev.some((p) => p.id === ev2.id)) return prev;
-      const next = [...prev, ev2];
-      return next.length > 400 ? next.slice(next.length - 400) : next;
-    });
-  }
-
-  async function loadSessionEvents(sessionId: string) {
+  const refreshToolSession = useCallback(async (toolName: string, id: string) => {
     try {
-      const r = await api<{ items: any[] }>(`/api/sessions/${encodeURIComponent(sessionId)}/events?limit=220`);
-      const rows = Array.isArray((r as any)?.items) ? (r as any).items : [];
-      const parsed = rows.map(normalizeEvent).filter(Boolean) as EventItem[];
-      setEvents(parsed);
-    } catch {
-      // ignore
+      if (!id || !toolName || toolName === "(unknown)") return;
+      const requestKey = `${String(activeSessionId ?? "")}:${toolName}:${id}`;
+      if (!requestKey || activeToolSessionKeyRef.current !== requestKey) return;
+      const summary = await api<ToolSessionSummary>(`/api/tool-sessions/${toolName}/${id}`);
+      const messagesObj = await api<{ messages: ToolSessionMessage[] }>(`/api/tool-sessions/${toolName}/${id}/messages`);
+      if (activeToolSessionKeyRef.current !== requestKey) return;
+      setToolSession(summary);
+      setToolMessages(Array.isArray(messagesObj.messages) ? messagesObj.messages : []);
+      setToolMessagesSourceKey(requestKey);
+    } catch (e: any) { console.error("Failed to load tool messages", e); }
+  }, [activeSessionId]);
+
+  const refreshNativeThread = useCallback(async (threadId: string) => {
+    if (!threadId) return;
+    try {
+      const requestKey = `${String(activeSessionId ?? "")}:${threadId}`;
+      if (!requestKey || activeNativeThreadKeyRef.current !== requestKey) return;
+      const resp = await api<NativeThreadResp>(`/api/codex-native/threads/${encodeURIComponent(threadId)}`);
+      const next = parseCodexNativeThreadMessages(resp?.thread ?? null);
+      if (activeNativeThreadKeyRef.current !== requestKey) return;
+      setNativeThreadMessages(next);
+      setNativeMessagesSourceKey(requestKey);
+    } catch (e: any) {
+      console.error("Failed to load codex native thread", e);
     }
-  }
+  }, [activeSessionId]);
 
-  async function loadSessionTranscriptToTerm(sessionId: string) {
-    try {
-      const r = await api<{ items: { chunk: string }[] }>(
-        `/api/sessions/${encodeURIComponent(sessionId)}/transcript?limit=1200`,
+  // Global polling (8s baseline; websocket events trigger debounced refreshes sooner)
+  useEffect(() => {
+    void refresh();
+    if (authed === "yes") {
+      const t = setInterval(() => void refresh(), 8000);
+      return () => clearInterval(t);
+    }
+  }, [refresh, authed]);
+
+  // Resolve active session def
+  const activeSessionDef = useMemo((): SessionRow | null => {
+    const activeTask = tasks.find((t) => t.id === activeTaskId);
+    return sessions.find((s) => s.id === activeSessionId)
+      || activeTask?.members?.find(m => m.sessionId === activeSessionId)?.session
+      || null;
+  }, [activeSessionId, sessions, tasks, activeTaskId]);
+
+  const isCodexNative = useMemo(
+    () =>
+      Boolean(
+        activeSessionDef?.tool === "codex" &&
+        activeSessionDef?.transport === "codex-app-server" &&
+        activeSessionDef?.toolSessionId,
+      ),
+    [activeSessionDef?.tool, activeSessionDef?.transport, activeSessionDef?.toolSessionId],
+  );
+
+  // Raw/terminal view is now strictly a mode decision.
+  // Missing toolSession IDs should not force users out of wrapper mode.
+  const showRawTerminal = useMemo(() => {
+    if (!activeSessionDef) return true;
+    if (activeSessionDef.taskMode === "terminal") return true;
+    return false;
+  }, [activeSessionDef]);
+
+  const canWrap = useMemo(
+    () => Boolean(isCodexNative || activeSessionDef?.toolSessionId),
+    [isCodexNative, activeSessionDef?.toolSessionId],
+  );
+
+  const activeToolSessionKey = useMemo(() => {
+    if (!activeSessionId || showRawTerminal || isCodexNative) return "";
+    const tool = String(activeSessionDef?.tool ?? "").trim();
+    const toolSessionId = String(activeSessionDef?.toolSessionId ?? "").trim();
+    if (!tool || !toolSessionId) return "";
+    return `${activeSessionId}:${tool}:${toolSessionId}`;
+  }, [activeSessionId, showRawTerminal, isCodexNative, activeSessionDef?.tool, activeSessionDef?.toolSessionId]);
+
+  const activeNativeThreadKey = useMemo(() => {
+    if (!activeSessionId || showRawTerminal || !isCodexNative) return "";
+    const threadId = String(activeSessionDef?.toolSessionId ?? "").trim();
+    if (!threadId) return "";
+    return `${activeSessionId}:${threadId}`;
+  }, [activeSessionId, showRawTerminal, isCodexNative, activeSessionDef?.toolSessionId]);
+
+  useEffect(() => {
+    activeToolSessionKeyRef.current = activeToolSessionKey;
+    setToolSession(null);
+    setToolMessages([]);
+    setToolMessagesSourceKey("");
+  }, [activeToolSessionKey]);
+
+  useEffect(() => {
+    activeNativeThreadKeyRef.current = activeNativeThreadKey;
+    setNativeThreadMessages([]);
+    setNativeMessagesSourceKey("");
+    setNativeLiveBlock(null);
+  }, [activeNativeThreadKey]);
+
+  // Load persisted tool messages for non-native wrapper sessions.
+  useEffect(() => {
+    if (!activeSessionId || authed !== "yes" || showRawTerminal) {
+      setToolSession(null);
+      setToolMessages([]);
+      setToolMessagesSourceKey("");
+      if (!showRawTerminal) setRunMsg(null);
+      return;
+    }
+    if (isCodexNative) {
+      setToolMessages([]);
+      setToolMessagesSourceKey("");
+      const sid = String(activeSessionDef?.toolSessionId ?? "");
+      setToolSession(
+        sid
+          ? {
+            tool: "codex",
+            id: sid,
+            cwd: String(activeSessionDef?.cwd ?? ""),
+            createdAt: null,
+            updatedAt: Date.now(),
+            title: activeSessionDef?.profileId ?? "codex.native",
+            preview: null,
+            messageCount: null,
+            gitBranch: null,
+          }
+          : null,
       );
-      const rows = Array.isArray((r as any)?.items) ? (r as any).items : [];
-      const chunks = rows.map((x: any) => (typeof x?.chunk === "string" ? x.chunk : "")).filter(Boolean);
-      if (!chunks.length) return;
-
-      // Write in batches so mobile browsers stay responsive.
-      const joined = chunks.join("");
-      const batchSize = 24_000;
-      for (let i = 0; i < joined.length; i += batchSize) {
-        if (activeIdRef.current !== sessionId) return;
-        term.current?.write(joined.slice(i, i + batchSize));
-        // Yield to the browser event loop.
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise((res) => setTimeout(res, 0));
-      }
-      try {
-        (term.current as any)?.scrollToBottom?.();
-      } catch {
-        // ignore
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  function flushTermOutput() {
-    const rec = termOutBuf.current;
-    if (!rec || rec.chunks.length === 0) return;
-    if (rec.timer) {
-      clearTimeout(rec.timer);
-      rec.timer = null;
-    }
-    const joined = rec.chunks.join("");
-    rec.chunks = [];
-    rec.bytes = 0;
-    try {
-      term.current?.write(joined);
-    } catch {
-      // ignore
-    }
-  }
-
-  function queueTermOutput(chunk: string) {
-    const rec = termOutBuf.current ?? { chunks: [], bytes: 0, timer: null };
-    rec.chunks.push(chunk);
-    rec.bytes += chunk.length;
-    termOutBuf.current = rec;
-    if (termReplay.current.inProgress) {
-      // During transcript replay we buffer live output but avoid flushing so history
-      // doesn't interleave with the replayed scrollback.
-      if (rec.bytes > 900_000 && rec.chunks.length > 220) {
-        rec.chunks = rec.chunks.slice(-220);
-        rec.bytes = rec.chunks.reduce((n, s) => n + s.length, 0);
-      }
       return;
     }
-    if (rec.bytes > 96_000 || rec.chunks.length > 120) {
-      flushTermOutput();
+    if (activeSessionDef?.tool && activeSessionDef.toolSessionId) {
+      void refreshToolSession(activeSessionDef.tool, activeSessionDef.toolSessionId);
+    }
+  }, [activeSessionId, activeSessionDef?.toolSessionId, showRawTerminal, refreshToolSession, authed, isCodexNative, activeSessionDef?.tool, activeSessionDef?.cwd, activeSessionDef?.profileId]);
+
+  // Poll persisted tool messages for non-native wrapper sessions.
+  useEffect(() => {
+    if (!activeSessionId || authed !== "yes" || showRawTerminal) return;
+    if (isCodexNative) return;
+    if (!activeSessionDef?.tool || !activeSessionDef.toolSessionId) return;
+    const tool = activeSessionDef.tool;
+    const toolId = activeSessionDef.toolSessionId;
+    const interval = setInterval(
+      () => void refreshToolSession(tool, toolId),
+      activeSessionDef?.running ? 3800 : 6500,
+    );
+    return () => clearInterval(interval);
+  }, [activeSessionId, activeSessionDef?.tool, activeSessionDef?.toolSessionId, activeSessionDef?.running, showRawTerminal, authed, refreshToolSession, isCodexNative]);
+
+  // Poll Codex native thread snapshots while in wrapper mode.
+  useEffect(() => {
+    if (!activeSessionId || authed !== "yes" || showRawTerminal || !isCodexNative) {
+      setNativeThreadMessages([]);
+      setNativeMessagesSourceKey("");
+      setNativeLiveBlock(null);
       return;
     }
-    if (!rec.timer) {
-      rec.timer = setTimeout(() => flushTermOutput(), 16);
+    const threadId = String(activeSessionDef?.toolSessionId ?? "");
+    if (!threadId) return;
+    void refreshNativeThread(threadId);
+    const interval = setInterval(() => void refreshNativeThread(threadId), activeSessionDef?.running ? 1800 : 3600);
+    return () => clearInterval(interval);
+  }, [activeSessionId, authed, showRawTerminal, isCodexNative, activeSessionDef?.toolSessionId, refreshNativeThread, activeSessionDef?.running]);
+
+  useEffect(() => {
+    if (!defaultWorkspacePath) return;
+    setCreateProjectPath(p => p || defaultWorkspacePath);
+    setSoloCwd(p => p || defaultWorkspacePath);
+  }, [defaultWorkspacePath]);
+
+  useEffect(() => {
+    setSoloProfile(prev => prev.startsWith(`${soloTool}.`) ? prev : `${soloTool}.default`);
+  }, [soloTool]);
+
+  useEffect(() => {
+    setCustomOrchestratorProfile((prev) =>
+      normalizeProfileIdForTool(customOrchestratorTool, prev, configProfiles),
+    );
+  }, [customOrchestratorTool, configProfiles]);
+
+  useEffect(() => {
+    setSoloModel("");
+  }, [soloTool]);
+
+  useEffect(() => {
+    setManualAgentModels({});
+  }, [selectedPreset]);
+
+  useEffect(() => {
+    setCustomWorkerGroups((prev) =>
+      prev.map((g) => ({
+        ...g,
+        profileId: normalizeProfileIdForTool(g.tool, g.profileId, configProfiles),
+      })),
+    );
+  }, [configProfiles]);
+
+  useEffect(() => {
+    setAutoOrchestratorModel("");
+    setAutoWorkerModels({});
+  }, [recommendation]);
+
+  // Keep global app state fresh with websocket events.
+  useEffect(() => {
+    if (authed !== "yes") {
+      setGlobalWsState("closed");
+      return;
     }
-  }
+    let closed = false;
+    let retryTimer: any = null;
+    let ws: WebSocket | null = null;
 
-  function startPing(sock: WebSocket) {
-    return setInterval(() => {
-      try {
-        if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "ping", ts: Date.now() }));
-      } catch {
-        // ignore
-      }
-    }, 5000);
-  }
-
-  function connectWs(id: string, attempt = 0) {
-    // Stop any pending reconnect loop for the previous connection.
-    if (sessionCtl.current.timer) clearTimeout(sessionCtl.current.timer);
-    sessionCtl.current.timer = null;
-    if (sessionCtl.current.ping) clearInterval(sessionCtl.current.ping);
-    sessionCtl.current.ping = null;
-
-    sessionCtl.current.id = id;
-    sessionCtl.current.attempt = attempt;
-    setSessionWsState("connecting");
-
-    try {
-      ws.current?.close();
-    } catch {
-      // ignore
-    }
-    ws.current = null;
-
-    connectedSessionId.current = id;
-    // Only reset the terminal on an intentional session switch (attempt=0).
-    // During reconnects we keep the current scrollback so the UI doesn't "blink" or lose history.
-    if (attempt === 0) {
-      try {
-        if (termOutBuf.current?.timer) clearTimeout(termOutBuf.current.timer);
-      } catch {
-        // ignore
-      }
-      termOutBuf.current = null;
-      term.current?.reset();
-      term.current?.write("\u001b[2J\u001b[H");
-      dismissedAssistSig.current = "";
-      setTuiAssist(null);
-    }
-
-    const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const s = new WebSocket(`${proto}://${window.location.host}/ws/sessions/${id}`);
-    ws.current = s;
-
-    s.onmessage = (ev) => {
-      try {
-        if (ws.current !== s) return; // stale socket after a fast session switch
-        const msg = JSON.parse(String(ev.data));
-        if (msg?.type === "pong") return;
-        if (msg?.type === "session.closing") {
-          setSessionWsState("connecting");
-          setToast("Session closing...");
-          void refreshSessions();
-          return;
-        }
-        if (msg?.type === "session.closed") {
-          setSessionWsState("closed");
-          if (activeIdRef.current === id) setActiveId(null);
-          setToast("Session closed");
-          void refreshSessions();
-          void refreshWorkspaces();
-          return;
-        }
-        if (msg?.type === "session.stopped") {
-          setToast("Session stopped");
-          void refreshSessions();
-          return;
-        }
-        if (msg?.type === "session.restarted") {
-          setToast("Session resumed");
-          void refreshSessions();
-          scheduleFitAndResize({ force: true, burst: true });
-          return;
-        }
-        if (msg?.type === "codex.native.delta" && typeof msg?.delta === "string") {
-          const kind = typeof msg?.kind === "string" ? msg.kind : "agent";
-          const threadId = typeof msg?.threadId === "string" ? msg.threadId : "";
-          const turnId = typeof msg?.turnId === "string" ? msg.turnId : "";
-          const itemId = typeof msg?.itemId === "string" ? msg.itemId : "";
-          const delta = String(msg.delta ?? "");
-          if (delta) {
-            setCodexNativeLive((prev) => {
-              if (!prev || prev.threadId !== threadId || prev.turnId !== turnId || prev.itemId !== itemId || prev.kind !== kind) {
-                return { kind, threadId, turnId, itemId, text: delta };
-              }
-              return { ...prev, text: prev.text + delta };
-            });
-          }
-          return;
-        }
-        if (msg?.type === "codex.native.diff" && typeof msg?.diff === "string") {
-          setCodexNativeDiff(String(msg.diff ?? ""));
-          return;
-        }
-        if (msg?.type === "codex.native.turn" && typeof msg?.event === "string") {
-          const threadId = typeof msg?.threadId === "string" ? msg.threadId : "";
-          if (msg.event === "started") {
-            setCodexNativeLive(null);
-            setCodexNativeDiff(null);
-          }
-          if (msg.event === "completed" && threadId) {
-            setCodexNativeLive(null);
-            void loadCodexNativeThread(threadId);
-          }
-          return;
-        }
-        if (msg.type === "output" && typeof msg.chunk === "string") queueTermOutput(msg.chunk);
-        if (msg.type === "assist") {
-          const a = (msg?.assist ?? null) as any;
-          const sig = a && typeof a.signature === "string" ? String(a.signature) : "";
-          if (sig && sig === dismissedAssistSig.current) return;
-          setTuiAssist(a && typeof a.title === "string" && Array.isArray(a.options) ? (a as TuiAssist) : null);
-        }
-        if (msg.type === "event") {
-          const raw = msg.event ?? msg; // back-compat
-          ingestEventRaw(raw);
-        }
-      } catch {
-        // ignore
-      }
-    };
-
-    s.onopen = () => {
-      // If the user switched sessions before this connection opened, abort.
-      if (activeIdRef.current !== id) {
+    const connect = () => {
+      if (closed) return;
+      setGlobalWsState("connecting");
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const host = window.location.host;
+      ws = new WebSocket(`${protocol}//${host}/ws/global`);
+      ws.onopen = () => setGlobalWsState("open");
+      ws.onmessage = (ev) => {
         try {
-          s.close();
+          const msg = JSON.parse(String(ev.data ?? "{}"));
+          if (msg?.type === "sessions.changed" || msg?.type === "tasks.changed" || msg?.type === "inbox.changed" || msg?.type === "workspaces.changed") {
+            queueRefresh(320);
+          }
         } catch {
           // ignore
         }
-        return;
-      }
-      sessionCtl.current.attempt = 0;
-      setSessionWsState("open");
-      sessionCtl.current.ping = startPing(s);
-
-      scheduleFitAndResize({ force: true, burst: true });
-      const queued = pendingInputBySession.current[id];
-      if (Array.isArray(queued) && queued.length > 0) {
-        for (const text of queued) s.send(JSON.stringify({ type: "input", text }));
-        delete pendingInputBySession.current[id];
-      }
+      };
+      ws.onclose = () => {
+        setGlobalWsState("closed");
+        if (closed) return;
+        retryTimer = setTimeout(connect, 1200);
+      };
+      ws.onerror = () => {
+        // onclose will handle retries
+      };
     };
 
-    s.onerror = () => {
+    connect();
+    return () => {
+      closed = true;
       try {
-        s.close();
+        if (retryTimer) clearTimeout(retryTimer);
       } catch {
         // ignore
       }
-    };
-
-    s.onclose = () => {
-      if (ws.current === s) ws.current = null;
-      if (connectedSessionId.current === id) connectedSessionId.current = null;
-      if (sessionCtl.current.ping) clearInterval(sessionCtl.current.ping);
-      sessionCtl.current.ping = null;
-      flushTermOutput();
-
-      const stillWanted = tabRef.current === "run" && activeIdRef.current === id && authedRef.current === "yes";
-      if (!stillWanted) {
-        setSessionWsState("closed");
-        return;
-      }
-
-      const nextAttempt = Math.min(9, attempt + 1);
-      sessionCtl.current.attempt = nextAttempt;
-      const delay = backoffMs(nextAttempt);
-      setSessionWsState("connecting");
-      sessionCtl.current.timer = setTimeout(() => connectWs(id, nextAttempt), delay);
-    };
-  }
-
-  function openSession(id: string) {
-    setActiveId(id);
-    dismissedAssistSig.current = "";
-    setTuiAssist(null);
-    const sess = sessions.find((s) => s.id === id) ?? null;
-    if (sess) {
-      const gk = String(sess.workspaceKey ?? (sess.cwd ? `dir:${sess.cwd}` : `dir:${sess.id}`));
-      if (gk) {
-        selectedWorkspaceKeyRef.current = gk;
-        setSelectedWorkspaceKey(gk);
-      }
-    }
-    setEvents([]);
-    setTab("run");
-  }
-
-  function switchSessionRelative(delta: number, source: "swipe" | "button" = "button"): boolean {
-    if (!activeId) return false;
-    if (sessionSwitchOrder.length < 2) return false;
-    const idx = sessionSwitchOrder.indexOf(activeId);
-    if (idx < 0) return false;
-    const step = delta >= 0 ? 1 : -1;
-    const next = (idx + step + sessionSwitchOrder.length) % sessionSwitchOrder.length;
-    const nextId = sessionSwitchOrder[next];
-    if (!nextId || nextId === activeId) return false;
-    const s = sessions.find((x) => x.id === nextId) ?? null;
-    openSession(nextId);
-    const label = String(s?.label || s?.profileId || s?.tool || "").trim();
-    setToast(
-      `${next + 1}/${sessionSwitchOrder.length}${label ? ` · ${label}` : ""}`,
-    );
-    if (source === "swipe") {
       try {
-        if (typeof navigator !== "undefined" && typeof navigator.vibrate === "function") navigator.vibrate(8);
+        ws?.close();
       } catch {
         // ignore
       }
-    }
-    return true;
-  }
+      setGlobalWsState("closed");
+    };
+  }, [authed, queueRefresh]);
 
-  async function removeSession(sessionId: string) {
-    const sess = sessions.find((s) => s.id === sessionId) ?? null;
-    if (!sess) return;
-    const label = sess.label || sess.profileId || sessionId.slice(0, 8);
-    const runningNote = sess.running ? "\n\nThis session is running and will be force-closed first." : "";
-    const ok = window.confirm(
-      `Remove session "${label}"?${runningNote}\n\nThis deletes the FromYourPhone record (terminal replay + inbox items). It does NOT delete ${sess.tool} chat logs stored by the tool.`,
+  // Session websocket: live codex-native deltas + immediate wrapper refresh triggers.
+  useEffect(() => {
+    const sid = String(activeSessionId ?? "");
+    if (!sid || authed !== "yes" || showRawTerminal) return;
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const host = window.location.host;
+    const ws = new WebSocket(`${protocol}//${host}/ws/sessions/${sid}`);
+    activeSessionWsRef.current = ws;
+
+    ws.onmessage = (ev) => {
+      let msg: any = null;
+      try {
+        msg = JSON.parse(String(ev.data ?? "{}"));
+      } catch {
+        return;
+      }
+      if (!msg || typeof msg !== "object") return;
+
+      if (msg.type === "event") {
+        const kind = String(msg?.event?.kind ?? "");
+        if (kind === "input" && activeSessionDef?.tool && activeSessionDef.toolSessionId && !isCodexNative) {
+          void refreshToolSession(activeSessionDef.tool, activeSessionDef.toolSessionId);
+        }
+      }
+
+      if (!isCodexNative) return;
+
+      if (msg.type === "codex.native.delta") {
+        const kind = String(msg.kind ?? "");
+        const delta = typeof msg.delta === "string" ? msg.delta : "";
+        if (!delta) return;
+        if (kind === "reasoning") {
+          setNativeLiveBlock((prev) => ({
+            type: "thinking",
+            text: `${prev?.type === "thinking" ? prev.text : ""}${delta}`,
+          }));
+        } else {
+          setNativeLiveBlock((prev) => ({
+            type: "text",
+            text: `${prev?.type === "text" ? prev.text : ""}${delta}`,
+          }));
+        }
+        return;
+      }
+
+      if (msg.type === "codex.native.turn") {
+        if (String(msg.event ?? "") === "completed") setNativeLiveBlock(null);
+        const threadId = String(activeSessionDef?.toolSessionId ?? "");
+        if (threadId) void refreshNativeThread(threadId);
+        return;
+      }
+
+      if (msg.type === "codex.native.notification") {
+        const method = String(msg?.method ?? "");
+        if (method === "item/started" || method === "item/completed") {
+          const threadId = String(activeSessionDef?.toolSessionId ?? "");
+          if (threadId) void refreshNativeThread(threadId);
+        }
+      }
+    };
+
+    return () => {
+      if (activeSessionWsRef.current === ws) activeSessionWsRef.current = null;
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      setNativeLiveBlock(null);
+    };
+  }, [activeSessionId, authed, showRawTerminal, isCodexNative, activeSessionDef?.tool, activeSessionDef?.toolSessionId, refreshToolSession, refreshNativeThread]);
+
+  // Drop stale optimistic echoes and clear composer status when session changes.
+  useEffect(() => {
+    setRunMsg(null);
+    const sid = String(activeSessionId ?? "");
+    if (!sid) return;
+    setPendingEchoes((prev) => prev.filter((e) => e.sessionId !== sid || Date.now() - e.ts < 45_000));
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      setPendingEchoes((prev) => prev.filter((e) => Date.now() - e.ts < 45_000));
+    }, 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  const activeEchoMessages = useMemo<ToolSessionMessage[]>(() => {
+    const sid = String(activeSessionId ?? "");
+    if (!sid) return [];
+    return pendingEchoes
+      .filter((e) => e.sessionId === sid)
+      .map((e) => ({
+        role: "user",
+        ts: e.ts,
+        text: e.text,
+        blocks: [{ type: "text", text: e.text }],
+      }));
+  }, [pendingEchoes, activeSessionId]);
+
+  const visibleToolMessages = useMemo<ToolSessionMessage[]>(() => {
+    if (!activeToolSessionKey) return [];
+    if (toolMessagesSourceKey !== activeToolSessionKey) return [];
+    return toolMessages;
+  }, [activeToolSessionKey, toolMessagesSourceKey, toolMessages]);
+
+  const visibleNativeThreadMessages = useMemo<ToolSessionMessage[]>(() => {
+    if (!activeNativeThreadKey) return [];
+    if (nativeMessagesSourceKey !== activeNativeThreadKey) return [];
+    return nativeThreadMessages;
+  }, [activeNativeThreadKey, nativeMessagesSourceKey, nativeThreadMessages]);
+
+  const displayToolMessages = useMemo<ToolSessionMessage[]>(() => {
+    const base =
+      isCodexNative && visibleNativeThreadMessages.length > 0 ? visibleNativeThreadMessages : visibleToolMessages;
+    const merged = [...base, ...activeEchoMessages];
+    if (nativeLiveBlock && isCodexNative) {
+      merged.push({
+        role: "assistant",
+        ts: Date.now(),
+        text: nativeLiveBlock.text,
+        blocks: [nativeLiveBlock],
+      });
+    }
+    merged.sort((a, b) => {
+      const dt = Number(a.ts ?? 0) - Number(b.ts ?? 0);
+      if (dt !== 0) return dt;
+      if (a.role !== b.role) return a.role === "user" ? -1 : 1;
+      return 0;
+    });
+    return merged;
+  }, [isCodexNative, visibleNativeThreadMessages, visibleToolMessages, activeEchoMessages, nativeLiveBlock]);
+
+  // Reconcile optimistic echoes once persisted user messages arrive.
+  // Important: only compare against persisted history, not against optimistic echoes
+  // themselves, otherwise the echo is dropped immediately after send.
+  useEffect(() => {
+    if (!activeSessionId) return;
+    const persisted =
+      isCodexNative && visibleNativeThreadMessages.length > 0 ? visibleNativeThreadMessages : visibleToolMessages;
+    const userTexts = new Set(
+      persisted
+        .filter((m) => m.role === "user")
+        .map((m) => String(m.text ?? "").trim())
+        .filter(Boolean),
     );
-    if (!ok) return;
+    setPendingEchoes((prev) => {
+      let changed = false;
+      const next: PendingEcho[] = [];
+      for (const e of prev) {
+        const dup = e.sessionId === activeSessionId && userTexts.has(String(e.text ?? "").trim());
+        if (dup) {
+          changed = true;
+          continue;
+        }
+        next.push(e);
+      }
+      return changed ? next : prev;
+    });
+  }, [activeSessionId, isCodexNative, visibleNativeThreadMessages, visibleToolMessages]);
 
-    // Optimistic UI so it disappears immediately.
-    const remaining = sessions.filter((s) => s.id !== sessionId);
-    setSessions(remaining);
-    setWorkspaces((prev) =>
-      prev.map((w) => ({
-        ...w,
-        sessions: (w.sessions ?? []).filter((s) => s.id !== sessionId),
-      })),
-    );
-    setInbox((prev) => prev.filter((it) => it.sessionId !== sessionId));
+  const sendToActiveSession = useCallback(async () => {
+    const sid = String(activeSessionId ?? "");
+    if (!sid || sendBusy) return;
+    const text = composerText.trim();
+    if (!text) return;
+    const sendText = /[\r\n]$/.test(text) ? text : `${text}\r`;
+    const echoText = text;
+    const echo: PendingEcho = {
+      id: `${sid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      sessionId: sid,
+      ts: Date.now(),
+      text: echoText,
+    };
+    setComposerText("");
+    setRunMsg(null);
+    setPendingEchoes((prev) => [...prev.slice(-120), echo]);
+    setSendBusy(true);
     try {
-      delete pendingInputBySession.current[sessionId];
-    } catch {
-      // ignore
-    }
-
-    // If the removed session was active, switch immediately to avoid reconnect loops.
-    if (activeIdRef.current === sessionId) {
-      const next = remaining[0]?.id ?? null;
-      activeIdRef.current = next;
-      setActiveId(next);
-    }
-
-    setShowControls(false);
-
-    try {
-      await api(`/api/sessions/${encodeURIComponent(sessionId)}?force=1`, { method: "DELETE" });
-      setToast(sess.running ? "Session closed and removed" : "Session removed");
+      await api(`/api/sessions/${encodeURIComponent(sid)}/input`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: sendText }),
+      });
+      if (isCodexNative) {
+        const threadId = String(activeSessionDef?.toolSessionId ?? "");
+        if (threadId) void refreshNativeThread(threadId);
+      } else if (activeSessionDef?.tool && activeSessionDef.toolSessionId) {
+        void refreshToolSession(activeSessionDef.tool, activeSessionDef.toolSessionId);
+      }
     } catch (e: any) {
-      setToast(typeof e?.message === "string" ? e.message : "remove failed");
+      setRunMsg(typeof e?.message === "string" ? e.message : "Failed to send message.");
     } finally {
-      refreshSessions();
-      refreshWorkspaces();
-      refreshInbox({ workspaceKey: selectedWorkspaceKeyRef.current });
+      setSendBusy(false);
     }
-  }
+  }, [activeSessionId, sendBusy, composerText, isCodexNative, activeSessionDef?.toolSessionId, activeSessionDef?.tool, refreshNativeThread, refreshToolSession]);
 
-  async function sendControl(type: "interrupt" | "stop" | "kill") {
-    if (!activeId) {
-      setToast("No active session");
-      return;
-    }
-    if (activeSessionClosing) {
-      setToast("Session is closing");
-      return;
-    }
-
-    // Prefer websocket (lowest latency, updates stream immediately).
-    if (ws.current && ws.current.readyState === WebSocket.OPEN && connectedSessionId.current === activeId) {
-      ws.current.send(JSON.stringify({ type }));
-      setToast(`${type} sent`);
-      return;
-    }
-
-    // Fallback to HTTP so controls still work during reconnects.
-    try {
-      const r: any = await api(`/api/sessions/${encodeURIComponent(activeId)}/${type}`, { method: "POST" });
-      if (r?.event && activeIdRef.current === activeId) ingestEventRaw(r.event);
-      setToast(`${type} sent`);
-    } catch (e: any) {
-      setToast(typeof e?.message === "string" ? e.message : "Not connected");
-    }
-  }
-
-  async function sendRaw(text: string) {
-    if (!activeId) {
-      setToast("No active session");
-      return;
-    }
-    if (activeSessionClosing) {
-      setToast("Session is closing");
-      return;
-    }
-
-    if (ws.current && ws.current.readyState === WebSocket.OPEN && connectedSessionId.current === activeId) {
-      ws.current.send(JSON.stringify({ type: "input", text }));
-      return;
-    }
-
-    try {
-      const r: any = await api(`/api/sessions/${encodeURIComponent(activeId)}/input`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      if (r?.event && activeIdRef.current === activeId) ingestEventRaw(r.event);
-      setToast("Sent");
-    } catch (e: any) {
-      setToast(typeof e?.message === "string" ? e.message : "Not connected");
-    }
-  }
-
-  async function copyTermSelection() {
-    const sel = (() => {
-      try {
-        return String(term.current?.getSelection?.() ?? "");
-      } catch {
-        return "";
+  const switchMode = useCallback((mode: "wrap" | "terminal") => {
+    if (!activeSessionId) return;
+    api(`/api/sessions/${activeSessionId}/mode`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode }),
+    }).then(async () => {
+      await refresh();
+      if (mode !== "wrap") return;
+      const threadId = String(activeSessionDef?.toolSessionId ?? "");
+      if (isCodexNative && threadId) {
+        void refreshNativeThread(threadId);
+        return;
       }
-    })();
-    if (!sel.trim()) {
-      setToast("Select text in the terminal to copy");
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(sel);
-      setToast("Copied");
-    } catch {
-      setToast("Copy failed (clipboard blocked; try HTTPS or long-press)");
-    }
-  }
+      const tool = String(activeSessionDef?.tool ?? "");
+      if (tool && threadId) void refreshToolSession(tool, threadId);
+    }).catch(console.error);
+  }, [activeSessionId, refresh, activeSessionDef?.toolSessionId, activeSessionDef?.tool, isCodexNative, refreshNativeThread, refreshToolSession]);
 
-  async function pasteClipboardToTerm() {
-    if (!activeId) {
-      setToast("No active session");
-      return;
-    }
-    if (!activeCanInput) {
-      setToast(activeSessionClosing ? "Session is closing" : "Session stopped");
-      return;
-    }
-    let text = "";
-    try {
-      text = await navigator.clipboard.readText();
-    } catch {
-      setToast("Paste failed (clipboard blocked; try HTTPS)");
-      return;
-    }
-    if (!text) {
-      setToast("Clipboard empty");
-      return;
-    }
+  const openSession = useCallback((sessionId: string, taskId?: string | null) => {
+    setActiveSessionId(sessionId);
+    setActiveTaskId(taskId ?? null);
+    setTab("run");
+  }, []);
 
-    // Send directly so we can show a specific toast.
-    if (ws.current && ws.current.readyState === WebSocket.OPEN && connectedSessionId.current === activeId) {
-      ws.current.send(JSON.stringify({ type: "input", text }));
-      setToast("Pasted");
-      return;
-    }
+  const orchestrationIdFromTaskId = useCallback((taskId: string | null | undefined): string | null => {
+    const id = String(taskId ?? "").trim();
+    if (!id) return null;
+    if (id.startsWith("orch:")) return id.slice(5);
+    return null;
+  }, []);
+
+  const refreshOrchestrationProgress = useCallback(async (taskId: string) => {
+    const orchestrationId = orchestrationIdFromTaskId(taskId);
+    if (!orchestrationId) return;
     try {
-      const r: any = await api(`/api/sessions/${encodeURIComponent(activeId)}/input`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      if (r?.event && activeIdRef.current === activeId) ingestEventRaw(r.event);
-      setToast("Pasted");
+      const resp = await api<{ ok: true; item: OrchestrationProgressItem }>(
+        `/api/orchestrations/${encodeURIComponent(orchestrationId)}/progress`,
+      );
+      if (isRecord(resp?.item)) {
+        const workers = Array.isArray((resp.item as any).workers)
+          ? (resp.item as any).workers.filter(isRecord) as OrchestrationProgressWorker[]
+          : [];
+        setOrchestrationProgressByTask((prev) => ({
+          ...prev,
+          [taskId]: {
+            ...(resp.item as any),
+            workers,
+          },
+        }));
+      }
+    } catch {
+      // ignore; task may have been removed
+    }
+  }, [orchestrationIdFromTaskId]);
+
+  useEffect(() => {
+    if (!activeTaskId) return;
+    const task = tasks.find((t) => t.id === activeTaskId);
+    if (!task || task.kind !== "orchestrator") return;
+    void refreshOrchestrationProgress(activeTaskId);
+    const t = setInterval(() => void refreshOrchestrationProgress(activeTaskId), 5000);
+    return () => clearInterval(t);
+  }, [activeTaskId, tasks, refreshOrchestrationProgress]);
+
+  useEffect(() => {
+    const targetTaskIds = new Set<string>();
+    for (const item of inbox) {
+      const taskId = String(item?.taskId ?? "").trim();
+      if (item.status !== "open" || !taskId.startsWith("orch:")) continue;
+      targetTaskIds.add(taskId);
+    }
+    if (activeTaskId && activeTaskId.startsWith("orch:")) targetTaskIds.add(activeTaskId);
+    if (!targetTaskIds.size) return;
+
+    const now = Date.now();
+    for (const taskId of targetTaskIds) {
+      const last = Number(orchestrationProgressPullAtRef.current[taskId] ?? 0) || 0;
+      if (now - last < 3500) continue;
+      orchestrationProgressPullAtRef.current[taskId] = now;
+      void refreshOrchestrationProgress(taskId);
+    }
+  }, [inbox, activeTaskId, refreshOrchestrationProgress]);
+
+  const dismissInboxItem = useCallback(async (id: number) => {
+    const key = `inbox:${id}`;
+    if (removeBusyKey) return;
+    setRemoveBusyKey(key);
+    try {
+      await api(`/api/inbox/${encodeURIComponent(String(id))}/dismiss`, { method: "POST" });
+      await refresh();
     } catch (e: any) {
-      setToast(typeof e?.message === "string" ? e.message : "Not connected");
+      setTaskActionMsg(typeof e?.message === "string" ? e.message : "Dismiss failed.");
+      setTimeout(() => setTaskActionMsg(null), 3000);
+    } finally {
+      setRemoveBusyKey(null);
     }
-  }
+  }, [refresh, removeBusyKey]);
 
-  async function sendText() {
-    const text = composer.trimEnd();
-    const hasText = Boolean(text.trim());
-    if (!activeId) {
-      setToast("No active session");
-      return;
+  const removeSession = useCallback(async (sessionId: string) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid || removeBusyKey) return;
+    setRemoveBusyKey(`session:${sid}`);
+    setTaskActionMsg(null);
+    try {
+      await api(`/api/sessions/${encodeURIComponent(sid)}?force=1`, { method: "DELETE" });
+      if (activeSessionId === sid) setActiveSessionId(null);
+      await refresh();
+      setTaskActionMsg("Session removed.");
+      setTimeout(() => setTaskActionMsg(null), 2500);
+    } catch (e: any) {
+      setTaskActionMsg(typeof e?.message === "string" ? e.message : "Failed to remove session.");
+      setTimeout(() => setTaskActionMsg(null), 3000);
+    } finally {
+      setRemoveBusyKey(null);
     }
-    if (activeSessionClosing) {
-      setToast("Session is closing");
-      return;
-    }
-    if (!activeCanInput) {
-      // If the session isn't running, treat Send as "Resume" (and optionally send the queued message).
-      setToast("Resuming...");
-      try {
-        await api(`/api/sessions/${encodeURIComponent(activeId)}/restart`, {
+  }, [activeSessionId, refresh, removeBusyKey]);
+
+  const removeTask = useCallback(async (task: TaskCard | null | undefined) => {
+    if (!task || removeBusyKey) return;
+    const key = `task:${task.id}`;
+    setRemoveBusyKey(key);
+    setTaskActionMsg(null);
+    try {
+      const orchestrationId = orchestrationIdFromTaskId(task.id);
+      if (task.kind === "orchestrator" && orchestrationId) {
+        await api(`/api/orchestrations/${encodeURIComponent(orchestrationId)}/cleanup`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({}),
+          body: JSON.stringify({
+            stopSessions: true,
+            deleteSessions: true,
+            removeWorktrees: false,
+            removeRecord: true,
+            keepCoordinator: false,
+          }),
         });
-      } catch (e: any) {
-        setToast(typeof e?.message === "string" ? e.message : "Resume failed");
-        void refreshSessions();
-        return;
+      } else {
+        await api(`/api/tasks/${encodeURIComponent(task.id)}/archive`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ stopMembers: true, hardCleanup: true }),
+        });
       }
-      void refreshSessions();
-      void refreshWorkspaces();
-      if (!hasText) {
-        setComposer("");
-        return;
-      }
-    }
-    const isCodexNative = activeSession?.tool === "codex" && String(activeSession?.transport ?? "pty") === "codex-app-server";
-    const suffix = (() => {
-      const pid = activeSession?.profileId ?? "";
-      const p = pid ? profiles.find((x) => x.id === pid) ?? null : null;
-      return typeof p?.sendSuffix === "string" ? p.sendSuffix : "\r";
-    })();
-    const full = isCodexNative ? text : text + suffix;
-
-    if (!hasText) return;
-
-    if (ws.current && ws.current.readyState === WebSocket.OPEN && connectedSessionId.current === activeId) {
-      ws.current.send(JSON.stringify({ type: "input", text: full }));
-      setToast("Sent");
-      setComposer("");
-      return;
-    }
-
-    // HTTP fallback for reliability (works even if the session socket is reconnecting).
-    try {
-      const r: any = await api(`/api/sessions/${encodeURIComponent(activeId)}/input`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: full }),
+      setOrchestrationProgressByTask((prev) => {
+        const next = { ...prev };
+        delete next[task.id];
+        return next;
       });
-      if (r?.event && activeIdRef.current === activeId) ingestEventRaw(r.event);
-      setToast("Sent");
-      setComposer("");
-      return;
+      if (activeTaskId === task.id) setActiveTaskId(null);
+      if (task.primarySessionId && activeSessionId === task.primarySessionId) setActiveSessionId(null);
+      await refresh();
+      setTaskActionMsg("Task removed.");
+      setTimeout(() => setTaskActionMsg(null), 2600);
     } catch (e: any) {
-      const msg = typeof e?.message === "string" ? e.message : "";
-      // Don't queue when the server explicitly rejected the input (e.g. the session stopped).
-      if (msg.includes("Session stopped") || msg.includes("session_not_running") || msg.includes("unknown session")) {
-        setToast(msg || "Session stopped");
-        void refreshSessions();
-        return;
-      }
-
-      // If the host is unreachable (offline), keep the message and send once the socket reconnects.
-      const q = pendingInputBySession.current[activeId] ?? [];
-      q.push(full);
-      pendingInputBySession.current[activeId] = q;
-      setToast(!online ? "Queued (offline)" : "Queued (reconnecting...)");
-      setComposer("");
+      setTaskActionMsg(typeof e?.message === "string" ? e.message : "Failed to remove task.");
+      setTimeout(() => setTaskActionMsg(null), 3200);
+    } finally {
+      setRemoveBusyKey(null);
     }
-  }
+  }, [activeSessionId, activeTaskId, orchestrationIdFromTaskId, refresh, removeBusyKey]);
 
-  async function startSessionWith(input: {
-    tool: ToolId;
-    profileId: string;
-    transport?: string;
-    cwd?: string;
-    overrides?: any;
-    savePreset?: boolean;
-    toolAction?: "resume" | "fork";
-    toolSessionId?: string;
-  }) {
+  const quickLaunchTerminal = useCallback(async (tool: ToolId) => {
+    setRunLaunchMsg(null);
     try {
-      const res = await api<{ id: string }>("/api/sessions", {
+      const created = await api<{ id: string; taskId?: string | null }>("/api/sessions", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          tool: input.tool,
-          profileId: input.profileId,
-          transport: input.transport,
-          cwd: input.cwd,
-          toolAction: input.toolAction,
-          toolSessionId: input.toolSessionId,
-          overrides: input.overrides ?? {},
-          savePreset: typeof input.savePreset === "boolean" ? input.savePreset : false,
+          tool,
+          profileId: `${tool}.default`,
+          cwd: defaultWorkspacePath || undefined,
+          savePreset: true,
+          overrides: withShareModeClaudeTrust(tool, {}),
         }),
       });
-      setToast("Session started");
-      const rows = await refreshSessions();
-      await refreshRecentWorkspaces();
-      await refreshWorkspaces();
-      openSession(res.id);
-      void autoPinSession(res.id, rows);
+      if (features.terminalModeEnabled) {
+        await api(`/api/sessions/${encodeURIComponent(created.id)}/mode`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ mode: "terminal" }),
+        }).catch(() => undefined);
+      }
+      await refresh();
+      openSession(created.id, created.taskId);
     } catch (e: any) {
-      setToast(typeof e?.message === "string" ? e.message : "failed to create session");
+      setRunLaunchMsg(typeof e?.message === "string" ? e.message : `Failed to launch ${tool}.`);
     }
-  }
+  }, [defaultWorkspacePath, features.terminalModeEnabled, refresh, openSession, withShareModeClaudeTrust]);
 
-  async function createSession() {
-    const overrides: any = {};
-    if (tool === "codex") {
-      overrides.codex = {
-        sandbox: codexOpt.sandbox || undefined,
-        askForApproval: codexOpt.askForApproval || undefined,
-        fullAuto: codexOpt.fullAuto,
-        bypassApprovalsAndSandbox: codexOpt.bypassApprovalsAndSandbox,
-        search: codexOpt.search,
-        noAltScreen: codexOpt.noAltScreen,
-        addDir: dirsFromText(codexOpt.addDirText),
-      };
-    }
-    if (tool === "claude") {
-      overrides.claude = {
-        permissionMode: claudeOpt.permissionMode || undefined,
-        dangerouslySkipPermissions: claudeOpt.dangerouslySkipPermissions,
-        addDir: dirsFromText(claudeOpt.addDirText),
-      };
-    }
-    if (tool === "opencode") {
-      overrides.opencode = {
-        model: opencodeOpt.model || undefined,
-        agent: opencodeOpt.agent || undefined,
-        prompt: opencodeOpt.prompt || undefined,
-        continue: opencodeOpt.cont,
-        session: opencodeOpt.session || undefined,
-        fork: opencodeOpt.fork,
-      };
-    }
-    await startSessionWith({
-      tool,
-      profileId,
-      transport: tool === "codex" ? String((codexOpt as any).transport ?? "pty") : undefined,
-      cwd: cwd.trim() ? cwd.trim() : undefined,
-      overrides,
-      savePreset,
-    });
-  }
+  const applyPickedDirectory = useCallback((pickedPath: string) => {
+    const cleaned = String(pickedPath ?? "").trim();
+    if (!cleaned) return;
+    if (dirPickerTarget === "soloCwd") setSoloCwd(cleaned);
+    else setCreateProjectPath(cleaned);
+    setDirPickerOpen(false);
+    setDirPickerMsg(null);
+  }, [dirPickerTarget]);
 
-  async function loadOpenCodeModels(opts?: { provider?: string; refresh?: boolean }) {
-    setModelListMsg(null);
-    setModelLoading(true);
+  const loadDirectoryPicker = useCallback(async (rawPath: string, opts?: { showHidden?: boolean }) => {
+    const startPath =
+      String(rawPath ?? "").trim() ||
+      defaultWorkspacePath ||
+      doctor?.workspaceRoots?.[0] ||
+      "/";
+    const showHidden =
+      typeof opts?.showHidden === "boolean" ? opts.showHidden : dirPickerShowHidden;
+    setDirPickerBusy(true);
+    setDirPickerMsg(null);
     try {
-      const qs = new URLSearchParams();
-      const provider = typeof opts?.provider === "string" ? opts.provider.trim() : "";
-      const refresh = Boolean(opts?.refresh);
-      if (provider) qs.set("provider", provider);
-      if (refresh) qs.set("refresh", "1");
-      const r = await api<{ ok: boolean; items: string[]; cached?: boolean }>("/api/opencode/models" + (qs.toString() ? `?${qs}` : ""));
-      setModelList(Array.isArray((r as any)?.items) ? (r as any).items.map((s: any) => String(s)).filter(Boolean) : []);
+      const resp = await api<{
+        dir?: string;
+        parent?: string | null;
+        entries?: Array<{ name?: string; path?: string; kind?: string }>;
+      }>(`/api/fs/list?path=${encodeURIComponent(startPath)}&showHidden=${showHidden ? "1" : "0"}`);
+      const items = Array.isArray(resp?.entries)
+        ? resp.entries
+          .map((it) => {
+            const name = String(it?.name ?? "").trim();
+            const pathVal = String(it?.path ?? "").trim();
+            const kind = String(it?.kind ?? "") === "dir" ? "dir" : "file";
+            if (!name || !pathVal) return null;
+            return { name, path: pathVal, kind };
+          })
+          .filter(Boolean) as Array<{ name: string; path: string; kind: "dir" | "file" }>
+        : [];
+      setDirPickerPath(String(resp?.dir ?? startPath));
+      setDirPickerParent(typeof resp?.parent === "string" && resp.parent.trim() ? String(resp.parent) : null);
+      setDirPickerEntries(items);
     } catch (e: any) {
-      setModelList([]);
-      setModelListMsg(typeof e?.message === "string" ? e.message : "failed to load models");
+      setDirPickerMsg(typeof e?.message === "string" ? e.message : "Could not open this folder.");
     } finally {
-      setModelLoading(false);
+      setDirPickerBusy(false);
     }
-  }
+  }, [defaultWorkspacePath, doctor?.workspaceRoots, dirPickerShowHidden]);
 
-  async function respondInbox(attentionId: number, optionId: string) {
-    const sid = inbox.find((x) => x.id === attentionId)?.sessionId ?? null;
+  const openDirectoryPicker = useCallback((target: DirectoryPickerTarget) => {
+    const current = target === "soloCwd" ? soloCwd.trim() : createProjectPath.trim();
+    const initialPath = current || defaultWorkspacePath || doctor?.workspaceRoots?.[0] || "/";
+    setDirPickerTarget(target);
+    setDirPickerOpen(true);
+    setDirPickerPath(initialPath);
+    setDirPickerParent(null);
+    setDirPickerEntries([]);
+    setDirPickerMsg(null);
+    void loadDirectoryPicker(initialPath, { showHidden: dirPickerShowHidden });
+  }, [soloCwd, createProjectPath, defaultWorkspacePath, doctor?.workspaceRoots, loadDirectoryPicker, dirPickerShowHidden]);
+
+  const toggleDirectoryHidden = useCallback((next: boolean) => {
+    setDirPickerShowHidden(next);
+    void loadDirectoryPicker(dirPickerPath || defaultWorkspacePath || "/", { showHidden: next });
+  }, [dirPickerPath, defaultWorkspacePath, loadDirectoryPicker]);
+
+  const createDirectoryInPicker = useCallback(async (name: string, parentPath: string) => {
+    const folderName = String(name ?? "").trim();
+    if (!folderName) {
+      setDirPickerMsg("Enter a folder name.");
+      return;
+    }
+    setDirPickerBusy(true);
+    setDirPickerMsg(null);
     try {
-      const r: any = await api(`/api/inbox/${attentionId}/respond`, {
+      const resp = await api<{ path?: string; created?: boolean }>("/api/fs/mkdir", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ optionId }),
+        body: JSON.stringify({ path: parentPath, name: folderName }),
       });
-      if (r?.event && sid && activeIdRef.current === sid) ingestEventRaw(r.event);
-      await refreshInbox({ workspaceKey: selectedWorkspaceKey });
+      const nextPath = String(resp?.path ?? "").trim();
+      if (nextPath) {
+        setDirPickerMsg(resp?.created === false ? "Folder already exists." : "Folder created.");
+        await loadDirectoryPicker(nextPath, { showHidden: dirPickerShowHidden });
+      } else {
+        setDirPickerMsg("Folder ready.");
+        await loadDirectoryPicker(parentPath, { showHidden: dirPickerShowHidden });
+      }
     } catch (e: any) {
-      setToast(typeof e?.message === "string" ? e.message : "failed to respond");
-    }
-  }
-
-  async function dismissInbox(attentionId: number) {
-    const sid = inbox.find((x) => x.id === attentionId)?.sessionId ?? null;
-    try {
-      const r: any = await api(`/api/inbox/${attentionId}/dismiss`, { method: "POST" });
-      if (r?.event && sid && activeIdRef.current === sid) ingestEventRaw(r.event);
-      await refreshInbox({ workspaceKey: selectedWorkspaceKey });
-    } catch {
-      setToast("dismiss failed");
-    }
-  }
-
-  async function openToolChat(tool: ToolSessionTool, sessionId: string, opts?: { refresh?: boolean; limit?: number; keep?: boolean }) {
-    setToolChatMsg(null);
-    setToolChatLoading(true);
-    const limit = Number.isFinite(Number(opts?.limit)) ? Math.floor(Number(opts?.limit)) : 240;
-    const lim = Math.min(5000, Math.max(60, limit));
-    setToolChatLimit(lim);
-    if (!opts?.keep) {
-      setToolChatMessages([]);
-      setToolChatSession(null);
-    }
-    setShowToolChat(true);
-    try {
-      const qs = new URLSearchParams();
-      qs.set("limit", String(lim));
-      if (opts?.refresh) qs.set("refresh", "1");
-      const r = await api<{ ok: true; session: ToolSessionSummary; messages: ToolSessionMessage[] }>(
-        `/api/tool-sessions/${encodeURIComponent(tool)}/${encodeURIComponent(sessionId)}/messages?${qs.toString()}`,
-      );
-      setToolChatSession(r.session ?? null);
-      setToolChatMessages(Array.isArray(r.messages) ? r.messages : []);
-    } catch (e: any) {
-      setToolChatMsg(typeof e?.message === "string" ? e.message : "failed to load chat history");
+      setDirPickerMsg(typeof e?.message === "string" ? e.message : "Failed to create folder.");
     } finally {
-      setToolChatLoading(false);
+      setDirPickerBusy(false);
     }
-  }
+  }, [dirPickerShowHidden, loadDirectoryPicker]);
 
-  async function loadCodexNativeThread(threadId: string) {
-    if (!threadId) return;
-    setCodexNativeMsg(null);
-    setCodexNativeLoading(true);
+
+  const analyzeGoal = useCallback(async () => {
+    const objective = createObjective.trim();
+    const projectPath = createProjectPath.trim() || defaultWorkspacePath;
+    if (!objective) { setCreateMsg({ text: "Describe what you want to accomplish.", ok: false }); return; }
+    setCreateBusy("analyzing");
+    setCreateMsg(null);
+    setRecommendation(null);
     try {
-      const r = await api<{ ok: true; thread: any }>(`/api/codex-native/threads/${encodeURIComponent(threadId)}`);
-      setCodexNativeThread((r as any)?.thread ?? null);
+      const result = await api<{ ok: boolean; recommendation: any }>("/api/harness/creator/recommend", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          objective,
+          projectPath: projectPath || undefined,
+          prefs: { budget, priority: "balanced", maxWorkers: 4, allowWorkspaceScan: true },
+        }),
+      });
+      if (result?.recommendation) setRecommendation(result.recommendation);
+      else setCreateMsg({ text: "Couldn't generate a recommendation. Try again.", ok: false });
     } catch (e: any) {
-      setCodexNativeThread(null);
-      setCodexNativeMsg(typeof e?.message === "string" ? e.message : "failed to load Codex thread");
-    } finally {
-      setCodexNativeLoading(false);
-    }
-  }
+      setCreateMsg({ text: typeof e?.message === "string" ? e.message : "Analysis failed.", ok: false });
+    } finally { setCreateBusy(null); }
+  }, [createObjective, createProjectPath, defaultWorkspacePath, budget]);
 
-  async function startFromToolSession(ts: ToolSessionSummary, action: "resume" | "fork") {
+  const launchFromRecommendation = useCallback(async () => {
+    if (!recommendation || createBusy) return;
+    const objective = createObjective.trim();
+    const projectPath = (createProjectPath.trim() || defaultWorkspacePath);
+    if (!projectPath) { setCreateMsg({ text: "Project path is required.", ok: false }); return; }
+    setCreateBusy("orchestration");
+    setCreateMsg(null);
     try {
-      // Prefer per-workspace defaults (tool-native settings and approvals) if present.
-      let pid = `${ts.tool}.default`;
-      let overrides: any = {};
+      const built = await api<{ ok: boolean; orchestrationSpec?: any }>("/api/harness/creator/build", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ objective, projectPath, prefs: { budget, priority: "balanced", maxWorkers: 4, allowWorkspaceScan: true } }),
+      });
+      if (!built?.orchestrationSpec) throw new Error("No spec returned.");
+      const orchestrationSpec = structuredClone(built.orchestrationSpec ?? {});
+      if (isRecord(orchestrationSpec?.orchestrator)) {
+        const orchTool = String((orchestrationSpec.orchestrator as any).tool ?? "").trim() as ToolId;
+        const withModel = mergeToolOverrides((orchestrationSpec.orchestrator as any).overrides, modelOverridesForTool(orchTool, autoOrchestratorModel));
+        const finalOverrides = withShareModeClaudeTrust(orchTool, withModel);
+        if (Object.keys(finalOverrides).length > 0) (orchestrationSpec.orchestrator as any).overrides = finalOverrides;
+      }
+      const workers = Array.isArray(orchestrationSpec?.workers) ? orchestrationSpec.workers : [];
+      orchestrationSpec.workers = workers.map((w: any, idx: number) => {
+        const tool = String(w?.tool ?? "").trim() as ToolId;
+        const merged = withShareModeClaudeTrust(tool, mergeToolOverrides(w?.overrides, modelOverridesForTool(tool, autoWorkerModels[idx] ?? "")));
+        if (Object.keys(merged).length === 0) return w;
+        return {
+          ...w,
+          overrides: merged,
+        };
+      });
+      const managedAutomation = {
+        questionMode: "orchestrator",
+        steeringMode: "passive_review",
+        questionTimeoutMs: 120_000,
+        reviewIntervalMs: 300_000,
+        yoloMode: false,
+      } as const;
+      const existingAutomation = isRecord((orchestrationSpec as any)?.automation)
+        ? ((orchestrationSpec as any).automation as Record<string, any>)
+        : {};
+      (orchestrationSpec as any).automation = {
+        ...managedAutomation,
+        ...existingAutomation,
+      };
+      const created = await api<{ id: string; taskId?: string | null }>("/api/orchestrations", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(orchestrationSpec),
+      });
+      if (created?.taskId) {
+        // Auto/orchestrator flows are wrapper-first by design.
+        await api(`/api/tasks/${encodeURIComponent(created.taskId)}/mode`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ mode: "wrap" }),
+        }).catch(() => undefined);
+      }
+      await refresh();
+      setTab("workspace");
+      if (created?.taskId) setActiveTaskId(created.taskId);
+      setActiveSessionId(null);
+      setRecommendation(null);
+      setCreateMsg({ text: `Launched — ${recommendation.workers?.length ?? "?"} agents starting.`, ok: true });
+    } catch (e: any) {
+      setCreateMsg({ text: typeof e?.message === "string" ? e.message : "Launch failed.", ok: false });
+    } finally { setCreateBusy(null); }
+  }, [recommendation, createBusy, createObjective, createProjectPath, defaultWorkspacePath, budget, refresh, autoOrchestratorModel, autoWorkerModels, withShareModeClaudeTrust]);
+
+  const createFromPreset = useCallback(async (preset: PresetDef) => {
+    if (createBusy) return;
+    const cwd = soloCwd.trim() || defaultWorkspacePath;
+
+    if (preset.kind === "session") {
+      const tool = soloTool; // override with user's tool selection for solo
+      const profileId = soloProfile || `${tool}.default`;
+      const modelOverrides = modelOverridesForTool(tool, soloModel);
+      setCreateBusy("session");
+      setCreateMsg(null);
       try {
-        const pr = await api<{ ok: true; preset: any | null }>(
-          `/api/workspaces/preset?path=${encodeURIComponent(ts.cwd)}&tool=${encodeURIComponent(ts.tool)}`,
-        );
-        if (pr?.preset && typeof pr.preset.profileId === "string") {
-          pid = pr.preset.profileId;
-          overrides = pr.preset.overrides ?? {};
+        const created = await api<{ id: string; taskId?: string | null }>("/api/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            tool,
+            profileId,
+            cwd: cwd || undefined,
+            savePreset: true,
+            overrides: withShareModeClaudeTrust(tool, modelOverrides),
+          }),
+        });
+        if (features.terminalModeEnabled) {
+          await api(`/api/sessions/${encodeURIComponent(created.id)}/mode`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ mode: "terminal" }),
+          }).catch(() => undefined);
         }
-      } catch {
-        // ignore
-      }
-      await startSessionWith({
-        tool: ts.tool as any,
-        profileId: pid,
-        transport: ts.tool === "codex" ? String((codexOpt as any).transport ?? "pty") : undefined,
-        cwd: ts.cwd,
-        overrides,
-        savePreset: false,
-        toolAction: action,
-        toolSessionId: ts.id,
-      });
-    } catch (e: any) {
-      setToast(typeof e?.message === "string" ? e.message : "failed to start session");
-    }
-  }
-
-  async function setSessionMeta(sessionId: string, patch: { label?: string | null; pinnedSlot?: number | null }) {
-    const r: any = await api(`/api/sessions/${encodeURIComponent(sessionId)}/meta`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    if (r?.event && activeIdRef.current === sessionId) ingestEventRaw(r.event);
-  }
-
-  async function autoPinSession(sessionId: string, rows?: SessionRow[] | null) {
-    if (!autoPinNew) return;
-    const list = Array.isArray(rows) && rows.length ? rows : sessions;
-    const sess = list.find((s) => s.id === sessionId) ?? null;
-    if (!sess) return;
-    const already = typeof sess.pinnedSlot === "number" ? sess.pinnedSlot : null;
-    if (already && already >= 1 && already <= 6) return;
-
-    const groupKey = String(sess.workspaceKey ?? (sess.cwd ? `dir:${sess.cwd}` : `dir:${sess.id}`));
-    const used = new Set<number>();
-    for (const s of list) {
-      const g = String(s.workspaceKey ?? (s.cwd ? `dir:${s.cwd}` : `dir:${s.id}`));
-      if (g !== groupKey) continue;
-      const ps = typeof s.pinnedSlot === "number" ? s.pinnedSlot : null;
-      if (ps && ps >= 1 && ps <= 6) used.add(ps);
-    }
-
-    let chosen: number = slotCfg.slots;
-    for (let i = 1; i <= slotCfg.slots; i++) {
-      if (!used.has(i)) {
-        chosen = i;
-        break;
-      }
-    }
-
-    // Optimistic update: clear any other session in this group already in the chosen slot.
-    setSessions((prev) =>
-      prev.map((s) => {
-        const g = String(s.workspaceKey ?? (s.cwd ? `dir:${s.cwd}` : `dir:${s.id}`));
-        if (g !== groupKey) return s;
-        if (s.id === sessionId) return { ...s, pinnedSlot: chosen };
-        if (s.pinnedSlot === chosen) return { ...s, pinnedSlot: null };
-        return s;
-      }),
-    );
-
-    try {
-      await setSessionMeta(sessionId, { pinnedSlot: chosen });
-    } catch {
-      // If pin fails (e.g. server rejected), re-sync.
-      refreshSessions();
-      refreshWorkspaces();
-    }
-  }
-
-  async function togglePin(sessionId: string) {
-    const sess = sessions.find((s) => s.id === sessionId) ?? null;
-    if (!sess) return;
-    const groupKey = String(sess.workspaceKey ?? `dir:${sess.cwd ?? sessionId}`);
-    const current = typeof sess.pinnedSlot === "number" ? sess.pinnedSlot : null;
-
-    // Unpin
-    if (current && current >= 1 && current <= 6) {
-      setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, pinnedSlot: null } : s)));
-      try {
-        await setSessionMeta(sessionId, { pinnedSlot: null });
-        setToast("Unpinned");
+        await refresh();
+        openSession(created.id, created.taskId);
       } catch (e: any) {
-        setToast(typeof e?.message === "string" ? e.message : "unpin failed");
-        refreshSessions();
-        refreshWorkspaces();
+        setCreateMsg({ text: typeof e?.message === "string" ? e.message : "Failed to start session.", ok: false });
+      } finally { setCreateBusy(null); }
+      return;
+    }
+
+    if (preset.id === "custom-team") {
+      const objective = createObjective.trim();
+      const projectPath = createProjectPath.trim() || cwd;
+      if (!objective) { setCreateMsg({ text: "Enter an objective above.", ok: false }); return; }
+      if (!projectPath) { setCreateMsg({ text: "Enter the project path.", ok: false }); return; }
+
+      const groups = customWorkerGroups
+        .map((g) => ({
+          ...g,
+          role: String(g.role || "").trim(),
+          taskTemplate: String(g.taskTemplate || "").trim() || "Help accomplish: {objective}",
+          count: Math.max(1, Math.min(CUSTOM_TEAM_MAX_GROUP_COUNT, Math.floor(Number(g.count || 1)))),
+          profileId: normalizeProfileIdForTool(g.tool, g.profileId, configProfiles),
+        }))
+        .filter((g) => g.count > 0);
+
+      const totalWorkers = groups.reduce((n, g) => n + g.count, 0);
+      if (totalWorkers < 1) { setCreateMsg({ text: "Add at least one worker.", ok: false }); return; }
+      if (totalWorkers > CUSTOM_TEAM_MAX_WORKERS) {
+        setCreateMsg({ text: `Custom team exceeds worker cap (${CUSTOM_TEAM_MAX_WORKERS}). Reduce worker counts.`, ok: false });
+        return;
+      }
+
+      setCreateBusy("orchestration");
+      setCreateMsg(null);
+      try {
+        const orchProfile = normalizeProfileIdForTool(customOrchestratorTool, customOrchestratorProfile, configProfiles);
+        const workersPayload: Array<Record<string, any>> = [];
+        for (let gi = 0; gi < groups.length; gi++) {
+          const g = groups[gi]!;
+          const baseName = g.role || `worker-${gi + 1}`;
+          const taskPromptBase = materializeTaskPrompt(g.taskTemplate, objective);
+          for (let wi = 0; wi < g.count; wi++) {
+            const name = g.count > 1 ? `${baseName} ${wi + 1}` : baseName;
+            workersPayload.push({
+              name,
+              role: g.role || "worker",
+              tool: g.tool,
+              profileId: g.profileId,
+              taskPrompt: taskPromptBase,
+              overrides: withShareModeClaudeTrust(g.tool, modelOverridesForTool(g.tool, g.model)),
+            });
+          }
+        }
+
+        const created = await api<{ id: string; taskId?: string | null }>("/api/orchestrations", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: `Custom Team: ${objective.slice(0, 60)}`,
+            projectPath,
+            dispatchMode: "orchestrator-first",
+            autoDispatchInitialPrompts: true,
+            automation: customTeamAutomationPayload,
+            orchestrator: {
+              tool: customOrchestratorTool,
+              profileId: orchProfile,
+              prompt: objective,
+              overrides: withShareModeClaudeTrust(customOrchestratorTool, modelOverridesForTool(customOrchestratorTool, customOrchestratorModel)),
+            },
+            workers: workersPayload,
+            harness: { useDefaultPrompts: true },
+          }),
+        });
+        if (created?.id) {
+          const syncMode = customTeamAutomationMode === "manual" ? "manual" : "interval";
+          await api(`/api/orchestrations/${encodeURIComponent(created.id)}/sync-policy`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              mode: syncMode,
+              intervalMs: Math.max(30_000, customTeamAutomationPayload.reviewIntervalMs),
+              deliverToOrchestrator: true,
+              minDeliveryGapMs: Math.max(30_000, Math.floor(customTeamAutomationPayload.reviewIntervalMs / 2)),
+            }),
+          }).catch(() => undefined);
+          await api(`/api/orchestrations/${encodeURIComponent(created.id)}/automation-policy`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              ...customTeamAutomationPayload,
+              runNow: customTeamAutomationMode !== "manual",
+              force: customTeamAutomationMode === "autopilot",
+            }),
+          }).catch(() => undefined);
+        }
+        if (features.terminalModeEnabled && created?.taskId) {
+          await api(`/api/tasks/${encodeURIComponent(created.taskId)}/mode`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ mode: "terminal" }),
+          }).catch(() => undefined);
+        }
+        await refresh();
+        setTab("workspace");
+        if (created?.taskId) setActiveTaskId(created.taskId);
+        setActiveSessionId(null);
+        setCreateMsg({ text: `Custom Team started — ${workersPayload.length + 1} agents launched.`, ok: true });
+      } catch (e: any) {
+        setCreateMsg({ text: typeof e?.message === "string" ? e.message : "Failed to start custom team.", ok: false });
+      } finally {
+        setCreateBusy(null);
       }
       return;
     }
 
-    // Pick a slot (first free in visible slots; else replace last visible).
-    const used = new Set<number>();
-    for (const s of sessions) {
-      const g = String(s.workspaceKey ?? `dir:${s.cwd ?? s.id}`);
-      if (g !== groupKey) continue;
-      const ps = typeof s.pinnedSlot === "number" ? s.pinnedSlot : null;
-      if (ps && ps >= 1 && ps <= 6) used.add(ps);
-    }
-    let chosen: number = slotCfg.slots;
-    for (let i = 1; i <= slotCfg.slots; i++) {
-      if (!used.has(i)) {
-        chosen = i;
-        break;
-      }
-    }
+    // Orchestration preset
+    const objective = createObjective.trim();
+    const projectPath = createProjectPath.trim() || cwd;
+    if (!objective) { setCreateMsg({ text: "Enter an objective above.", ok: false }); return; }
+    if (!projectPath) { setCreateMsg({ text: "Enter the project path.", ok: false }); return; }
 
-    // Optimistic: clear any other session in this group already in this slot.
-    setSessions((prev) =>
-      prev.map((s) => {
-        const g = String(s.workspaceKey ?? `dir:${s.cwd ?? s.id}`);
-        if (g !== groupKey) return s;
-        if (s.id === sessionId) return { ...s, pinnedSlot: chosen };
-        if (s.pinnedSlot === chosen) return { ...s, pinnedSlot: null };
-        return s;
-      }),
-    );
+    setCreateBusy("orchestration");
+    setCreateMsg(null);
+
+    const orchPair = preset.agents.map((agent, idx) => ({ agent, idx })).find((x) => x.agent.role === "orchestrator");
+    const workerPairs = preset.agents
+      .map((agent, idx) => ({ agent, idx }))
+      .filter((x) => x.agent.role === "worker");
+    if (!orchPair) {
+      setCreateMsg({ text: "Preset is missing an orchestrator.", ok: false });
+      setCreateBusy(null);
+      return;
+    }
+    const orchAgent = orchPair.agent;
+    const orchModelOverride = modelOverridesForTool(orchAgent.tool, manualAgentModels[orchPair.idx] ?? "");
+
     try {
-      await setSessionMeta(sessionId, { pinnedSlot: chosen });
-      setToast(`Pinned to slot ${chosen}`);
-    } catch (e: any) {
-      setToast(typeof e?.message === "string" ? e.message : "pin failed");
-      refreshSessions();
-      refreshWorkspaces();
-    }
-  }
-
-  async function loadPicker(pathStr?: string, opts?: { showHidden?: boolean }) {
-    const p = pathStr ?? pickPath ?? "";
-    const showHidden = typeof opts?.showHidden === "boolean" ? opts.showHidden : pickShowHidden;
-    const qs = new URLSearchParams();
-    if (p) qs.set("path", p);
-    if (showHidden) qs.set("showHidden", "1");
-    const r = await api<{ dir: string; parent: string | null; entries: { name: string; path: string; kind: string }[] }>(
-      "/api/fs/list?" + qs.toString(),
-    );
-    setPickPath(r.dir);
-    setPickParent(r.parent);
-    setPickEntries(r.entries);
-  }
-
-  async function openConfig() {
-    setConfigMsg(null);
-    setShowConfig(true);
-    try {
-      const r = await api<{ toml: string }>("/api/config/raw");
-      setConfigToml(r.toml);
-    } catch (e: any) {
-      setConfigMsg(typeof e?.message === "string" ? e.message : "failed to load config");
-    }
-  }
-
-  async function saveConfig() {
-    setConfigMsg(null);
-    try {
-      await api("/api/config/raw", {
-        method: "PUT",
+      const created = await api<{ id: string; taskId?: string | null }>("/api/orchestrations", {
+        method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ toml: configToml }),
+        body: JSON.stringify({
+          name: `${preset.name}: ${objective.slice(0, 60)}`,
+          projectPath,
+          automation: {
+            questionMode: "orchestrator",
+            steeringMode: "passive_review",
+            questionTimeoutMs: 120_000,
+            reviewIntervalMs: 300_000,
+            yoloMode: false,
+          },
+          orchestrator: {
+            tool: orchAgent.tool,
+            profileId: orchAgent.profileId,
+            prompt: objective,
+            overrides: withShareModeClaudeTrust(orchAgent.tool, orchModelOverride),
+          },
+          workers: workerPairs.map(({ agent: w, idx }) => ({
+            name: w.name,
+            tool: w.tool,
+            profileId: w.profileId,
+            taskPrompt: materializeTaskPrompt(w.taskPrompt || "Help accomplish: {objective}", objective),
+            overrides: withShareModeClaudeTrust(w.tool, modelOverridesForTool(w.tool, manualAgentModels[idx] ?? "")),
+          })),
+          harness: { useDefaultPrompts: true },
+        }),
       });
-      setConfigMsg("Saved. Profiles update live; tool command changes may require a restart.");
-      const cfg = await api<{ tools: string[]; profiles: Profile[] }>("/api/config");
-      setProfiles(cfg.profiles);
+      if (features.terminalModeEnabled && created?.taskId) {
+        // Manual groups behave as true mirrored terminals by default.
+        await api(`/api/tasks/${encodeURIComponent(created.taskId)}/mode`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ mode: "terminal" }),
+        }).catch(() => undefined);
+      }
+      await refresh();
+      setTab("workspace");
+      if (created?.taskId) setActiveTaskId(created.taskId);
+      setActiveSessionId(null);
+      setCreateMsg({ text: `${preset.name} started — ${preset.agents.length} agents launched.`, ok: true });
     } catch (e: any) {
-      setConfigMsg(typeof e?.message === "string" ? e.message : "save failed");
-    }
-  }
+      setCreateMsg({ text: typeof e?.message === "string" ? e.message : "Failed to start.", ok: false });
+    } finally { setCreateBusy(null); }
+  }, [createBusy, createObjective, createProjectPath, soloTool, soloProfile, soloModel, soloCwd, defaultWorkspacePath, refresh, openSession, features.terminalModeEnabled, manualAgentModels, customWorkerGroups, customOrchestratorTool, customOrchestratorProfile, customOrchestratorModel, customTeamAutomationMode, customTeamAutomationPayload, configProfiles, withShareModeClaudeTrust]);
 
-  async function rescanDoctor() {
-    try {
-      await api("/api/doctor/rescan", { method: "POST" });
-      const d2 = await api<Doctor>("/api/doctor");
-      setDoctor(d2);
-      setToast("Rescanned tool capabilities");
-    } catch {
-      setToast("Rescan failed");
+  const customTeamWorkerTotal = useMemo(
+    () =>
+      customWorkerGroups.reduce((n, g) => {
+        const c = Math.max(1, Math.min(CUSTOM_TEAM_MAX_GROUP_COUNT, Math.floor(Number(g.count || 1))));
+        return n + c;
+      }, 0),
+    [customWorkerGroups],
+  );
+  const customTeamOverLimit = customTeamWorkerTotal > CUSTOM_TEAM_MAX_WORKERS;
+
+  const activeTask = tasks.find(t => t.id === activeTaskId);
+  const activeOrchestrationTaskId = useMemo(() => {
+    const fromTask = String(activeTask?.id ?? "").trim();
+    if (fromTask.startsWith("orch:")) return fromTask;
+    const fromSession = String(activeSessionDef?.taskId ?? "").trim();
+    if (fromSession.startsWith("orch:")) return fromSession;
+    return null;
+  }, [activeTask?.id, activeSessionDef?.taskId]);
+  const activeOrchestrationId = orchestrationIdFromTaskId(activeOrchestrationTaskId);
+  const activeOrchestrationProgress = useMemo(() => {
+    if (activeOrchestrationTaskId && orchestrationProgressByTask[activeOrchestrationTaskId]) {
+      return orchestrationProgressByTask[activeOrchestrationTaskId];
     }
-  }
+    const target = String(activeOrchestrationId ?? "").trim();
+    if (!target) return null;
+    for (const [taskId, item] of Object.entries(orchestrationProgressByTask)) {
+      if (taskId === `orch:${target}`) return item;
+      if (String(item?.orchestrationId ?? "") === target) return item;
+    }
+    return null;
+  }, [activeOrchestrationId, activeOrchestrationTaskId, orchestrationProgressByTask]);
+  const activeOrchestrationWorkers = useMemo(
+    () =>
+      (Array.isArray(activeOrchestrationProgress?.workers) ? activeOrchestrationProgress?.workers : []).map((w) => ({
+        name: String(w?.name ?? "").trim(),
+        sessionId: String(w?.sessionId ?? "").trim(),
+        running: Boolean(w?.running),
+        attention: Number(w?.attention ?? 0),
+      })),
+    [activeOrchestrationProgress?.workers],
+  );
+  const activeSessionRunning = activeSessionDef?.running ?? false;
+  const inboxCount = inbox.filter(i => i.status === "open").length;
 
   useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(null), 2400);
-    return () => clearTimeout(t);
-  }, [toast]);
-
-  useEffect(() => {
-    if (!showControls) return;
-    setLabelDraft(activeSession?.label ?? "");
-  }, [showControls, activeId]);
-
-  const codexCaps = doctor?.tools.codex;
-  const claudeCaps = doctor?.tools.claude;
-  const opencodeCaps = doctor?.tools.opencode as any;
-  const activeInboxItems = activeId ? inbox.filter((x) => x.sessionId === activeId) : [];
-  const activeInboxCount = activeInboxItems.length;
-  const workspaceInboxCount = inbox.length;
-  const activeAttention = activeInboxItems[0] ?? null;
-
-  const modelProviders = useMemo(() => {
-    const set = new Set<string>();
-    for (const m of modelList) {
-      const s = String(m || "");
-      const idx = s.indexOf("/");
-      if (idx > 0) set.add(s.slice(0, idx));
+    if (!activeSessionId || !activeOrchestrationId || showRawTerminal) {
+      setShowOrchestrationCommands(false);
     }
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [modelList]);
+  }, [activeSessionId, activeOrchestrationId, showRawTerminal]);
 
-  const codexNativeMessages = useMemo(() => {
-    const thread = codexNativeThread;
-    if (!thread) return [] as { id: string; role: "user" | "assistant"; kind: string; text: string; tone?: "default" | "thinking" | "toolUse" | "toolResult" }[];
+  const onOrchestrationCommandExecuted = useCallback(async () => {
+    queueRefresh(120);
+    if (activeOrchestrationTaskId) {
+      await refreshOrchestrationProgress(activeOrchestrationTaskId);
+    }
+    if (showRawTerminal) return;
+    if (isCodexNative && activeSessionDef?.toolSessionId) {
+      void refreshNativeThread(activeSessionDef.toolSessionId);
+      return;
+    }
+    if (activeSessionDef?.tool && activeSessionDef.toolSessionId) {
+      void refreshToolSession(activeSessionDef.tool, activeSessionDef.toolSessionId);
+    }
+  }, [
+    queueRefresh,
+    activeOrchestrationTaskId,
+    refreshOrchestrationProgress,
+    showRawTerminal,
+    isCodexNative,
+    activeSessionDef?.toolSessionId,
+    activeSessionDef?.tool,
+    refreshNativeThread,
+    refreshToolSession,
+  ]);
 
-    const out: { id: string; role: "user" | "assistant"; kind: string; text: string; tone?: "default" | "thinking" | "toolUse" | "toolResult" }[] = [];
-    const seen = new Set<string>();
-
-    const formatValue = (v: any): string => {
-      if (v == null) return "";
-      if (typeof v === "string") return v;
-      if (typeof v === "number" || typeof v === "boolean") return String(v);
-      try {
-        return JSON.stringify(v, null, 2);
-      } catch {
-        return "";
-      }
-    };
-
-    const textFrom = (v: any, depth = 0): string => {
-      if (depth > 5) return "";
-      if (v == null) return "";
-      if (typeof v === "string") return v;
-      if (typeof v === "number" || typeof v === "boolean") return String(v);
-      if (Array.isArray(v)) return v.map((x) => textFrom(x, depth + 1)).filter(Boolean).join("\n");
-      if (typeof v !== "object") return "";
-      if (typeof (v as any).text === "string") return String((v as any).text);
-      if (typeof (v as any).thinking === "string") return String((v as any).thinking);
-      if (typeof (v as any).delta === "string") return String((v as any).delta);
-      const te = (v as any).text_elements;
-      if (Array.isArray(te)) return te.map((x: any) => (typeof x?.text === "string" ? x.text : "")).join("");
-      const summary = (v as any).summary;
-      if (Array.isArray(summary)) return summary.map((x: any) => textFrom(x, depth + 1)).filter(Boolean).join("\n");
-      if (typeof summary === "string") return summary;
-      const content = (v as any).content;
-      if (Array.isArray(content)) return content.map((x: any) => textFrom(x, depth + 1)).filter(Boolean).join("\n");
-      if (typeof content === "string") return content;
-      if (content && typeof content === "object") {
-        const nested = textFrom(content, depth + 1);
-        if (nested) return nested;
-      }
-      const output = (v as any).output;
-      if (output != null) {
-        const nested = textFrom(output, depth + 1);
-        if (nested) return nested;
-      }
-      const result = (v as any).result;
-      if (result != null) {
-        const nested = textFrom(result, depth + 1);
-        if (nested) return nested;
-      }
-      return "";
-    };
-
-    const normalizeText = (v: string): string => {
-      const t = String(v ?? "").replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
-      if (!t) return "";
-      if (t.length <= 14000) return t;
-      return `${t.slice(0, 13985)}\n...[truncated]`;
-    };
-
-    const push = (m: {
-      id: string;
-      role: "user" | "assistant";
-      kind: string;
-      text: string;
-      tone?: "default" | "thinking" | "toolUse" | "toolResult";
-    }) => {
-      const text = normalizeText(m.text);
-      if (!text) return;
-      const sig = `${m.role}|${m.kind}|${m.id}|${text.slice(0, 180)}`;
-      if (seen.has(sig)) return;
-      seen.add(sig);
-      out.push({ ...m, text });
-    };
-
-    const toolCallText = (item: any): string => {
-      const name =
-        typeof item?.name === "string"
-          ? item.name
-          : typeof item?.toolName === "string"
-            ? item.toolName
-            : typeof item?.functionName === "string"
-              ? item.functionName
-              : "";
-      const args = item?.input ?? item?.arguments ?? item?.args ?? item?.payload ?? null;
-      const head = name ? `Tool: ${name}` : "Tool call";
-      const body = normalizeText(textFrom(args) || formatValue(args));
-      return body ? `${head}\n${body}` : head;
-    };
-
-    const toolResultText = (item: any): string => {
-      const raw = item?.result ?? item?.output ?? item?.response ?? item?.content ?? null;
-      const body = normalizeText(textFrom(raw) || formatValue(raw));
-      const errRaw = item?.error ?? (item?.is_error ? raw : null);
-      const err = normalizeText(textFrom(errRaw) || formatValue(errRaw));
-      if (err) return body ? `[error]\n${err}\n\n${body}` : `[error]\n${err}`;
-      return body;
-    };
-
-    const turns = Array.isArray((thread as any).turns) ? ((thread as any).turns as any[]) : [];
-    for (const turn of turns) {
-      const turnId = typeof turn?.id === "string" ? String(turn.id) : "";
-
-      const input = Array.isArray(turn?.input) ? (turn.input as any[]) : [];
-      for (let i = 0; i < input.length; i++) {
-        const it = input[i];
-        if (it && typeof it === "object" && it.type === "text" && typeof it.text === "string") {
-          push({ id: `${turnId}:in:${i}`, role: "user", kind: "input", text: String(it.text) });
-        }
-      }
-
-      const items = Array.isArray(turn?.items)
-        ? (turn.items as any[])
-        : Array.isArray(turn?.output)
-          ? (turn.output as any[])
-          : Array.isArray(turn?.messages)
-            ? (turn.messages as any[])
-            : [];
-
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        if (!item || typeof item !== "object") continue;
-
-        const type =
-          typeof item.type === "string"
-            ? String(item.type)
-            : typeof (item as any).kind === "string"
-              ? String((item as any).kind)
-              : "";
-        const typeNorm = type.toLowerCase();
-        const itemId = typeof item.id === "string" ? String(item.id) : `${turnId || "turn"}:${i}`;
-
-        if (typeNorm === "usermessage" || typeNorm === "user_message") {
-          push({
-            id: itemId,
-            role: "user",
-            kind: "user",
-            text: textFrom((item as any).text ?? (item as any).content ?? item),
-          });
-          continue;
-        }
-        if (typeNorm === "agentmessage" || typeNorm === "assistantmessage" || typeNorm === "assistant_message") {
-          push({
-            id: itemId,
-            role: "assistant",
-            kind: "assistant",
-            text: textFrom((item as any).text ?? (item as any).content ?? item),
-          });
-          continue;
-        }
-        if (typeNorm === "reasoning" || typeNorm === "thinking") {
-          const summaryText = textFrom((item as any).summary);
-          const contentText = textFrom((item as any).content);
-          push({
-            id: itemId,
-            role: "assistant",
-            kind: "thinking",
-            tone: "thinking",
-            text: summaryText || contentText || textFrom(item),
-          });
-          continue;
-        }
-        if (typeNorm === "plan") {
-          push({
-            id: itemId,
-            role: "assistant",
-            kind: "plan",
-            text: textFrom((item as any).text ?? (item as any).content ?? item),
-          });
-          continue;
-        }
-        if (typeNorm === "commandexecution" || typeNorm === "command_execution") {
-          const cmd = typeof (item as any).command === "string" ? String((item as any).command) : "";
-          const status = typeof (item as any).status === "string" ? String((item as any).status) : "";
-          const t = cmd ? `$ ${cmd}${status ? `\n[${status}]` : ""}` : textFrom(item);
-          push({ id: itemId, role: "assistant", kind: "command", text: t, tone: "toolUse" });
-          continue;
-        }
-        if (typeNorm === "filechange" || typeNorm === "file_change") {
-          const pathsRaw = Array.isArray((item as any).paths)
-            ? (item as any).paths
-            : Array.isArray((item as any).files)
-              ? (item as any).files.map((f: any) => f?.path)
+  const renderOrchestrationProgressCard = (task: TaskCard | null | undefined) => {
+    if (!task || task.kind !== "orchestrator") return null;
+    const progress = orchestrationProgressByTask[task.id];
+    if (!progress) {
+      return (
+        <div className="card">
+          <div className="cardHead"><div className="cardTitle">Worker Progress</div></div>
+          <div className="cardBody">
+            <div className="emptyCardRow">Waiting for worker progress files…</div>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className="card">
+        <div className="cardHead">
+          <div>
+            <div className="cardTitle">Worker Progress</div>
+            <div className="cardSub mono">{fmtTime(progress.generatedAt)}</div>
+          </div>
+        </div>
+        <div className="cardBody">
+          {(() => {
+            const startup = isRecord((progress as any).startup) ? ((progress as any).startup as NonNullable<OrchestrationProgressItem["startup"]>) : null;
+            if (!startup) return null;
+            const state = String(startup.state ?? "running");
+            const dispatchMode = String(startup.dispatchMode ?? "worker-first");
+            const pendingWorkers = Array.isArray(startup.pendingWorkerNames)
+              ? startup.pendingWorkerNames.filter((v) => typeof v === "string" && v.trim())
               : [];
-          const paths = pathsRaw.map((x: any) => String(x ?? "")).filter(Boolean);
-          const t = paths.length ? `Edits:\n- ${paths.join("\n- ")}` : textFrom(item);
-          push({ id: itemId, role: "assistant", kind: "edits", text: t, tone: "toolResult" });
-          continue;
-        }
+            const pendingCount = Array.isArray(startup.pendingSessionIds) ? startup.pendingSessionIds.length : 0;
+            const startupChipClass =
+              state === "waiting-first-dispatch"
+                ? "orchStartupChipWarn"
+                : state === "auto-released"
+                  ? "orchStartupChipAuto"
+                  : "orchStartupChipOk";
+            const startupChipLabel =
+              state === "waiting-first-dispatch"
+                ? "Waiting for first dispatch"
+                : state === "auto-released"
+                  ? "Auto-released"
+                  : "Workers released";
+            const startupLine =
+              state === "waiting-first-dispatch"
+                ? `${pendingCount} worker${pendingCount === 1 ? "" : "s"} still gated.`
+                : dispatchMode === "worker-first"
+                  ? "Worker-first mode starts workers automatically."
+                  : "Orchestrator-first release is complete.";
+            return (
+              <div
+                className={`orchStartupStrip ${state === "waiting-first-dispatch"
+                    ? "orchStartupStripWarn"
+                    : state === "auto-released"
+                      ? "orchStartupStripAuto"
+                      : "orchStartupStripOk"
+                  }`}
+              >
+                <div className="orchStartupTop">
+                  <span className={`orchStartupChip mono ${startupChipClass}`}>{startupChipLabel}</span>
+                  <span className="orchStartupText">{startupLine}</span>
+                </div>
+                {state === "waiting-first-dispatch" && pendingWorkers.length > 0 ? (
+                  <div className="orchStartupPending mono">Pending: {pendingWorkers.join(", ")}</div>
+                ) : null}
+              </div>
+            );
+          })()}
+          {(Array.isArray(progress.workers) ? progress.workers : []).map((w) => {
+            const total = Number(w.progress?.checklistTotal ?? 0);
+            const done = Number(w.progress?.checklistDone ?? 0);
+            const ratio = total > 0 ? `${done}/${total}` : "—";
+            const rawPreview = String(w.preview ?? w.progress?.preview ?? "");
+            const meta = parseProgressPreviewMeta(rawPreview);
+            const showMeta = Boolean(progressMetaOpen[w.sessionId]);
+            const hasHiddenMeta = Boolean(meta.generatedAt || meta.orchestrationId);
+            const activityState = String(w.activity?.state ?? (w.running ? "live" : "idle"));
+            const idleAge = fmtIdleAge(Number(w.activity?.idleForMs ?? 0) || null);
+            const awaitingOrchestrator =
+              Boolean(w.running) &&
+              (activityState === "needs_input" || activityState === "waiting_or_done");
+            const statusLabel =
+              activityState === "needs_input"
+                ? "needs input"
+                : activityState === "waiting_or_done"
+                  ? "waiting/done"
+                  : w.running
+                    ? "live"
+                    : "idle";
+            const statusClass =
+              activityState === "needs_input"
+                ? "dotWarn"
+                : activityState === "waiting_or_done"
+                  ? "dotWait"
+                  : w.running
+                    ? "dotOn"
+                    : "dotOff";
+            return (
+              <div key={w.sessionId} className="progressRow">
+                <div className="progressRowHead">
+                  <div className="progressRowTitle">{w.name}</div>
+                  <div className="progressRowMeta">
+                    <span className={`dot ${statusClass}`}>{statusLabel}</span>
+                    <span className="chip mono">{ratio}</span>
+                    {awaitingOrchestrator ? (
+                      <span className="progressAwaitBadge mono">Awaiting orchestrator</span>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="progressRowSub mono">
+                  {w.progress?.found ? (w.progress.relPath || "task.md") : "No task.md yet"}
+                  {w.branch ? ` · ${w.branch}` : ""}
+                  {idleAge ? ` · idle ${idleAge}` : ""}
+                </div>
+                {rawPreview ? <div className="progressRowPreview">{meta.cleanText}</div> : null}
+                {hasHiddenMeta ? (
+                  <>
+                    <button
+                      className="progressMetaToggle mono"
+                      onClick={() =>
+                        setProgressMetaOpen((prev) => ({ ...prev, [w.sessionId]: !Boolean(prev[w.sessionId]) }))
+                      }
+                    >
+                      {showMeta ? "Hide meta" : "Show meta"}
+                    </button>
+                    {showMeta ? (
+                      <div className="progressMetaBody mono">
+                        {meta.generatedAt ? `Generated: ${meta.generatedAt}` : ""}
+                        {meta.generatedAt && meta.orchestrationId ? " · " : ""}
+                        {meta.orchestrationId ? `Orchestration ID: ${meta.orchestrationId}` : ""}
+                      </div>
+                    ) : null}
+                  </>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
 
-        const looksLikeToolUse =
-          /tool.*(call|use)|(?:^|_)function(?:_|$).*(call|use)|mcp.*(call|use)|call_tool/.test(typeNorm) ||
-          typeNorm === "toolcall" ||
-          typeNorm === "functioncall";
-        if (looksLikeToolUse) {
-          push({
-            id: itemId,
-            role: "assistant",
-            kind: "tool_use",
-            tone: "toolUse",
-            text: toolCallText(item),
-          });
-          continue;
-        }
+  // ── SESSION VIEW (overlays all tabs when session is active) ──
+  const renderSessionView = () => {
+    if (!activeSessionId) return null;
+    const hasToolSess = !!activeSessionDef?.toolSessionId;
 
-        const looksLikeToolResult =
-          /tool.*(result|output)|(?:^|_)function(?:_|$).*(result|output)|mcp.*(result|output)|call_result/.test(typeNorm) ||
-          typeNorm === "toolresult" ||
-          typeNorm === "functioncalloutput";
-        if (looksLikeToolResult) {
-          push({
-            id: itemId,
-            role: "assistant",
-            kind: "tool_result",
-            tone: "toolResult",
-            text: toolResultText(item),
-          });
-          continue;
-        }
+    return (
+      <div className="sessionView">
+        {/* Minimal session bar: back + mode toggle only */}
+        <div className="sessionBar">
+          <button
+            className="sessionBackBtn"
+            onClick={() => { setActiveSessionId(null); }}
+            aria-label="Back"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="15 18 9 12 15 6" />
+            </svg>
+          </button>
 
-        const fallback = textFrom(item);
-        if (fallback) {
-          push({
-            id: itemId,
-            role: "assistant",
-            kind: type || "message",
-            text: fallback,
-          });
-        }
-      }
-    }
+          <div className="sessionBarMeta">
+            {activeSessionDef?.cwd && (
+              <span className="sessionCwd">{formatDisplayPathTail(activeSessionDef.cwd, 2)}</span>
+            )}
+          </div>
 
-    return out;
-  }, [codexNativeThread]);
+          {/* Mode toggle — always show if terminal mode feature enabled, or when toolSessionId exists */}
+          {(features.terminalModeEnabled || canWrap) && (
+            <div className="sessionModeToggle">
+              <button
+                className={`sessionModeBtn ${!showRawTerminal ? "sessionModeBtnOn" : ""}`}
+                onClick={() => switchMode("wrap")}
+                disabled={!canWrap}
+                title={!canWrap ? "Chat available once session links to a tool session" : "Chat view"}
+              >
+                Chat
+              </button>
+              <button
+                className={`sessionModeBtn ${showRawTerminal ? "sessionModeBtnOn" : ""}`}
+                onClick={() => switchMode("terminal")}
+              >
+                Raw
+              </button>
+            </div>
+          )}
+          {!showRawTerminal && activeOrchestrationId ? (
+            <button
+              className={`sessionCommandBtn ${showOrchestrationCommands ? "sessionCommandBtnOn" : ""}`}
+              onClick={() => setShowOrchestrationCommands((v) => !v)}
+              aria-expanded={showOrchestrationCommands}
+            >
+              Commands
+            </button>
+          ) : null}
+        </div>
 
+        {/* Content */}
+        {showRawTerminal ? (
+          <div className="sessionTermWrap">
+            {!hasToolSess && activeSessionDef?.taskMode !== "terminal" && (
+              <div className="sessionConnecting">
+                <div className="sessionConnectingDots"><span /><span /><span /></div>
+                <span>Connecting to session…</span>
+              </div>
+            )}
+            <TerminalView session={activeSessionDef || null} />
+          </div>
+        ) : (
+          <div className="sessionChatWrap">
+            {activeOrchestrationId ? (
+              <OrchestrationCommandPanel
+                orchestrationId={activeOrchestrationId}
+                open={showOrchestrationCommands}
+                onToggle={() => setShowOrchestrationCommands((v) => !v)}
+                workers={activeOrchestrationWorkers}
+                onExecuted={onOrchestrationCommandExecuted}
+              />
+            ) : null}
+            <WrapperChatView
+              session={toolSession}
+              messages={displayToolMessages}
+              loading={false}
+              msg={runMsg}
+              running={activeSessionRunning}
+              formatPath={formatDisplayPath}
+              onRefresh={() => {
+                if (isCodexNative && activeSessionDef?.toolSessionId) {
+                  void refreshNativeThread(activeSessionDef.toolSessionId);
+                  return;
+                }
+                if (activeSessionDef?.tool && activeSessionDef.toolSessionId) {
+                  void refreshToolSession(activeSessionDef.tool, activeSessionDef.toolSessionId);
+                }
+              }}
+              onHistory={() => { }}
+            />
+          </div>
+        )}
+
+        {!showRawTerminal && (
+          <div className="compose" style={{ padding: "0 10px 8px" }}>
+            <textarea
+              value={composerText}
+              onChange={(e) => setComposerText(e.target.value)}
+              placeholder="Message this session..."
+              disabled={sendBusy}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void sendToActiveSession();
+                }
+              }}
+            />
+            <button className="composeSend" onClick={() => void sendToActiveSession()} disabled={sendBusy || !composerText.trim()} aria-label="Send">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M22 2 11 13" />
+                <path d="m22 2-7 20-4-9-9-4z" />
+              </svg>
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // ── AUTH SCREENS ──
   if (authed === "unknown") return <ConnectingScreen />;
-
   if (authed === "no") {
     return (
       <UnlockScreen
-        token={token}
-        setToken={setToken}
-        pairCode={pairCode}
-        setPairCode={setPairCode}
-        pairMsg={pairMsg}
-        unlockMsg={unlockMsg}
+        token={token} setToken={setToken}
+        pairCode={pairCode} setPairCode={setPairCode}
+        pairMsg={pairMsg} unlockMsg={unlockMsg}
         onUnlock={() => {
-          setPairMsg(null);
-          setUnlockMsg(null);
+          setPairMsg(null); setUnlockMsg(null);
           const tok = token.trim();
-          if (!tok) {
-            setUnlockMsg("Paste the long token from the host terminal.");
-            return;
-          }
+          if (!tok) { setUnlockMsg("Paste the token from the host terminal."); return; }
           const u = new URL(window.location.href);
           u.searchParams.set("token", tok);
           window.location.href = u.toString();
         }}
         onRetry={() => window.location.reload()}
         onPair={async () => {
-          setPairMsg(null);
-          setUnlockMsg(null);
+          setPairMsg(null); setUnlockMsg(null);
           try {
-            await api("/api/auth/pair/claim", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ code: pairCode }),
-            });
+            await api("/api/auth/pair/claim", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: pairCode }) });
             window.location.reload();
-          } catch (e: any) {
-            setPairMsg(typeof e?.message === "string" ? e.message : "pair failed");
-          }
+          } catch (e: any) { setPairMsg(typeof e?.message === "string" ? e.message : "Pair failed."); }
         }}
       />
     );
   }
 
+  // ── MAIN APP ──
   return (
-    <div className="shell">
-      <HeaderBar
-        online={online}
-        globalWsState={globalWsState}
-        activeSession={activeSession}
-        onOpenSettings={() => setTab("settings")}
-      />
+    <div className="app">
+      <div className="shell">
+        <HeaderBar
+          online={true}
+          globalWsState={globalWsState}
+          activeSession={activeSessionId ? activeSessionDef : null}
+          activeSessionRunning={activeSessionRunning}
+          onOpenSettings={() => { setActiveSessionId(null); setTab("settings"); }}
+        />
 
-      <main className="stage">
-        <section className="viewRun" hidden={tab !== "run"} aria-hidden={tab !== "run"}>
-          {!activeId ? (
-            <div className="emptyRun">
-              <div className="emptyRunIcon">
-                <svg viewBox="0 0 24 24" width="40" height="40"><polyline points="4 17 10 11 4 5" stroke="var(--faint)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" fill="none"/><line x1="12" y1="19" x2="20" y2="19" stroke="var(--faint)" strokeWidth="1.8" strokeLinecap="round"/></svg>
-              </div>
-              <div className="emptyTitle">No active session</div>
-              <div className="emptySub">Tap below to start</div>
-              <button className="btn primary" onClick={() => setTab("new")} style={{ marginTop: 8 }}>
-                New Session
-              </button>
-            </div>
-          ) : (
-            <div className="run">
-              <div className="runStrip">
-                <PinnedSlotsBar
-                  slots={slotCfg.slots}
-                  activeId={activeId}
-                  pinnedBySlot={pinnedBySlot}
-                  onOpenSession={openSession}
-                />
-                {pinnedOrder.length < 2 && workspaceSessionsSorted.length > 1 ? (
-                  <div className="pinBar">
-                    {workspaceSessionsSorted.slice(0, 6).map((s, idx) => {
-                      const on = s.id === activeId;
-                      const hasAttention = (s.attention ?? 0) > 0;
-                      return (
-                        <button
-                          key={s.id}
-                          className={`pinPill ${on ? "pinPillOn" : ""}`}
-                          onClick={() => openSession(s.id)}
-                          aria-label={`Session ${idx + 1}: ${s.label || s.profileId}`}
-                        >
-                          <span className="pinPillNum">{idx + 1}</span>
-                          <span className="pinPillLabel">{s.label || s.tool}</span>
-                          {hasAttention ? <span className="pinPillDot" /> : null}
-                          {s.running ? <span className="pinPillRun" /> : null}
-                        </button>
-                      );
-                    })}
-                    {workspaceSessionsSorted.length > 6 ? (
-                      <span className="chip mono">+{workspaceSessionsSorted.length - 6}</span>
-                    ) : null}
-                  </div>
-                ) : null}
-                <div className="runInfo">
-                  <div className={`dot ${activeSession?.running ? "dotOn" : "dotOff"}`}>
-                    {activeSession?.running ? "RUN" : "IDLE"}
-                  </div>
-                  <span className="mono runLabel">
-                    {activeSession?.label || activeSession?.profileId || ""}
-                  </span>
-                  {activeSessionClosing ? <span className="chip mono">closing</span> : null}
-                  {sessionWsState !== "open" ? (
-                    <span className="chip mono">
-                      {sessionWsState === "connecting" ? "..." : "off"}
-                    </span>
-                  ) : null}
-                  {!activeIsCodexNative && (activeSession?.tool === "codex" || activeSession?.tool === "claude") && !activeToolSessionId ? (
-                    <span className="chip mono">linking…</span>
-                  ) : null}
-                  {activeInboxCount > 0 ? (
-                    <button className="runAlert" onClick={() => { refreshInbox({ workspaceKey: activeWorkspaceKey }); setTab("inbox"); }}>
-                      {activeInboxCount}
-                    </button>
-                  ) : null}
-                  <div className="spacer" />
-                  <button
-                    className="runBtn"
-                    onClick={() => switchSessionRelative(-1, "button")}
-                    aria-label="Previous session"
-                    disabled={sessionSwitchOrder.length < 2}
-                    title="Previous session"
-                  >
-                    <svg viewBox="0 0 16 16" width="14" height="14">
-                      <polyline points="10 3 5 8 10 13" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-                    </svg>
-                  </button>
-                  <button
-                    className="runBtn"
-                    onClick={() => switchSessionRelative(1, "button")}
-                    aria-label="Next session"
-                    disabled={sessionSwitchOrder.length < 2}
-                    title="Next session"
-                  >
-                    <svg viewBox="0 0 16 16" width="14" height="14">
-                      <polyline points="6 3 11 8 6 13" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-                    </svg>
-                  </button>
-                  <button className="runBtn" onClick={() => sendControl("interrupt")} aria-label="Ctrl+C">
-                    <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM5 5l6 6M11 5l-6 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/></svg>
-                  </button>
-                  {!activeIsCodexNative && (activeSession?.tool === "codex" || activeSession?.tool === "claude" || (activeSession?.tool === "opencode" && Boolean(activeToolSessionId))) ? (
-                    <button
-                      className="runBtn"
-                      onClick={() => {
-                        if (!activeCanOpenChatHistory) return;
-                        const toolId = activeSession?.tool as any;
-                        openToolChat(toolId, activeToolSessionId, { refresh: true, limit: toolChatLimit });
-                      }}
-                      aria-label="Chat history"
-                      title={activeCanOpenChatHistory ? "Chat history" : "Chat history (linking...)"}
-                      disabled={!activeCanOpenChatHistory}
-                    >
-                      <svg viewBox="0 0 16 16" width="14" height="14">
-                        <path
-                          d="M3 3.5h10v6H6.5L4 12V9.5H3v-6z"
-                          stroke="currentColor"
-                          strokeWidth="1.5"
-                          strokeLinejoin="round"
-                          fill="none"
-                        />
-                      </svg>
-                    </button>
-                  ) : null}
-                  <button className="runBtn" onClick={() => setShowControls(true)} aria-label="More">
-                    <svg viewBox="0 0 16 16" width="14" height="14"><circle cx="3" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="13" cy="8" r="1.3" fill="currentColor"/></svg>
-                  </button>
-                </div>
-              </div>
-
-              {activeAttention ? (
-                <div className={`attentionCard attention${activeAttention.severity}`}>
-                  <div className="attentionHead">
-                    <span className="chip">{activeAttention.severity}</span>
-                    <span className="mono attentionTitle">{activeAttention.title}</span>
-                    <div className="spacer" />
-                    <button className="btn ghost" onClick={() => setTab("inbox")}>
-                      All ({workspaceInboxCount})
-                    </button>
-                  </div>
-                  <div className="attentionBody mono">{activeAttention.body}</div>
-                  <div className="attentionActions">
-                    {(activeAttention.options ?? []).map((o) => (
-                      <button
-                        key={o.id}
-                        className={o.id === "n" || o.id === "esc" || o.id === "c" ? "btn" : "btn primary"}
-                        onClick={() => respondInbox(activeAttention.id, o.id)}
-                      >
-                        {o.label}
+        <div className="stage">
+          {/* Session view overlays when a session is selected */}
+          {activeSessionId ? renderSessionView() : (
+            <>
+              {/* ── INBOX TAB ── */}
+              {tab === "inbox" && (
+                <div className="view">
+                  {taskActionMsg ? <div className="syncNote">{taskActionMsg}</div> : null}
+                  {/* Active task from task detail drill-down */}
+                  {activeTaskId && (
+                    <div className="taskDetailPanel">
+                      <button className="backLink" onClick={() => setActiveTaskId(null)}>
+                        ← All tasks
                       </button>
-                    ))}
-                    <button className="btn ghost" onClick={() => dismissInbox(activeAttention.id)}>
-                      Dismiss
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-
-              <div
-                className={`termPanel ${activeIsCodexNative ? "termPanelNative" : "termPanelPty"}`}
-                ref={runSurfaceRef}
-              >
-                {activeIsCodexNative ? (
-                  <CodexNativeThreadView
-                    threadId={String(activeSession?.toolSessionId ?? "")}
-                    loading={codexNativeLoading}
-                    error={codexNativeMsg}
-                    messages={codexNativeMessages}
-                    live={codexNativeLive}
-                    diff={codexNativeDiff}
-                    innerRef={nativeChatRef}
-                  />
-                ) : (
-                  <>
-                    <div className="term" ref={termRef} />
-                    {activeIsRawTerminal && !activeAttention && tuiAssist ? (
-                      <TerminalAssistOverlay
-                        assist={tuiAssist}
-                        onHide={() => {
-                          dismissedAssistSig.current = String(tuiAssist.signature ?? "");
-                          setTuiAssist(null);
-                        }}
-                        onSend={(send) => sendRaw(send)}
-                      />
-                    ) : null}
-                  </>
-                )}
-              </div>
-
-              <div
-                className="compose"
-                onClick={() => {
-                  try {
-                    composerRef.current?.focus();
-                  } catch {
-                    // ignore
-                  }
-                }}
-              >
-                <textarea
-                  ref={composerRef}
-                  value={composer}
-                  onChange={(e) => setComposer(e.target.value)}
-                  placeholder={
-                    !activeId
-                      ? "No active session"
-                      : activeSessionClosing
-                        ? "Session closing..."
-                        : !activeCanInput
-                          ? "Session stopped. Tap send to resume."
-                          : "Message..."
-                  }
-                  disabled={!activeId || activeSessionClosing}
-                  autoCapitalize="sentences"
-                  autoCorrect="on"
-                  spellCheck={false}
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                  }}
-                  onTouchStart={(e) => {
-                    e.stopPropagation();
-                  }}
-                  onFocus={() => {
-                    try {
-                      (term.current as any)?.blur?.();
-                    } catch {
-                      // ignore
-                    }
-                  }}
-                  rows={1}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      sendText();
-                    }
-                  }}
-                />
-                <button
-                  className="composeSend"
-                  onClick={sendText}
-                  aria-label={activeCanInput ? "Send" : "Resume"}
-                  disabled={!activeId || activeSessionClosing || (activeCanInput && !composer.trim())}
-                >
-                  {activeCanInput ? (
-                    <svg viewBox="0 0 20 20" width="18" height="18"><path d="M3 10l14-7-7 14v-7H3z" fill="currentColor"/></svg>
-                  ) : (
-                    <svg viewBox="0 0 20 20" width="18" height="18"><path d="M7 5l10 5-10 5V5z" fill="currentColor"/></svg>
-                  )}
-                </button>
-              </div>
-            </div>
-          )}
-        </section>
-
-        {tab === "workspace" ? (
-          <section className="view">
-            <div className="card">
-              <div className="cardHead">
-                <div>
-                  <div className="cardTitle">Projects</div>
-                </div>
-                <button className="btn ghost" onClick={refreshWorkspaces}>
-                  Refresh
-                </button>
-              </div>
-              <div className="row">
-                <input
-                  value={workspaceQuery}
-                  onChange={(e) => setWorkspaceQuery(e.target.value)}
-                  placeholder="Search workspaces..."
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  className="searchInput"
-                />
-              </div>
-              <div className="row" style={{ padding: 0 }}>
-                <div className="list listScrollWorkspace">
-                  {filteredWorkspaces.length === 0 ? (
-                    <div className="row">
-                      <div className="help">No matching workspaces yet. Start a session in New.</div>
-                    </div>
-                  ) : null}
-	                  {filteredWorkspaces.map((w) => {
-	                    const waiting = (w.sessions ?? []).reduce((acc, s) => acc + (s.attention ?? 0), 0);
-	                    const on = selectedWorkspaceKey === w.key;
-	                    const rootLabel = String(w.root || "").trim() || "(unknown)";
-	                    return (
-	                      <div
-	                        key={w.key}
-	                        className={`listRow listRowDiv ${on ? "listRowOn" : ""}`}
-	                        role="button"
-	                        tabIndex={0}
-	                        onClick={() => setSelectedWorkspaceKey(w.key)}
-	                        onKeyDown={(e) => {
-	                          if (e.key === "Enter" || e.key === " ") {
-	                            e.preventDefault();
-	                            setSelectedWorkspaceKey(w.key);
-	                          }
-	                        }}
-	                      >
-	                        <div className="listLeft">
-	                          <span className={`chip ${w.isGit ? "chipOn" : ""}`}>{w.isGit ? "git" : "dir"}</span>
-	                          <div className="listText">
-	                            <div className="listTitle mono">{rootLabel}</div>
-	                            <div className="listSub mono">
-	                              {(w.sessions ?? []).length} sessions{waiting ? ` · ${waiting} waiting` : ""}
-	                            </div>
-	                          </div>
-	                        </div>
-	                        <div className="listRight">{on ? "open" : ""}</div>
-	                      </div>
-	                    );
-	                  })}
-                </div>
-              </div>
-	              {(() => {
-	                const w = selectedWorkspaceKey ? mergedWorkspaces.find((x) => x.key === selectedWorkspaceKey) ?? null : null;
-	                if (!w) return <div className="row"><div className="help">Pick a workspace to see sessions and worktrees.</div></div>;
-	                const trees = (w.trees ?? []).filter((t) => t.path);
-	                return (
-	                  <>
-                    {w.isGit ? (
-                      <div className="row">
-                        <div className="field">
-                          <label>Git Trees (Worktrees)</label>
-                          <select value={selectedTreePath || w.root} onChange={(e) => setSelectedTreePath(e.target.value)}>
-                            <option value={w.root}>Main: {w.root}</option>
-                            {trees
-                              .filter((t) => t.path !== w.root)
-                              .map((t) => (
-                                <option key={t.path} value={t.path}>
-                                  {t.branch ? t.branch.replace(/^refs\/heads\//, "") : t.detached ? "(detached)" : ""} {t.path}
-                                </option>
-                              ))}
-                          </select>
-                          <div className="help">New sessions start in the selected tree path.</div>
+                      <div className="card">
+                        <div className="cardHead">
+                          <div>
+                            <div className="cardTitle">{activeTask?.title || "Task"}</div>
+                            <div className="cardSub">{activeTask?.kind} · {activeTask?.status}</div>
+                          </div>
+                          <div className="cardHeadActions">
+                            {activeTask?.runningCount ? <span className="chip chipOn">{activeTask.runningCount} live</span> : null}
+                            {activeTask ? (
+                              <button
+                                className="btn danger btnCompact"
+                                onClick={() => void removeTask(activeTask)}
+                                disabled={removeBusyKey === `task:${activeTask.id}`}
+                              >
+                                {removeBusyKey === `task:${activeTask.id}` ? "Removing…" : "Remove"}
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                        <div className="cardBody">
+                          {activeTask?.members?.map(m => (
+                            <div key={m.id} className="rowActionWrap">
+                              <button className="sessionRow rowActionMain" onClick={() => openSession(m.sessionId, m.taskId)}>
+                                <div className="sessionRowLeft">
+                                  <div className="sessionRowName">{m.title || m.session?.tool || "Session"}</div>
+                                  <div className="sessionRowMeta">{m.mode} mode{m.session?.cwd ? ` · ${formatDisplayPathTail(m.session.cwd, 1)}` : ""}</div>
+                                </div>
+                                <div className="sessionRowRight">
+                                  <span className={`dot ${m.running ? "dotOn" : "dotOff"}`}>{m.running ? "live" : m.role}</span>
+                                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+                                </div>
+                              </button>
+                              <button
+                                className="rowActionBtn rowActionDanger"
+                                onClick={() => void removeSession(m.sessionId)}
+                                disabled={removeBusyKey === `session:${m.sessionId}`}
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ))}
                         </div>
                       </div>
-                    ) : null}
-
-	                    <div className="row">
-	                      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-		                        <button
-		                          className="btn primary"
-		                          onClick={() => {
-		                            const base = String(selectedTreePath || w.root || "").trim();
-		                            if (!base || base === "(unknown)") {
-		                              setToast("Workspace path unknown (legacy session). Pick a real path in New.");
-		                              setTab("new");
-		                              return;
-		                            }
-		                            if (base) {
-		                              setCwd(base);
-		                              setTab("new");
-		                              setToast("Workspace loaded into New Session");
-		                            }
-		                          }}
-		                        >
-	                          New Session Here
-	                        </button>
-	                      </div>
-	                    </div>
-
-	                      {(() => {
-	                        const base = String(selectedTreePath || w.root || "").trim();
-	                        const have = new Set(profiles.map((p) => p.id));
-	                        if (!base || base === "(unknown)") return null;
-	                        const toolProfiles: { tool: ToolId; profiles: { id: string; label: string; danger?: boolean }[] }[] = [];
-	                        if (tools.includes("codex")) {
-	                          const p: { id: string; label: string; danger?: boolean }[] = [];
-	                          if (have.has("codex.default")) p.push({ id: "codex.default", label: "Normal" });
-                          if (have.has("codex.plan")) p.push({ id: "codex.plan", label: "Plan" });
-                          if (have.has("codex.full_auto")) p.push({ id: "codex.full_auto", label: "Auto" });
-                          if (have.has("codex.danger")) p.push({ id: "codex.danger", label: "Danger", danger: true });
-                          if (p.length) toolProfiles.push({ tool: "codex", profiles: p });
-                        }
-                        if (tools.includes("claude")) {
-                          const p: { id: string; label: string; danger?: boolean }[] = [];
-                          if (have.has("claude.default")) p.push({ id: "claude.default", label: "Normal" });
-                          if (have.has("claude.plan")) p.push({ id: "claude.plan", label: "Plan" });
-                          if (have.has("claude.accept_edits")) p.push({ id: "claude.accept_edits", label: "Accept Edits" });
-                          if (have.has("claude.bypass_plan")) p.push({ id: "claude.bypass_plan", label: "Bypass", danger: true });
-                          if (p.length) toolProfiles.push({ tool: "claude", profiles: p });
-                        }
-                        if (tools.includes("opencode")) {
-                          const p: { id: string; label: string; danger?: boolean }[] = [];
-                          if (have.has("opencode.default")) p.push({ id: "opencode.default", label: "Normal" });
-                          if (have.has("opencode.plan_build")) p.push({ id: "opencode.plan_build", label: "Plan+Build" });
-                          if (p.length) toolProfiles.push({ tool: "opencode", profiles: p });
-                        }
-                        if (!toolProfiles.length) return null;
-                        return (
-                          <div className="quickStartSection">
-                            <div className="quickStartLabel">Quick Start</div>
-                            {toolProfiles.map((tp) => (
-                              <div key={tp.tool}>
-                                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
-                                  <span className="chip chipOn" style={{ fontSize: 10 }}>{tp.tool}</span>
-                                </div>
-                                <div className="quickStartGroup">
-                                  {tp.profiles.map((p) => (
-                                    <button
-                                      key={p.id}
-                                      className={p.danger ? "btn danger" : "btn"}
-                                      onClick={() =>
-                                        startSessionWith({
-                                          tool: tp.tool,
-                                          profileId: p.id,
-                                          transport: tp.tool === "codex" ? String((codexOpt as any).transport ?? "pty") : undefined,
-                                          cwd: base,
-                                          savePreset: false,
-                                        })
-                                      }
-                                    >
-                                      {p.label}
-                                    </button>
-                                  ))}
-                                </div>
-                              </div>
-                            ))}
+                      {activeTask?.kind === "orchestrator" && (
+                        <div className="card">
+                          <div className="cardHead"><div className="cardTitle">Controls</div></div>
+                          <div className="cardBody">
+                            {syncMsg && <div className="syncNote">{syncMsg}</div>}
+                            <div className="btnRow">
+                              <button className="btn" onClick={() => {
+                                setSyncMsg(null);
+                                if (!activeOrchestrationId) {
+                                  setSyncMsg("Invalid orchestration id.");
+                                  setTimeout(() => setSyncMsg(null), 3000);
+                                  return;
+                                }
+                                api(`/api/orchestrations/${encodeURIComponent(activeOrchestrationId)}/sync`, { method: "POST" })
+                                  .then(() => setSyncMsg("Synced."))
+                                  .catch(() => setSyncMsg("Sync failed."))
+                                  .finally(() => setTimeout(() => setSyncMsg(null), 3000));
+                              }}>Sync Workers</button>
+                              <button className="btn" onClick={() => {
+                                setSyncMsg("Steering dispatched.");
+                                if (!activeOrchestrationId) {
+                                  setSyncMsg("Invalid orchestration id.");
+                                  setTimeout(() => setSyncMsg(null), 3000);
+                                  return;
+                                }
+                                api(`/api/orchestrations/${encodeURIComponent(activeOrchestrationId)}/automation-policy`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ runNow: true }) })
+                                  .catch(console.error)
+                                  .finally(() => setTimeout(() => setSyncMsg(null), 3000));
+                              }}>Steer</button>
+                            </div>
                           </div>
-                        );
-                      })()}
-
-	                    <div className="row" style={{ padding: 0 }}>
-	                      <div className="list listScrollSessions">
-	                        {(() => {
-	                          const groups = groupByRecent(
-	                            w.sessions ?? [],
-	                            (s) => String(s.treePath || s.cwd || w.root || "unknown"),
-	                            (s) => Number(s.updatedAt ?? 0),
-	                          );
-	                          const labelForTree = (treePath: string): string =>
-	                            treeLabel({ isGit: w.isGit, root: String(w.root || ""), trees }, treePath);
-
-	                          return groups.map((g) => (
-	                            <div key={g.key}>
-	                              <div className="groupHdr">
-	                                <span className="chip">{labelForTree(g.key)}</span>
-	                                <span className="mono groupPath">{g.key}</span>
-	                              </div>
-	                              {g.items.map((s) => {
-	                                const isPinned =
-	                                  typeof s.pinnedSlot === "number" && Number.isFinite(s.pinnedSlot) && s.pinnedSlot >= 1 && s.pinnedSlot <= 6;
-	                                return (
-	                                  <div
-	                                    key={s.id}
-	                                    className="listRow listRowDiv"
-	                                    role="button"
-	                                    tabIndex={0}
-	                                    onClick={() => openSession(s.id)}
-	                                    onKeyDown={(e) => {
-	                                      if (e.key === "Enter" || e.key === " ") {
-	                                        e.preventDefault();
-	                                        openSession(s.id);
-	                                      }
-	                                    }}
-	                                  >
-	                                    <div className="listLeft">
-	                                      <ToolChip tool={s.tool} />
-	                                      <div className="listText">
-	                                        <div className="listTitle">
-	                                          {s.label ? s.label : s.profileId}
-	                                          {isPinned ? <span className="badge badgePin">#{s.pinnedSlot}</span> : null}
-	                                          {s.attention && s.attention > 0 ? <span className="badge">{s.attention}</span> : null}
-	                                        </div>
-                                        <div className="listSub mono">
-                                          {s.running ? "RUNNING" : "STOPPED"} {s.id ? `· ${s.id}` : ""}
-                                        </div>
-                                        {s.preview ? <div className="preview mono">{cleanPreviewLine(s.preview)}</div> : null}
-                                      </div>
-                                    </div>
-                                    <div className="listRight">
-                                      <button
-	                                        className={`btn ${isPinned ? "" : "ghost"}`}
-	                                        onClick={(e) => {
-	                                          e.stopPropagation();
-	                                          togglePin(s.id);
-	                                        }}
-	                                      >
-	                                        {isPinned ? `Unpin` : `Pin`}
-	                                      </button>
-	                                    </div>
-	                                  </div>
-	                                );
-	                              })}
-	                            </div>
-	                          ));
-	                        })()}
-	                      </div>
-	                    </div>
-
-                      {(() => {
-                        const wsRoot = String(w.root || "").trim();
-                        const items = Array.isArray(toolSessions) ? toolSessions : [];
-
-                        const isUnder = (p: string, root: string): boolean => {
-                          const r = root.replace(/\/+$/g, "");
-                          return p === r || p.startsWith(r + "/");
-                        };
-
-                        const treeRoots = [String(w.root || ""), ...trees.map((t) => String(t.path || "")).filter(Boolean)]
-                          .map((s) => s.replace(/\/+$/g, ""))
-                          .filter(Boolean);
-
-                        const pickTreeRoot = (p: string): string => {
-                          if (!w.isGit) return wsRoot || p;
-                          let best = wsRoot || (treeRoots[0] ?? p);
-                          for (const r of treeRoots) {
-                            if (!r) continue;
-                            if (isUnder(p, r) && r.length >= best.length) best = r;
-                          }
-                          return best || p;
-                        };
-                        const filtered = items.filter((ts) => {
-                          if (!ts?.cwd) return false;
-                          if (wsRoot && !isUnder(ts.cwd, wsRoot)) return false;
-                          return true;
-                        });
-                        const groups = groupByRecent(
-                          filtered,
-                          (ts) => pickTreeRoot(String(ts.cwd)),
-                          (ts) => Number(ts.updatedAt ?? 0),
-                        );
-                        const labelForTree = (treePath: string): string =>
-                          treeLabel({ isGit: w.isGit, root: String(w.root || ""), trees }, treePath);
-
-                        return (
-                          <>
-                            <div className="row" style={{ marginTop: 8 }}>
-                              <div style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
-                                <div className="cardTitle" style={{ margin: 0 }}>Tool Sessions</div>
-                                <div className="spacer" />
-                                <button className="btn ghost" onClick={() => refreshToolSessions({ under: wsRoot, refresh: true })}>
-                                  Refresh
-                                </button>
-                              </div>
-                              <div className="help">Chat history stored by Codex, Claude, and OpenCode on this host. Tap to view, or resume in a live terminal.</div>
-                              {toolSessionsMsg ? <div className="help mono">{toolSessionsMsg}</div> : null}
-                            </div>
-
-                            <div className="row" style={{ padding: 0 }}>
-                              <div className="list listScrollToolSessions">
-                                {toolSessionsLoading ? (
-                                  <div className="row">
-                                    <div className="help">Loading tool sessions...</div>
-                                  </div>
-                                ) : groups.length === 0 ? (
-                                  <div className="row">
-                                    <div className="help">No stored tool sessions found in this workspace yet.</div>
-                                  </div>
-                                ) : null}
-
-                                {groups.map((g) => (
-                                  <div key={g.key}>
-                                    <div className="groupHdr">
-                                      <span className="chip">{labelForTree(g.key)}</span>
-                                      <span className="mono groupPath">{g.key}</span>
-                                    </div>
-                                    {g.items.map((ts) => (
-                                      <div
-                                        key={ts.id}
-                                        className="listRow listRowDiv"
-                                        role="button"
-                                        tabIndex={0}
-                                        onClick={() => openToolChat(ts.tool, ts.id)}
-                                        onKeyDown={(e) => {
-                                          if (e.key === "Enter" || e.key === " ") {
-                                            e.preventDefault();
-                                            openToolChat(ts.tool, ts.id);
-                                          }
-                                        }}
-                                      >
-                                        <div className="listLeft">
-                                          <ToolChip tool={ts.tool as any} />
-                                          <div className="listText">
-                                            <div className="listTitle">
-                                              {ts.title ? ts.title : ts.gitBranch ? ts.gitBranch : ts.id.slice(0, 8)}
-                                              {typeof ts.messageCount === "number" ? <span className="badge">{ts.messageCount}</span> : null}
-                                            </div>
-                                            <div className="listSub mono">
-                                              {ts.gitBranch ? `${ts.gitBranch} · ` : ""}
-                                              {new Date(ts.updatedAt).toLocaleString()} · {ts.id.slice(0, 8)}
-                                            </div>
-                                            {ts.preview ? <div className="preview mono">{cleanPreviewLine(ts.preview)}</div> : null}
-                                          </div>
-                                        </div>
-                                        <div className="listRight">
-                                          <button
-                                            className="btn primary"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              startFromToolSession(ts, "resume");
-                                            }}
-                                          >
-                                            Resume
-                                          </button>
-                                        </div>
-                                      </div>
-                                    ))}
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          </>
-                        );
-                      })()}
-	                  </>
-	                );
-	              })()}
-            </div>
-          </section>
-        ) : null}
-
-        {tab === "inbox" ? (
-          <section className="view">
-            <div className="card">
-              <div className="cardHead">
-                <div>
-                  <div className="cardTitle">Inbox</div>
-                </div>
-                <button className="btn ghost" onClick={() => refreshInbox({ workspaceKey: selectedWorkspaceKey })}>
-                  Refresh
-                </button>
-              </div>
-              <div className="row" style={{ padding: 0 }}>
-                <div className="list">
-                  {inbox.length === 0 ? (
-                    <div className="row">
-                      <div className="help">Nothing waiting. If Codex is running, approvals will appear here.</div>
+                        </div>
+                      )}
+                      {renderOrchestrationProgressCard(activeTask)}
                     </div>
-                  ) : null}
-                  {inbox.map((it) => (
-                    <div key={it.id} className={`inboxItem inbox${it.severity}`}>
-                      <div className="inboxHead">
-                        <span className="chip">{it.severity}</span>
-                        <span className="mono inboxTitle">{it.title}</span>
-                        <div className="spacer" />
-                        <button className="btn ghost" onClick={() => dismissInbox(it.id)}>
-                          Dismiss
-                        </button>
+                  )}
+
+                  {/* Inbox items needing response */}
+                  {!activeTaskId && inbox.filter(i => i.status === "open").length > 0 && (
+                    <div className="card">
+                      <div className="cardHead">
+                        <div><div className="cardTitle">Needs Attention</div></div>
+                        <span className="chip chipRed">{inboxCount}</span>
                       </div>
-                      <div className="inboxBody mono">{it.body}</div>
-                      <div className="inboxMeta mono">
-                        {it.session?.tool ? `${it.session.tool} · ` : ""}
-                        {it.session?.profileId ? `${it.session.profileId} · ` : ""}
-                        {it.sessionId}
+                      <div className="cardBody">
+                        {inbox.filter(i => i.status === "open").map(item => (
+                          <div key={item.id} className="rowActionWrap">
+                            <button
+                              className="inboxRow rowActionMain"
+                              onClick={() => openSession(item.sessionId, item.taskId)}
+                              onDoubleClick={() => openSession(item.sessionId, item.taskId)}
+                            >
+                              <div className="inboxRowIcon">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+                                </svg>
+                              </div>
+                              <div className="inboxRowContent">
+                                <div className="inboxRowTitle">{item.title}</div>
+                                <div className="inboxRowBody">{item.body || "Tap to view in terminal"}</div>
+                                {(() => {
+                                  const taskId = String(item.taskId ?? "").trim();
+                                  if (!taskId) return null;
+                                  const summary = summarizeOrchestrationForInbox(orchestrationProgressByTask[taskId]);
+                                  if (!summary) return null;
+                                  return (
+                                    <>
+                                      <div className="inboxRowMeta mono">{summary.line1}</div>
+                                      <div className="inboxRowMeta">{summary.line2}</div>
+                                    </>
+                                  );
+                                })()}
+                              </div>
+                              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+                            </button>
+                            <button
+                              className="rowActionBtn"
+                              onClick={() => void dismissInboxItem(item.id)}
+                              disabled={removeBusyKey === `inbox:${item.id}`}
+                            >
+                              Dismiss
+                            </button>
+                          </div>
+                        ))}
                       </div>
-                      <div className="inboxActions">
-                        {(it.options ?? []).map((o) => (
-                          <button key={o.id} className={o.id === "n" ? "btn" : "btn primary"} onClick={() => respondInbox(it.id, o.id)}>
-                            {o.label}
+                    </div>
+                  )}
+
+                  {/* Running tasks */}
+                  {!activeTaskId && (
+                    <div className="card">
+                      <div className="cardHead">
+                        <div>
+                          <div className="cardTitle">Active Tasks</div>
+                          <div className="cardSub">{tasks.filter(t => t.runningCount > 0).length} running now</div>
+                        </div>
+                      </div>
+                      <div className="cardBody">
+                        {tasks.filter(t => t.runningCount > 0).length === 0 ? (
+                          <div className="emptyCardRow">
+                            {tasks.length === 0 ? "No tasks yet — create one from New." : "Nothing running right now."}
+                          </div>
+                        ) : tasks.filter(t => t.runningCount > 0).map(t => (
+                          <div key={t.id} className="rowActionWrap">
+                            <button className="sessionRow rowActionMain" onClick={() => setActiveTaskId(t.id)}>
+                              <div className="sessionRowLeft">
+                                <div className="sessionRowName">{t.title || "Untitled Task"}</div>
+                                <div className="sessionRowMeta">{t.kind} · {t.memberCount} sessions{t.goal ? ` · ${t.goal.slice(0, 60)}` : ""}</div>
+                              </div>
+                              <div className="sessionRowRight">
+                                <span className="dot dotOn">{t.runningCount} live</span>
+                                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+                              </div>
+                            </button>
+                            <button
+                              className="rowActionBtn rowActionDanger"
+                              onClick={() => void removeTask(t)}
+                              disabled={removeBusyKey === `task:${t.id}`}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {!activeTaskId && inbox.length === 0 && tasks.filter(t => t.runningCount > 0).length === 0 && (
+                    <div className="emptyFullPage">
+                      <div className="emptyFullIcon">✓</div>
+                      <div className="emptyFullTitle">All clear</div>
+                      <div className="emptyFullSub">No pending actions or active tasks.</div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* ── PROJECTS TAB (workspace) ── */}
+              {tab === "workspace" && (
+                <div className="view">
+                  {taskActionMsg ? <div className="syncNote">{taskActionMsg}</div> : null}
+                  {activeTaskId ? (
+                    <div className="taskDetailPanel">
+                      <button className="backLink" onClick={() => setActiveTaskId(null)}>← All projects</button>
+                      <div className="card">
+                        <div className="cardHead">
+                          <div>
+                            <div className="cardTitle">{activeTask?.title || "Task"}</div>
+                            <div className="cardSub">{activeTask?.kind} · {activeTask?.status}</div>
+                          </div>
+                          <div className="cardHeadActions">
+                            {activeTask?.runningCount ? <span className="chip chipOn">{activeTask.runningCount} live</span> : null}
+                            {activeTask ? (
+                              <button
+                                className="btn danger btnCompact"
+                                onClick={() => void removeTask(activeTask)}
+                                disabled={removeBusyKey === `task:${activeTask.id}`}
+                              >
+                                {removeBusyKey === `task:${activeTask.id}` ? "Removing…" : "Remove"}
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                        <div className="cardBody">
+                          {(!activeTask?.members || activeTask.members.length === 0) && (
+                            <div className="emptyCardRow">No sessions in this task.</div>
+                          )}
+                          {activeTask?.members?.map(m => (
+                            <div key={m.id} className="rowActionWrap">
+                              <button className="sessionRow rowActionMain" onClick={() => openSession(m.sessionId, m.taskId)}>
+                                <div className="sessionRowLeft">
+                                  <div className="sessionRowName">{m.title || m.session?.tool || "Session"}</div>
+                                  <div className="sessionRowMeta">{m.mode} · {m.role}{m.session?.cwd ? ` · ${formatDisplayPathTail(m.session.cwd, 1)}` : ""}</div>
+                                </div>
+                                <div className="sessionRowRight">
+                                  <span className={`dot ${m.running ? "dotOn" : "dotOff"}`}>{m.running ? "live" : "idle"}</span>
+                                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+                                </div>
+                              </button>
+                              <button
+                                className="rowActionBtn rowActionDanger"
+                                onClick={() => void removeSession(m.sessionId)}
+                                disabled={removeBusyKey === `session:${m.sessionId}`}
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      {renderOrchestrationProgressCard(activeTask)}
+                    </div>
+                  ) : (
+                    <div className="card">
+                      <div className="cardHead">
+                        <div>
+                          <div className="cardTitle">All Projects</div>
+                          <div className="cardSub">{tasks.length} tasks total</div>
+                        </div>
+                      </div>
+                      <div className="cardBody">
+                        {tasks.length === 0 && (
+                          <div className="emptyCardRow">No projects yet. Create one from <strong>New</strong>.</div>
+                        )}
+                        {tasks.map(t => (
+                          <div key={t.id} className="rowActionWrap">
+                            <button className="sessionRow rowActionMain" onClick={() => setActiveTaskId(t.id)}>
+                              <div className="sessionRowLeft">
+                                <div className="sessionRowName">{t.title || "Untitled Task"}</div>
+                                <div className="sessionRowMeta">{t.kind} · {t.memberCount} sessions</div>
+                              </div>
+                              <div className="sessionRowRight">
+                                {t.runningCount > 0
+                                  ? <span className="dot dotOn">{t.runningCount} live</span>
+                                  : <span className="dot dotOff">{t.status}</span>}
+                                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+                              </div>
+                            </button>
+                            <button
+                              className="rowActionBtn rowActionDanger"
+                              onClick={() => void removeTask(t)}
+                              disabled={removeBusyKey === `task:${t.id}`}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* ── TERMINAL TAB — session picker ── */}
+              {tab === "run" && !activeSessionId && (
+                <div className="view">
+                  {taskActionMsg ? <div className="syncNote">{taskActionMsg}</div> : null}
+                  <div className="card">
+                    <div className="cardHead">
+                      <div><div className="cardTitle">Quick Terminal</div><div className="cardSub">Launch a mirrored CLI session instantly</div></div>
+                    </div>
+                    <div className="cardBody">
+                      <div className="toolToggle">
+                        {(["codex", "claude", "opencode"] as ToolId[]).map((t) => (
+                          <button key={t} className="toolToggleBtn" onClick={() => void quickLaunchTerminal(t)}>
+                            {t}
                           </button>
                         ))}
-                        <button
-                          className="btn"
-                          onClick={() => {
-                            openSession(it.sessionId);
-                            setToast("Opened session");
-                          }}
-                        >
-                          Open Session
-                        </button>
+                      </div>
+                      {runLaunchMsg ? <div className="syncNote" style={{ marginTop: 8 }}>{runLaunchMsg}</div> : null}
+                    </div>
+                  </div>
+
+                  {sessions.filter(s => s.running).length > 0 ? (
+                    <div className="card">
+                      <div className="cardHead">
+                        <div><div className="cardTitle">Running Sessions</div><div className="cardSub">Tap to open</div></div>
+                      </div>
+                      <div className="cardBody">
+                        {sessions.filter(s => s.running).map(s => (
+                          <div key={s.id} className="rowActionWrap">
+                            <button className="sessionRow rowActionMain" onClick={() => openSession(s.id, s.taskId)}>
+                              <div className="sessionRowLeft">
+                                <div className="sessionRowName mono">{s.tool}</div>
+                                <div className="sessionRowMeta">{s.cwd ? formatDisplayPathTail(s.cwd, 2) : s.profileId}</div>
+                              </div>
+                              <div className="sessionRowRight">
+                                <span className="dot dotOn">live</span>
+                                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+                              </div>
+                            </button>
+                            <button
+                              className="rowActionBtn rowActionDanger"
+                              onClick={() => void removeSession(s.id)}
+                              disabled={removeBusyKey === `session:${s.id}`}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </section>
-        ) : null}
-
-        {tab === "new" ? (
-          <section className="view">
-            <div className="card">
-              <div className="cardHead">
-                <div>
-                  <div className="cardTitle">New Session</div>
-                </div>
-                <button className="btn ghost" onClick={() => setAdvanced((v) => !v)}>
-                  {advanced ? "Less" : "More"}
-                </button>
-              </div>
-
-              <div className="row">
-                <div className="seg">
-                  {tools.map((t) => (
-                    <button
-                      key={t}
-                      className={`segBtn ${tool === t ? "segOn" : ""}`}
-                      onClick={() => {
-                        setTool(t);
-                        setProfileId(`${t}.default`);
-                      }}
-                    >
-                      {t}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="row">
-                <div className="field">
-                  <label>Profile</label>
-                  <div className="profileList" role="list">
-                    {orderedProfiles.map((p) => (
-                      <button
-                        key={p.id}
-                        type="button"
-                        className={`profileCard ${profileId === p.id ? "profileOn" : ""}`}
-                        onClick={() => setProfileId(p.id)}
-                      >
-                        <div className="profileTitle">{p.title}</div>
-                        <div className="profileMeta">
-                          <span className="chip chipOn">{p.tool}</span>
-                          <span className="mono">{p.id}</span>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {tool === "codex" ? (
-                <div className="row">
-                  <div className="field">
-                    <label>Codex Mode</label>
-                    <div className="seg" role="group" aria-label="Codex mode">
-                      <button
-                        className={`segBtn ${String((codexOpt as any).transport ?? "pty") === "codex-app-server" ? "segOn" : ""}`}
-                        onClick={() => setCodexOpt((p) => ({ ...p, transport: "codex-app-server" }))}
-                      >
-                        Native
-                      </button>
-                      <button
-                        className={`segBtn ${String((codexOpt as any).transport ?? "pty") !== "codex-app-server" ? "segOn" : ""}`}
-                        onClick={() => setCodexOpt((p) => ({ ...p, transport: "pty" }))}
-                      >
-                        Terminal
-                      </button>
+                  ) : (
+                    <div className="emptyFullPage">
+                      <div className="emptyFullIcon">
+                        <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="4 17 10 11 4 5" /><line x1="12" y1="19" x2="20" y2="19" />
+                        </svg>
+                      </div>
+                      <div className="emptyFullTitle">No sessions running</div>
+                      <div className="emptyFullSub">Use the 3 quick-launch buttons above to start instantly.</div>
                     </div>
-                    <div className="help">Native uses Codex App Server (chat-first). Terminal streams the real Codex TUI (compatibility mode).</div>
-                  </div>
+                  )}
                 </div>
-              ) : null}
+              )}
 
-              <div className="row">
-                <div className="field">
-                  <label>Workspace</label>
-                  <div className="inline">
-                    <input
-                      value={cwd}
-                      onChange={(e) => setCwd(e.target.value)}
-                      placeholder={doctor?.workspaceRoots?.[0] ?? "/path/to/workspace"}
-                      autoCapitalize="none"
-                      autoCorrect="off"
-                    />
-                    <button
-                      className="btn"
-                      onClick={async () => {
-                        setShowPicker(true);
-                        await loadPicker(cwd.trim() || undefined);
-                      }}
-                    >
-                      Browse
+              {/* ── NEW TAB ── */}
+              {tab === "new" && (
+                <div className="view newView">
+
+                  {/* Mode switcher */}
+                  <div className="newModeBar">
+                    <button className={`newModeBtn ${newMode === "smart" ? "newModeBtnOn" : ""}`} onClick={() => { setNewMode("smart"); setCreateMsg(null); setRecommendation(null); }}>
+                      Auto
+                    </button>
+                    <button className={`newModeBtn ${newMode === "manual" ? "newModeBtnOn" : ""}`} onClick={() => { setNewMode("manual"); setCreateMsg(null); setRecommendation(null); }}>
+                      Manual
                     </button>
                   </div>
-                  {recentForPicker.length ? (
-                    <div className="chipsRow" style={{ marginTop: 10 }}>
-                      <span className="muted" style={{ fontSize: 12 }}>
-                        Recent:
-                      </span>
-                      {recentForPicker.map((p) => (
-                        <button key={p} className="chip chipBtn mono" onClick={() => setCwd(p)}>
-                          {p}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                  {advanced ? (
+
+                  {/* ── SMART MODE ── */}
+                  {newMode === "smart" && (
                     <>
-                      <div className="chipsRow" style={{ marginTop: 10, justifyContent: "space-between" }}>
-                        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                          <label className="toggle" style={{ margin: 0 }}>
-                            <input type="checkbox" checked={autoPreset} onChange={(e) => setAutoPreset(e.target.checked)} />
-                            <span className="muted">Auto defaults</span>
-                          </label>
-                          <label className="toggle" style={{ margin: 0 }}>
-                            <input type="checkbox" checked={savePreset} onChange={(e) => setSavePreset(e.target.checked)} />
-                            <span className="muted">Save defaults</span>
-                          </label>
-                        </div>
-                        <button
-                          className="btn"
-                          onClick={() => {
-                            const p = workspacePreset;
-                            if (!p) {
-                              setPresetMsg("No saved defaults for this workspace");
-                              return;
-                            }
-                            applyPresetNow(p);
-                          }}
-                        >
-                          Apply
-                        </button>
+                      <div className="newSection">
+                        <div className="newSectionLabel">WHAT DO YOU WANT TO BUILD / FIX?</div>
+                        <textarea
+                          className="newTextarea"
+                          rows={4}
+                          value={createObjective}
+                          onChange={e => { setCreateObjective(e.target.value); setRecommendation(null); }}
+                          placeholder={"Fix all TypeScript errors in the server\nAdd dark mode to the web UI\nRefactor the auth system to use JWT refresh tokens"}
+                          disabled={!!createBusy}
+                        />
                       </div>
-                      {presetMsg ? <div className="help mono">{presetMsg}</div> : null}
-                    </>
-                  ) : null}
-                </div>
-              </div>
-
-              {advanced ? (
-                <div className="adv">
-                  {tool === "codex" ? (
-                    <div className="grid2">
-                      <div className="field">
-                        <label>Sandbox</label>
-                        <select value={codexOpt.sandbox} onChange={(e) => setCodexOpt((p) => ({ ...p, sandbox: e.target.value }))}>
-                          <option value="">(profile default)</option>
-                          {(codexCaps?.sandboxModes ?? ["workspace-write"]).map((m) => (
-                            <option key={m} value={m}>
-                              {m}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="field">
-                        <label>Approval Policy</label>
-                        <select
-                          value={codexOpt.askForApproval}
-                          onChange={(e) => setCodexOpt((p) => ({ ...p, askForApproval: e.target.value }))}
-                        >
-                          <option value="">(profile default)</option>
-                          {(codexCaps?.approvalPolicies ?? ["on-request"]).map((m) => (
-                            <option key={m} value={m}>
-                              {m}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="toggles">
-                        <label className="toggle">
-                          <input type="checkbox" checked={codexOpt.fullAuto} onChange={(e) => setCodexOpt((p) => ({ ...p, fullAuto: e.target.checked }))} />
-                          <span>Full Auto</span>
-                        </label>
-                        <label className="toggle">
+                      <div className="newSection">
+                        <div className="newSectionLabel">PROJECT PATH</div>
+                        <div className="newPathRow">
                           <input
-                            type="checkbox"
-                            checked={codexOpt.noAltScreen}
-                            onChange={(e) => setCodexOpt((p) => ({ ...p, noAltScreen: e.target.checked }))}
+                            className="newInput newPathInput"
+                            value={formatDisplayPath(createProjectPath)}
+                            onChange={e => setCreateProjectPath(e.target.value)}
+                            placeholder={formatDisplayPath(defaultWorkspacePath) || "~/path/to/project"}
+                            disabled={!!createBusy}
                           />
-                          <span>No Alt Screen (better Inbox detection)</span>
-                        </label>
-                        <label className="toggle">
-                          <input type="checkbox" checked={codexOpt.search} onChange={(e) => setCodexOpt((p) => ({ ...p, search: e.target.checked }))} />
-                          <span>Web Search</span>
-                        </label>
-                        <label className="toggle dangerToggle">
-                          <input
-                            type="checkbox"
-                            checked={codexOpt.bypassApprovalsAndSandbox}
-                            onChange={(e) => setCodexOpt((p) => ({ ...p, bypassApprovalsAndSandbox: e.target.checked }))}
-                          />
-                          <span>Bypass Approvals and Sandbox</span>
-                        </label>
-                      </div>
-                      <div className="field span2">
-                        <label>Additional Writable Dirs</label>
-                        <textarea value={codexOpt.addDirText} onChange={(e) => setCodexOpt((p) => ({ ...p, addDirText: e.target.value }))} placeholder="/path/one\n/path/two" />
-                        <div className="help">Each line becomes `--add-dir` (validated under allowed roots).</div>
-                      </div>
-                    </div>
-                  ) : null}
-
-                  {tool === "claude" ? (
-                    <div className="grid2">
-                      <div className="field">
-                        <label>Permission Mode</label>
-                        <select
-                          value={claudeOpt.permissionMode}
-                          onChange={(e) => setClaudeOpt((p) => ({ ...p, permissionMode: e.target.value }))}
-                        >
-                          <option value="">(profile default)</option>
-                          {(claudeCaps?.permissionModes ?? ["default"]).map((m) => (
-                            <option key={m} value={m}>
-                              {m}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="field">
-                        <label>Danger</label>
-                        <label className="toggle dangerToggle">
-                          <input
-                            type="checkbox"
-                            checked={claudeOpt.dangerouslySkipPermissions}
-                            onChange={(e) => setClaudeOpt((p) => ({ ...p, dangerouslySkipPermissions: e.target.checked }))}
-                          />
-                          <span>dangerously-skip-permissions</span>
-                        </label>
-                      </div>
-                      <div className="field span2">
-                        <label>Additional Dirs</label>
-                        <textarea value={claudeOpt.addDirText} onChange={(e) => setClaudeOpt((p) => ({ ...p, addDirText: e.target.value }))} placeholder="/path/one\n/path/two" />
-                        <div className="help">Each line becomes `--add-dir` (validated under allowed roots).</div>
-                      </div>
-                    </div>
-                  ) : null}
-
-                  {tool === "opencode" ? (
-                    <div className="grid2">
-                      <div className="field span2">
-                        <label>Model (--model)</label>
-                        <div className="inline">
-                          <input
-                            value={opencodeOpt.model}
-                            onChange={(e) => setOpenCodeOpt((p) => ({ ...p, model: e.target.value }))}
-                            placeholder="provider/model (optional)"
-                            autoCapitalize="none"
-                            autoCorrect="off"
-                          />
-                          <button
-                            className="btn"
-                            disabled={modelLoading}
-                            onClick={async () => {
-                              // Best-effort: if user already typed a provider/model, prefill provider & search.
-                              const cur = String(opencodeOpt.model || "").trim();
-                              const idx = cur.indexOf("/");
-                              if (idx > 0) {
-                                setModelProvider(cur.slice(0, idx));
-                                setModelQuery(cur.slice(idx + 1));
-                              } else if (cur) {
-                                setModelQuery(cur);
-                              }
-                              setShowModelPicker(true);
-                              if (modelList.length === 0) await loadOpenCodeModels({ provider: "" });
-                            }}
-                          >
+                          <button className="btn newPathBrowseBtn" disabled={!!createBusy} onClick={() => openDirectoryPicker("createProjectPath")}>
                             Browse
                           </button>
                         </div>
-                        <div className="help">
-                          Example free models: <span className="mono">opencode/kimi-k2.5-free</span>,{" "}
-                          <span className="mono">opencode/minimax-m2.5-free</span>. Other providers require host credentials (
-                          run <span className="mono">opencode auth</span> on the host).
+                      </div>
+                      <div className="newSection">
+                        <div className="newSectionLabel">BUDGET</div>
+                        <div className="toolToggle">
+                          {([["low", "Free"], ["balanced", "Claude Code"], ["high", "Custom"]] as const).map(([val, label]) => (
+                            <button key={val} className={`toolToggleBtn ${budget === val ? "toolToggleBtnOn" : ""}`} onClick={() => setBudget(val)}>{label}</button>
+                          ))}
                         </div>
-                        {!opencodeCaps?.supports?.model ? (
-                          <div className="help">
-                            Your installed <span className="mono">opencode</span> doesn’t report <span className="mono">--model</span> support (update OpenCode to enable the model picker).
+                      </div>
+
+                      {/* Analyzing state */}
+                      {createBusy === "analyzing" && (
+                        <div className="analyzeState">
+                          <div className="analyzeSpinner" />
+                          <div className="analyzeText">
+                            <div className="analyzeTitle">Creator is analyzing…</div>
+                            <div className="analyzeSub">Scanning workspace, scoring complexity, designing agent plan</div>
                           </div>
-                        ) : null}
+                        </div>
+                      )}
+
+                      {/* Recommendation result */}
+                      {recommendation && !createBusy && (
+                        <div className="recommendBox">
+                          <div className="recommendHeader">
+                            <div className="recommendTitle">Recommendation</div>
+                            <div className="recommendConfidence mono">{Math.round((recommendation.confidence ?? 0.8) * 100)}% confident</div>
+                          </div>
+
+                          {(recommendation.notes ?? []).length > 0 && (
+                            <div className="recommendNotes">
+                              {(recommendation.notes as string[]).map((n, i) => (
+                                <div key={i} className="recommendNote">· {n}</div>
+                              ))}
+                            </div>
+                          )}
+
+                          <div className="newSectionLabel" style={{ marginTop: 12 }}>ORCHESTRATOR</div>
+                          <div className="presetAgent presetAgent--orchestrator">
+                            <div className="presetAgentRole mono">ORCH</div>
+                            <div className="presetAgentInfo">
+                              <div className="presetAgentName">{recommendation.orchestrator?.tool ?? "claude"}</div>
+                              <div className="presetAgentLabel">{recommendation.orchestrator?.profileId ?? ""} · coordinates all workers</div>
+                            </div>
+                          </div>
+                          <div className="modelPickerRow">
+                            <div className="modelPickerLabel mono">Orchestrator model</div>
+                            <select
+                              className="newSelect"
+                              value={autoOrchestratorModel}
+                              onChange={(e) => setAutoOrchestratorModel(e.target.value)}
+                            >
+                              <option value="">Default profile model</option>
+                              {modelOptionsForTool(((recommendation.orchestrator?.tool ?? "codex") as ToolId)).map((opt) => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                              ))}
+                            </select>
+                          </div>
+
+                          <div className="newSectionLabel" style={{ marginTop: 10 }}>WORKERS — {(recommendation.workers ?? []).length}</div>
+                          <div className="presetAgentStack">
+                            {(recommendation.workers ?? []).map((w: any, i: number) => (
+                              <div key={i} className="presetAgent presetAgent--worker">
+                                <div className="presetAgentRole mono">W{i + 1}</div>
+                                <div className="presetAgentInfo">
+                                  <div className="presetAgentName">{w.name}</div>
+                                  <div className="presetAgentLabel">{w.role}</div>
+                                  <div className="modelPickerRow">
+                                    <div className="modelPickerLabel mono">Worker model</div>
+                                    <select
+                                      className="newSelect"
+                                      value={autoWorkerModels[i] ?? ""}
+                                      onChange={(e) =>
+                                        setAutoWorkerModels((prev) => ({ ...prev, [i]: e.target.value }))
+                                      }
+                                    >
+                                      <option value="">Default profile model</option>
+                                      {modelOptionsForTool((String(w?.tool ?? "codex").trim() as ToolId)).map((opt) => (
+                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                </div>
+                                <div className="presetAgentTool mono">{w.tool} · {w.profileId}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {createMsg && (
+                        <div className={`createFeedback ${createMsg.ok ? "createFeedbackOk" : "createFeedbackError"}`}>
+                          {createMsg.text}
+                        </div>
+                      )}
+
+                      {!recommendation ? (
+                        <button className="newLaunchBtn" disabled={!!createBusy} onClick={() => void analyzeGoal()}>
+                          {createBusy === "analyzing" ? "Analyzing…" : "Analyze →"}
+                        </button>
+                      ) : (
+                        <button className="newLaunchBtn" disabled={!!createBusy} onClick={() => void launchFromRecommendation()}>
+                          {createBusy === "orchestration" ? "Launching…" : `Launch — ${(recommendation.workers ?? []).length + 1} agents`}
+                        </button>
+                      )}
+                    </>
+                  )}
+
+                  {/* ── MANUAL MODE ── */}
+                  {newMode === "manual" && (
+                    <>
+                      <div className="newSection">
+                        <div className="newSectionLabel">PRESET</div>
+                        <div className="presetRow">
+                          {PRESETS.map(p => (
+                            <button
+                              key={p.id}
+                              className={`presetCard ${selectedPreset === p.id ? "presetCardOn" : ""}`}
+                              onClick={() => { setSelectedPreset(p.id); setCreateMsg(null); }}
+                            >
+                              <div className="presetCardName">{p.name}</div>
+                              <div className="presetCardDesc">{p.desc}</div>
+                            </button>
+                          ))}
+                        </div>
+                        <div className="presetDetail">{selectedPresetDef.detail}</div>
                       </div>
-                      <div className="field">
-                        <label>Agent</label>
-                        <input value={opencodeOpt.agent} onChange={(e) => setOpenCodeOpt((p) => ({ ...p, agent: e.target.value }))} placeholder="build / plan / ..." autoCapitalize="none" autoCorrect="off" />
+
+                      <div className="newSection">
+                        <div className="newSectionLabel">AGENTS</div>
+                        {selectedPresetDef.id === "custom-team" ? (
+                          <div className="presetAgentStack">
+                            <div className="presetAgent presetAgent--orchestrator">
+                              <div className="presetAgentRole mono">ORCH</div>
+                              <div className="presetAgentInfo">
+                                <div className="presetAgentName">Orchestrator</div>
+                                <div className="presetAgentLabel">Exactly one coordinator session</div>
+                              </div>
+                              <div className="presetAgentTool mono">
+                                {customOrchestratorTool} · {normalizeProfileIdForTool(customOrchestratorTool, customOrchestratorProfile, configProfiles)}
+                              </div>
+                            </div>
+                            <div className="presetAgent presetAgent--worker">
+                              <div className="presetAgentRole mono">WORK</div>
+                              <div className="presetAgentInfo">
+                                <div className="presetAgentName">{customTeamWorkerTotal} workers</div>
+                                <div className="presetAgentLabel">
+                                  {customWorkerGroups.length} group{customWorkerGroups.length !== 1 ? "s" : ""} · cap {CUSTOM_TEAM_MAX_WORKERS}
+                                </div>
+                              </div>
+                              <div className="presetAgentTool mono">{customTeamWorkerTotal + 1} total agents</div>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="presetAgentStack">
+                            {selectedPresetDef.agents.map((agent, i) => (
+                              <div key={i} className={`presetAgent presetAgent--${agent.role}`}>
+                                <div className="presetAgentRole mono">{agent.role === "orchestrator" ? "ORCH" : `W${i}`}</div>
+                                <div className="presetAgentInfo">
+                                  <div className="presetAgentName">{agent.name}</div>
+                                  <div className="presetAgentLabel">{agent.label}</div>
+                                </div>
+                                <div className="presetAgentTool mono">{agent.profileId}</div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
-                      <div className="field">
-                        <label>Session</label>
-                        <input value={opencodeOpt.session} onChange={(e) => setOpenCodeOpt((p) => ({ ...p, session: e.target.value }))} placeholder="session id (optional)" autoCapitalize="none" autoCorrect="off" />
+
+                      {selectedPresetDef.kind === "session" ? (
+                        <>
+                          <div className="newSection">
+                            <div className="newSectionLabel">TOOL</div>
+                            <div className="toolToggle">
+                              {(["claude", "codex", "opencode"] as ToolId[]).map(t => (
+                                <button key={t} className={`toolToggleBtn ${soloTool === t ? "toolToggleBtnOn" : ""}`}
+                                  onClick={() => { setSoloTool(t); setSoloProfile(`${t}.default`); }}>{t}</button>
+                              ))}
+                            </div>
+                          </div>
+                          <div className="newSection">
+                            <div className="newSectionLabel">MODEL (OPTIONAL)</div>
+                            <select className="newSelect" value={soloModel} onChange={(e) => setSoloModel(e.target.value)}>
+                              <option value="">Default profile model</option>
+                              {modelOptionsForTool(soloTool).map((opt) => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="newSection">
+                            <div className="newSectionLabel">DIRECTORY</div>
+                            <div className="newPathRow">
+                              <input className="newInput newPathInput" value={formatDisplayPath(soloCwd)} onChange={e => setSoloCwd(e.target.value)} placeholder={formatDisplayPath(defaultWorkspacePath) || "~/path/to/project"} />
+                              <button className="btn newPathBrowseBtn" disabled={!!createBusy} onClick={() => openDirectoryPicker("soloCwd")}>
+                                Browse
+                              </button>
+                            </div>
+                          </div>
+                        </>
+                      ) : selectedPresetDef.id === "custom-team" ? (
+                        <>
+                          <div className="newSection">
+                            <div className="newSectionLabel">PROJECT PATH</div>
+                            <div className="newPathRow">
+                              <input className="newInput newPathInput" value={formatDisplayPath(createProjectPath)} onChange={e => setCreateProjectPath(e.target.value)} placeholder={formatDisplayPath(defaultWorkspacePath) || "~/path/to/project"} />
+                              <button className="btn newPathBrowseBtn" disabled={!!createBusy} onClick={() => openDirectoryPicker("createProjectPath")}>
+                                Browse
+                              </button>
+                            </div>
+                          </div>
+                          <div className="newSection">
+                            <div className="newSectionLabel">OBJECTIVE</div>
+                            <textarea className="newTextarea" rows={3} value={createObjective} onChange={e => setCreateObjective(e.target.value)} placeholder="What should this custom team accomplish?" />
+                          </div>
+
+                          <div className="newSection">
+                            <div className="newSectionLabel">ORCHESTRATOR (LOCKED TO 1)</div>
+                            <div className="modelPickerRow modelPickerRowCard">
+                              <div className="modelPickerLabel mono">Tool</div>
+                              <div className="toolToggle">
+                                {(["claude", "codex", "opencode"] as ToolId[]).map(t => (
+                                  <button
+                                    key={t}
+                                    className={`toolToggleBtn ${customOrchestratorTool === t ? "toolToggleBtnOn" : ""}`}
+                                    onClick={() => setCustomOrchestratorTool(t)}
+                                  >
+                                    {t}
+                                  </button>
+                                ))}
+                              </div>
+                              <div className="modelPickerLabel mono">Profile</div>
+                              <select
+                                className="newSelect"
+                                value={normalizeProfileIdForTool(customOrchestratorTool, customOrchestratorProfile, configProfiles)}
+                                onChange={(e) => setCustomOrchestratorProfile(e.target.value)}
+                              >
+                                {profileOptionsForTool(customOrchestratorTool, configProfiles).map((p) => (
+                                  <option key={p.id} value={p.id}>{p.label}</option>
+                                ))}
+                              </select>
+                              <div className="modelPickerLabel mono">Model (optional override)</div>
+                              <select className="newSelect" value={customOrchestratorModel} onChange={(e) => setCustomOrchestratorModel(e.target.value)}>
+                                <option value="">Default profile model</option>
+                                {modelOptionsForTool(customOrchestratorTool).map((opt) => (
+                                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                ))}
+                              </select>
+                            </div>
+                          </div>
+
+                          <div className="newSection">
+                            <div className="newSectionLabel">AUTOMATION MODE</div>
+                            <div className="modelPickerRow modelPickerRowCard">
+                              <div className="modelPickerLabel mono">Orchestrator behavior</div>
+                              <div className="toolToggle">
+                                <button
+                                  className={`toolToggleBtn ${customTeamAutomationMode === "manual" ? "toolToggleBtnOn" : ""}`}
+                                  onClick={() => setCustomTeamAutomationMode("manual")}
+                                >
+                                  Manual
+                                </button>
+                                <button
+                                  className={`toolToggleBtn ${customTeamAutomationMode === "guided" ? "toolToggleBtnOn" : ""}`}
+                                  onClick={() => setCustomTeamAutomationMode("guided")}
+                                >
+                                  Guided
+                                </button>
+                                <button
+                                  className={`toolToggleBtn ${customTeamAutomationMode === "autopilot" ? "toolToggleBtnOn" : ""}`}
+                                  onClick={() => setCustomTeamAutomationMode("autopilot")}
+                                >
+                                  Autopilot
+                                </button>
+                              </div>
+                              <div className="presetDetail">
+                                {customTeamAutomationMode === "manual"
+                                  ? "No auto-answer and no periodic steering."
+                                  : customTeamAutomationMode === "guided"
+                                    ? "Auto-answer worker questions through orchestrator with passive review."
+                                    : "Auto-answer + active steering reviews for faster autonomous flow."}
+                              </div>
+                              <div className="modelPickerLabel mono">Question timeout</div>
+                              <select
+                                className="newSelect"
+                                value={String(customTeamQuestionTimeoutMs)}
+                                onChange={(e) => setCustomTeamQuestionTimeoutMs(Math.max(30_000, Number(e.target.value) || 120_000))}
+                              >
+                                <option value="60000">60s</option>
+                                <option value="120000">120s</option>
+                                <option value="180000">180s</option>
+                                <option value="300000">300s</option>
+                              </select>
+                              <div className="modelPickerLabel mono">Review interval</div>
+                              <select
+                                className="newSelect"
+                                value={String(customTeamReviewIntervalMs)}
+                                onChange={(e) => setCustomTeamReviewIntervalMs(Math.max(30_000, Number(e.target.value) || 60_000))}
+                                disabled={customTeamAutomationMode === "manual"}
+                              >
+                                <option value="60000">60s</option>
+                                <option value="120000">120s</option>
+                                <option value="180000">180s</option>
+                                <option value="300000">300s</option>
+                              </select>
+                              <div className="modelPickerLabel mono">Risk policy</div>
+                              <div className="toolToggle">
+                                <button
+                                  className={`toolToggleBtn ${!customTeamYoloMode ? "toolToggleBtnOn" : ""}`}
+                                  onClick={() => setCustomTeamYoloMode(false)}
+                                >
+                                  Safe
+                                </button>
+                                <button
+                                  className={`toolToggleBtn ${customTeamYoloMode ? "toolToggleBtnOn" : ""}`}
+                                  onClick={() => setCustomTeamYoloMode(true)}
+                                >
+                                  YOLO
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="newSection">
+                            <div className="newSectionLabel">WORKER GROUPS</div>
+                            <div className="presetAgentStack">
+                              {customWorkerGroups.map((group, idx) => {
+                                const profileValue = normalizeProfileIdForTool(group.tool, group.profileId, configProfiles);
+                                return (
+                                  <div key={group.id} className="modelPickerRow modelPickerRowCard">
+                                    <div className="modelPickerLabel mono">Group {idx + 1}</div>
+                                    <div className="toolToggle">
+                                      {(["claude", "codex", "opencode"] as ToolId[]).map((t) => (
+                                        <button
+                                          key={t}
+                                          className={`toolToggleBtn ${group.tool === t ? "toolToggleBtnOn" : ""}`}
+                                          onClick={() =>
+                                            setCustomWorkerGroups((prev) =>
+                                              prev.map((g) =>
+                                                g.id === group.id
+                                                  ? {
+                                                    ...g,
+                                                    tool: t,
+                                                    profileId: normalizeProfileIdForTool(t, g.profileId, configProfiles),
+                                                  }
+                                                  : g,
+                                              ),
+                                            )
+                                          }
+                                        >
+                                          {t}
+                                        </button>
+                                      ))}
+                                    </div>
+                                    <div className="modelPickerLabel mono">Profile</div>
+                                    <select
+                                      className="newSelect"
+                                      value={profileValue}
+                                      onChange={(e) =>
+                                        setCustomWorkerGroups((prev) =>
+                                          prev.map((g) => (g.id === group.id ? { ...g, profileId: e.target.value } : g)),
+                                        )
+                                      }
+                                    >
+                                      {profileOptionsForTool(group.tool, configProfiles).map((p) => (
+                                        <option key={p.id} value={p.id}>{p.label}</option>
+                                      ))}
+                                    </select>
+                                    <div className="modelPickerLabel mono">Role</div>
+                                    <input
+                                      className="newInput"
+                                      value={group.role}
+                                      onChange={(e) =>
+                                        setCustomWorkerGroups((prev) =>
+                                          prev.map((g) => (g.id === group.id ? { ...g, role: e.target.value } : g)),
+                                        )
+                                      }
+                                      placeholder="debug / frontend / backend / tests"
+                                    />
+                                    <div className="modelPickerLabel mono">Count (1-{CUSTOM_TEAM_MAX_GROUP_COUNT})</div>
+                                    <input
+                                      type="number"
+                                      min={1}
+                                      max={CUSTOM_TEAM_MAX_GROUP_COUNT}
+                                      className="newInput"
+                                      value={group.count}
+                                      onChange={(e) =>
+                                        setCustomWorkerGroups((prev) =>
+                                          prev.map((g) => {
+                                            if (g.id !== group.id) return g;
+                                            const next = Math.floor(Number(e.target.value || 1));
+                                            return { ...g, count: Math.max(1, Math.min(CUSTOM_TEAM_MAX_GROUP_COUNT, next || 1)) };
+                                          }),
+                                        )
+                                      }
+                                    />
+                                    <div className="modelPickerLabel mono">Model (optional override)</div>
+                                    <select
+                                      className="newSelect"
+                                      value={group.model}
+                                      onChange={(e) =>
+                                        setCustomWorkerGroups((prev) =>
+                                          prev.map((g) => (g.id === group.id ? { ...g, model: e.target.value } : g)),
+                                        )
+                                      }
+                                    >
+                                      <option value="">Default profile model</option>
+                                      {modelOptionsForTool(group.tool).map((opt) => (
+                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                      ))}
+                                    </select>
+                                    <div className="modelPickerLabel mono">Task template</div>
+                                    <textarea
+                                      className="newTextarea"
+                                      rows={2}
+                                      value={group.taskTemplate}
+                                      onChange={(e) =>
+                                        setCustomWorkerGroups((prev) =>
+                                          prev.map((g) => (g.id === group.id ? { ...g, taskTemplate: e.target.value } : g)),
+                                        )
+                                      }
+                                      placeholder="Implement and verify {objective}"
+                                    />
+                                    <div className="customTeamActions">
+                                      <button
+                                        className="rowActionBtn"
+                                        onClick={() =>
+                                          setCustomWorkerGroups((prev) => [
+                                            ...prev,
+                                            makeCustomWorkerGroup({
+                                              tool: group.tool,
+                                              profileId: normalizeProfileIdForTool(group.tool, group.profileId, configProfiles),
+                                              role: group.role || "worker",
+                                              taskTemplate: group.taskTemplate || "Help accomplish: {objective}",
+                                            }),
+                                          ])
+                                        }
+                                      >
+                                        Add group
+                                      </button>
+                                      <button
+                                        className="rowActionBtn rowActionDanger"
+                                        onClick={() =>
+                                          setCustomWorkerGroups((prev) =>
+                                            prev.length > 1 ? prev.filter((g) => g.id !== group.id) : prev,
+                                          )
+                                        }
+                                        disabled={customWorkerGroups.length <= 1}
+                                      >
+                                        Remove
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="newSection">
+                            <div className="newSectionLabel">PROJECT PATH</div>
+                            <div className="newPathRow">
+                              <input className="newInput newPathInput" value={formatDisplayPath(createProjectPath)} onChange={e => setCreateProjectPath(e.target.value)} placeholder={formatDisplayPath(defaultWorkspacePath) || "~/path/to/project"} />
+                              <button className="btn newPathBrowseBtn" disabled={!!createBusy} onClick={() => openDirectoryPicker("createProjectPath")}>
+                                Browse
+                              </button>
+                            </div>
+                          </div>
+                          <div className="newSection">
+                            <div className="newSectionLabel">OBJECTIVE</div>
+                            <textarea className="newTextarea" rows={3} value={createObjective} onChange={e => setCreateObjective(e.target.value)} placeholder="What should the agents accomplish?" />
+                          </div>
+                          <div className="newSection">
+                            <div className="newSectionLabel">MODEL OVERRIDES (OPTIONAL)</div>
+                            <div className="presetAgentStack">
+                              {selectedPresetDef.agents.map((agent, idx) => (
+                                <div key={`model-${idx}`} className="modelPickerRow modelPickerRowCard">
+                                  <div className="modelPickerLabel mono">
+                                    {agent.role === "orchestrator" ? "Orchestrator" : agent.name}
+                                  </div>
+                                  <select
+                                    className="newSelect"
+                                    value={manualAgentModels[idx] ?? ""}
+                                    onChange={(e) =>
+                                      setManualAgentModels((prev) => ({ ...prev, [idx]: e.target.value }))
+                                    }
+                                  >
+                                    <option value="">Default profile model</option>
+                                    {modelOptionsForTool(agent.tool).map((opt) => (
+                                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </>
+                      )}
+
+                      {createMsg && (
+                        <div className={`createFeedback ${createMsg.ok ? "createFeedbackOk" : "createFeedbackError"}`}>
+                          {createMsg.text}
+                        </div>
+                      )}
+
+                      {selectedPresetDef.id === "custom-team" && customTeamOverLimit && (
+                        <div className="createFeedback createFeedbackError">
+                          Worker count exceeds cap ({CUSTOM_TEAM_MAX_WORKERS}). Reduce group counts.
+                        </div>
+                      )}
+
+                      <button className="newLaunchBtn" disabled={!!createBusy || (selectedPresetDef.id === "custom-team" && customTeamOverLimit)} onClick={() => void createFromPreset(selectedPresetDef)}>
+                        {createBusy ? "Launching…" : selectedPresetDef.kind === "orchestration"
+                          ? `Launch ${selectedPresetDef.name} — ${selectedPresetDef.id === "custom-team" ? customTeamWorkerTotal + 1 : selectedPresetDef.agents.length} agents`
+                          : `Launch ${soloTool}`}
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* ── SETTINGS TAB ── */}
+              {tab === "settings" && (
+                <div className="view">
+                  <button className="backLink" onClick={() => setTab("inbox")}>← Back</button>
+                  <div className="card">
+                    <div className="cardHead"><div className="cardTitle">Server</div></div>
+                    <div className="cardBody">
+                      <div className="settingsRow">
+                        <span>Version</span>
+                        <span className="mono">{doctor?.app?.version || "—"}</span>
                       </div>
-                      <div className="field span2">
-                        <label>Prompt Override</label>
-                        <input value={opencodeOpt.prompt} onChange={(e) => setOpenCodeOpt((p) => ({ ...p, prompt: e.target.value }))} placeholder="prompt name (optional)" autoCapitalize="none" autoCorrect="off" />
+                      <div className="settingsRow">
+                        <span>Platform</span>
+                        <span className="mono">{doctor?.process?.platform || "—"}</span>
                       </div>
-                      <div className="toggles span2">
-                        <label className="toggle">
-                          <input type="checkbox" checked={opencodeOpt.cont} onChange={(e) => setOpenCodeOpt((p) => ({ ...p, cont: e.target.checked }))} />
-                          <span>Continue last</span>
-                        </label>
-                        <label className="toggle">
-                          <input type="checkbox" checked={opencodeOpt.fork} onChange={(e) => setOpenCodeOpt((p) => ({ ...p, fork: e.target.checked }))} />
-                          <span>Fork session</span>
-                        </label>
+                      <div className="settingsRow">
+                        <span>Terminal mode</span>
+                        <span>{features.terminalModeEnabled ? "enabled" : "disabled"}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="cardHead"><div className="cardTitle">Display & Privacy</div></div>
+                    <div className="cardBody">
+                      <div className="settingsRow settingsRowStack">
+                        <div className="settingsCell">
+                          <div>Path display mode</div>
+                          <div className="settingsHint">Hide `/home/username` or `/Users/username` when sharing screens.</div>
+                        </div>
+                        <div className="toolToggle toolToggleInline">
+                          <button
+                            className={`toolToggleBtn ${pathPrivacyMode === "full" ? "toolToggleBtnOn" : ""}`}
+                            onClick={() => setPathPrivacyMode("full")}
+                          >
+                            Full
+                          </button>
+                          <button
+                            className={`toolToggleBtn ${pathPrivacyMode === "share" ? "toolToggleBtnOn" : ""}`}
+                            onClick={() => setPathPrivacyMode("share")}
+                          >
+                            Sharing
+                          </button>
+                        </div>
+                      </div>
+                      <div className="settingsRow">
+                        <span>Preview</span>
+                        <span className="mono settingsPathPreview">
+                          {formatDisplayPath(defaultWorkspacePath || doctor?.process?.cwd || "") || "—"}
+                        </span>
+                      </div>
+                      <div className="settingsRow settingsRowStack">
+                        <div className="settingsCell">
+                          <div>Auto-trust Claude workspace in Sharing mode</div>
+                          <div className="settingsHint">
+                            Uses Claude `--dangerously-skip-permissions` so the trust prompt does not expose full paths.
+                          </div>
+                          {!claudeSupportsDangerousSkip ? (
+                            <div className="settingsHint settingsHintWarn">
+                              This Claude build does not report support for `--dangerously-skip-permissions`.
+                            </div>
+                          ) : null}
+                        </div>
+                        <div className="toolToggle toolToggleInline">
+                          <button
+                            className={`toolToggleBtn ${!claudeAutoTrustShareMode ? "toolToggleBtnOn" : ""}`}
+                            onClick={() => setClaudeAutoTrustShareMode(false)}
+                          >
+                            Off
+                          </button>
+                          <button
+                            className={`toolToggleBtn ${claudeAutoTrustShareMode ? "toolToggleBtnOn" : ""}`}
+                            onClick={() => setClaudeAutoTrustShareMode(true)}
+                          >
+                            On
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="cardHead"><div className="cardTitle">Tools</div></div>
+                    <div className="cardBody">
+                      {(["claude", "codex", "opencode"] as const).map(t => {
+                        const info = doctor?.tools?.[t];
+                        if (!info) return null;
+                        return (
+                          <div key={t} className="settingsRow">
+                            <span className="mono">{t}</span>
+                            <span className="chip">{info.version || "detected"}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {doctor?.workspaceRoots?.length ? (
+                    <div className="card">
+                      <div className="cardHead"><div className="cardTitle">Workspace Roots</div></div>
+                      <div className="cardBody">
+                        {doctor.workspaceRoots.map(r => (
+                          <div key={r} className="settingsRow mono" style={{ fontSize: 12 }}>{formatDisplayPath(r)}</div>
+                        ))}
                       </div>
                     </div>
                   ) : null}
-                </div>
-              ) : null}
-
-              <div className="row">
-                <button className="btn primary big" onClick={createSession}>
-                  Start Session
-                </button>
-              </div>
-            </div>
-          </section>
-        ) : null}
-
-        {tab === "settings" ? (
-          <section className="view">
-            <div className="card">
-              <div className="cardHead">
-                <div>
-                  <div className="cardTitle">This Device</div>
-                  <div className="cardSub">Clear the saved cookie and re-auth.</div>
-                </div>
-                <button
-                  className="btn"
-                  onClick={async () => {
-                    try {
-                      await api("/api/auth/logout", { method: "POST" });
-                    } catch {
-                      // ignore
-                    } finally {
-                      window.location.reload();
-                    }
-                  }}
-                >
-                  Forget
-                </button>
-              </div>
-              <div className="row">
-                <div className="help">Useful when the phone “never asks for token” because it’s already paired.</div>
-              </div>
-            </div>
-            <div className="card">
-              <div className="cardHead">
-                <div>
-                  <div className="cardTitle">Pair A Device</div>
-                  <div className="cardSub">Generates a short code so you don’t paste long tokens.</div>
-                </div>
-                <button
-                  className="btn primary"
-                  onClick={async () => {
-                    try {
-                      const r = await api<{ ok: boolean; code: string; expiresAt: number }>("/api/auth/pair/start", { method: "POST" });
-                      const url = `${window.location.origin}/?pair=${encodeURIComponent(r.code)}`;
-                      setPairInfo({ code: r.code, url, expiresAt: r.expiresAt });
-                      setToast("Pair code generated");
-                    } catch {
-                      setToast("Failed to generate pair code");
-                    }
-                  }}
-                >
-                  Generate Code
-                </button>
-              </div>
-              <div className="row">
-                <div className="help">Open this site on the new phone, tap Pair, and enter the code.</div>
-              </div>
-              {pairInfo ? (
-                <div className="row">
-                  <div className="field">
-                    <label>Pair Code</label>
-                    <div className="pairCodeBig mono">{pairInfo.code}</div>
-                    <div className="help mono">{pairInfo.url}</div>
-                    <div className="runBtns" style={{ marginTop: 10 }}>
-                      <button
-                        className="btn"
-                        onClick={async () => {
-                          try {
-                            await navigator.clipboard.writeText(pairInfo.code);
-                            setToast("Copied code");
-                          } catch {
-                            setToast("Copy failed (needs HTTPS)");
-                          }
-                        }}
-                      >
-                        Copy Code
-                      </button>
-                      <button
-                        className="btn"
-                        onClick={async () => {
-                          try {
-                            await navigator.clipboard.writeText(pairInfo.url);
-                            setToast("Copied link");
-                          } catch {
-                            setToast("Copy failed (needs HTTPS)");
-                          }
-                        }}
-                      >
-                        Copy Link
-                      </button>
-                      <button className="btn ghost" onClick={() => window.open(pairInfo.url, "_blank")}>
-                        Open
+                  <div className="card">
+                    <div className="cardBody">
+                      <button className="btn danger" style={{ width: "100%" }} onClick={() => { setAuthed("no"); setPairCode(""); setToken(""); }}>
+                        Disconnect
                       </button>
                     </div>
-                    <div className="help">Expires: {new Date(pairInfo.expiresAt).toLocaleString()}</div>
                   </div>
                 </div>
-              ) : null}
-            </div>
-	            <div className="card">
-	              <div className="cardHead">
-	                <div>
-	                  <div className="cardTitle">Pinned Slots</div>
-	                  <div className="cardSub">3 recommended, 4 recommended max, 6 experimental.</div>
-	                </div>
-	              </div>
-	              <div className="row">
-	                <div className="seg">
-	                  <button className={`segBtn ${slotCfg.slots === 3 ? "segOn" : ""}`} onClick={() => setSlotCfg({ slots: 3 })}>
-	                    3 (Recommended)
-	                  </button>
-	                  <button className={`segBtn ${slotCfg.slots === 4 ? "segOn" : ""}`} onClick={() => setSlotCfg({ slots: 4 })}>
-	                    4 (Rec. Max)
-	                  </button>
-	                  <button className={`segBtn ${slotCfg.slots === 6 ? "segOn" : ""}`} onClick={() => setSlotCfg({ slots: 6 })}>
-	                    6 (Experimental)
-	                  </button>
-	                </div>
-	              </div>
-	              <div className="row">
-	                <label className="toggle" style={{ margin: 0 }}>
-	                  <input type="checkbox" checked={autoPinNew} onChange={(e) => setAutoPinNew(e.target.checked)} />
-	                  <span className="muted">Auto-pin new sessions</span>
-	                </label>
-	              </div>
-	              <div className="row">
-	                <div className="help">
-	                  Pin/unpin from Workspace. Swipe left/right in Run to switch sessions (pinned first; otherwise recent sessions in this workspace).
-	                </div>
-	              </div>
-	            </div>
-            <div className="card">
-              <div className="cardHead">
-                <div>
-                  <div className="cardTitle">Tool Doctor</div>
-                  <div className="cardSub">Detected capabilities on this host.</div>
-                </div>
-                <button className="btn" onClick={rescanDoctor}>
-                  Rescan
-                </button>
-              </div>
-              <div className="doctorGrid">
-                <div className="doctorBox">
-                  <div className="doctorTitle">codex</div>
-                  <div className="mono muted">{doctor?.tools.codex.version ?? ""}</div>
-                </div>
-                <div className="doctorBox">
-                  <div className="doctorTitle">claude</div>
-                  <div className="mono muted">{doctor?.tools.claude.version ?? ""}</div>
-                </div>
-                <div className="doctorBox">
-                  <div className="doctorTitle">opencode</div>
-                  <div className="mono muted">{doctor?.tools.opencode.version ?? ""}</div>
-                </div>
-              </div>
-              {doctor?.app?.version ? (
-                <div className="help mono" style={{ wordBreak: "break-all" }}>
-                  App: {doctor.app.name ?? "fromyourphone"}@{doctor.app.version} · node {doctor.process?.node ?? ""} · pid {doctor.process?.pid ?? ""}
-                </div>
-              ) : null}
-              {doctor?.app?.webRoot ? (
-                <div className="help mono" style={{ wordBreak: "break-all" }}>
-                  Web: {doctor.app.webRoot}
-                </div>
-              ) : null}
-              <div className="help">
-                Allowed workspace roots: <span className="mono">{(doctor?.workspaceRoots ?? []).join(", ")}</span>
-              </div>
-            </div>
+              )}
+            </>
+          )}
+        </div>
 
-            <div className="card">
-              <div className="cardHead">
-                <div>
-                  <div className="cardTitle">Config</div>
-                  <div className="cardSub">Edit `~/.fromyourphone/config.toml`</div>
-                </div>
-                <button className="btn primary" onClick={openConfig}>
-                  Open Editor
-                </button>
-              </div>
-              <div className="help">
-                Profiles are best defined with tool-native fields: `profiles.*.codex`, `profiles.*.claude`, `profiles.*.opencode`.
-              </div>
-            </div>
-          </section>
-        ) : null}
-      </main>
-
-      <BottomNav
-        tab={tab}
-        inboxCount={workspaceInboxCount}
-        onSetTab={setTab}
-        onOpenInbox={() => {
-          refreshInbox({ workspaceKey: selectedWorkspaceKey });
-          setTab("inbox");
-        }}
-      />
-
+        {/* Hide nav when session is active (full-screen session view) */}
+        {!activeSessionId && (
+          <BottomNav
+            tab={tab}
+            inboxCount={inboxCount}
+            onSetTab={t => { setTab(t); setActiveTaskId(null); setActiveSessionId(null); }}
+            onOpenInbox={() => { setTab("inbox"); setActiveTaskId(null); setActiveSessionId(null); }}
+          />
+        )}
+      </div>
       <PickerModal
-        open={showPicker}
-        path={pickPath}
-        parent={pickParent}
-        entries={pickEntries}
-        showHidden={pickShowHidden}
-        onClose={() => setShowPicker(false)}
-        onUse={(p) => {
-          setCwd(p);
-          setShowPicker(false);
-          setToast("Workspace selected");
+        open={dirPickerOpen}
+        path={dirPickerPath}
+        parent={dirPickerParent}
+        entries={dirPickerEntries}
+        showHidden={dirPickerShowHidden}
+        busy={dirPickerBusy}
+        message={dirPickerMsg}
+        formatPath={formatDisplayPath}
+        onClose={() => {
+          setDirPickerOpen(false);
+          setDirPickerMsg(null);
         }}
-        onSetPath={setPickPath}
-        onGo={(p) => loadPicker(p)}
-        onUp={(p) => loadPicker(p)}
-        onToggleHidden={async (next) => {
-          setPickShowHidden(next);
-          await loadPicker(pickPath, { showHidden: next });
-        }}
+        onUse={applyPickedDirectory}
+        onSetPath={setDirPickerPath}
+        onGo={(path) => loadDirectoryPicker(path)}
+        onUp={(path) => loadDirectoryPicker(path)}
+        onToggleHidden={(next) => toggleDirectoryHidden(next)}
+        onCreateFolder={(name, parentPath) => createDirectoryInPicker(name, parentPath)}
       />
-
-      <ConfigModal
-        open={showConfig}
-        toml={configToml}
-        msg={configMsg}
-        onChange={setConfigToml}
-        onClose={() => setShowConfig(false)}
-        onSave={saveConfig}
-      />
-      <ModelPickerModal
-        open={showModelPicker}
-        providers={modelProviders}
-        provider={modelProvider}
-        query={modelQuery}
-        models={modelList}
-        loading={modelLoading}
-        msg={modelListMsg}
-        selectedModel={String(opencodeOpt.model || "").trim()}
-        onClose={() => setShowModelPicker(false)}
-        onProviderChange={setModelProvider}
-        onQueryChange={setModelQuery}
-        onReload={async () => {
-          await loadOpenCodeModels({ provider: "" });
-          setToast("Loaded models");
-        }}
-        onRefresh={async () => {
-          await loadOpenCodeModels({ provider: "", refresh: true });
-          setToast("Refreshed models");
-        }}
-        onClear={() => {
-          setOpenCodeOpt((p) => ({ ...p, model: "" }));
-          setToast("Model cleared");
-          setShowModelPicker(false);
-        }}
-        onSelect={(s) => {
-          setOpenCodeOpt((p) => ({ ...p, model: s }));
-          setToast(`Selected: ${s}`);
-          setShowModelPicker(false);
-        }}
-      />
-
-      <ToolChatModal
-        open={showToolChat}
-        session={toolChatSession}
-        messages={toolChatMessages}
-        loading={toolChatLoading}
-        msg={toolChatMsg}
-        limit={toolChatLimit}
-        onClose={() => setShowToolChat(false)}
-        onOlder={() => {
-          if (!toolChatSession) return;
-          return openToolChat(toolChatSession.tool, toolChatSession.id, { limit: Math.min(5000, toolChatLimit * 2), keep: true });
-        }}
-        onAll={() => {
-          if (!toolChatSession) return;
-          return openToolChat(toolChatSession.tool, toolChatSession.id, { limit: 5000, keep: true });
-        }}
-        onRefresh={() => {
-          if (!toolChatSession) return;
-          return openToolChat(toolChatSession.tool, toolChatSession.id, { refresh: true, limit: toolChatLimit, keep: true });
-        }}
-        onResume={() => {
-          if (!toolChatSession) return;
-          return startFromToolSession(toolChatSession, "resume");
-        }}
-        onFork={() => {
-          if (!toolChatSession) return;
-          return startFromToolSession(toolChatSession, "fork");
-        }}
-      />
-
-      <LogModal open={showLog} events={events} onClose={() => setShowLog(false)} />
-
-      <ControlsModal
-        open={showControls}
-        activeSession={activeSession}
-        labelDraft={labelDraft}
-        setLabelDraft={setLabelDraft}
-        fontSize={fontSize}
-        setFontSize={setFontSize}
-        lineHeight={lineHeight}
-        setLineHeight={setLineHeight}
-        onClose={() => setShowControls(false)}
-        onOpenLog={() => {
-          setShowControls(false);
-          setShowLog(true);
-        }}
-        onOpenChat={() => {
-          const t = activeSession?.tool ?? null;
-          const sid = String(activeSession?.toolSessionId ?? "");
-          if ((t !== "codex" && t !== "claude") || !sid) {
-            setToast("Chat history not linked yet");
-            return;
-          }
-          setShowControls(false);
-          openToolChat(t, sid);
-        }}
-        onSaveLabel={async () => {
-          if (!activeSession?.id) return;
-          try {
-            await setSessionMeta(activeSession.id, { label: labelDraft.trim() ? labelDraft.trim() : null });
-            setToast("Saved label");
-            setShowControls(false);
-            refreshSessions();
-            refreshWorkspaces();
-          } catch (e: any) {
-            setToast(typeof e?.message === "string" ? e.message : "failed to save label");
-          }
-        }}
-        onClearLabel={() => setLabelDraft("")}
-        onFit={() => scheduleFitAndResize({ force: true, burst: true })}
-        onCopy={copyTermSelection}
-        onPaste={pasteClipboardToTerm}
-        onSendRaw={sendRaw}
-        onRemoveSession={() => {
-          if (!activeSession?.id) return;
-          removeSession(activeSession.id);
-        }}
-        onKill={() => {
-          sendControl("kill");
-          setShowControls(false);
-        }}
-      />
-
-      {toast ? <div className="toast mono">{toast}</div> : null}
     </div>
   );
 }

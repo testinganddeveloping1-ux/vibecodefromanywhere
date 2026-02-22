@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from "react";
 import type { TabId } from "../types";
 import { IconFolder, IconInbox, IconPlus, IconTerminal } from "./icons";
+import styles from "./BottomNav.module.css";
 
 export function BottomNav(props: {
   tab: TabId;
@@ -58,43 +59,43 @@ export function BottomNav(props: {
   }, []);
 
   return (
-    <nav className="nav" ref={navRef as any}>
+    <nav className={styles.nav} ref={navRef as any}>
       <button
-        className={`navBtn ${props.tab === "run" ? "navOn" : ""}`}
-        aria-label="Terminal"
-        title="Terminal"
-        onClick={() => props.onSetTab("run")}
-      >
-        <IconTerminal />
-        <span className="navLabel">Terminal</span>
-      </button>
-      <button
-        className={`navBtn ${props.tab === "workspace" ? "navOn" : ""}`}
-        aria-label="Projects"
-        title="Projects"
-        onClick={() => props.onSetTab("workspace")}
-      >
-        <IconFolder />
-        <span className="navLabel">Projects</span>
-      </button>
-      <button
-        className={`navBtn ${props.tab === "inbox" ? "navOn" : ""}`}
+        className={`${styles.navBtn} ${props.tab === "inbox" ? styles.navOn : ""}`}
         aria-label="Inbox"
         title="Inbox"
         onClick={() => props.onOpenInbox()}
       >
         <IconInbox />
-        <span className="navLabel">Inbox</span>
-        {props.inboxCount > 0 ? <span className="navBadge">{props.inboxCount}</span> : null}
+        <span className={styles.navLabel}>Inbox</span>
+        {props.inboxCount > 0 ? <span className={styles.navBadge}>{props.inboxCount}</span> : null}
       </button>
       <button
-        className={`navBtn ${props.tab === "new" ? "navOn" : ""}`}
+        className={`${styles.navBtn} ${props.tab === "run" ? styles.navOn : ""}`}
+        aria-label="Terminal"
+        title="Terminal"
+        onClick={() => props.onSetTab("run")}
+      >
+        <IconTerminal />
+        <span className={styles.navLabel}>Terminal</span>
+      </button>
+      <button
+        className={`${styles.navBtn} ${props.tab === "workspace" ? styles.navOn : ""}`}
+        aria-label="Projects"
+        title="Projects"
+        onClick={() => props.onSetTab("workspace")}
+      >
+        <IconFolder />
+        <span className={styles.navLabel}>Projects</span>
+      </button>
+      <button
+        className={`${styles.navBtn} ${props.tab === "new" ? styles.navOn : ""}`}
         aria-label="New"
         title="New"
         onClick={() => props.onSetTab("new")}
       >
         <IconPlus />
-        <span className="navLabel">New</span>
+        <span className={styles.navLabel}>New</span>
       </button>
     </nav>
   );

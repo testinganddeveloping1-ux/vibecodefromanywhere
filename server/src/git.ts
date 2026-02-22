@@ -121,3 +121,86 @@ export function pickTreeRootForPath(cwd: string, trees: GitWorktreeInfo[]): stri
   return best;
 }
 
+export type CreateGitWorktreeInput = {
+  repoPath: string;
+  worktreePath: string;
+  branch: string;
+  baseRef?: string;
+  lock?: boolean;
+  lockReason?: string;
+};
+
+export type CreateGitWorktreeResult =
+  | {
+      ok: true;
+      repoPath: string;
+      worktreePath: string;
+      branch: string;
+      branchCreated: boolean;
+    }
+  | {
+      ok: false;
+      reason: string;
+      message: string;
+    };
+
+async function hasLocalBranch(repoPath: string, branch: string): Promise<boolean> {
+  const r = await execCapture("git", ["-C", repoPath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { timeoutMs: 2500 });
+  return r.ok;
+}
+
+export async function createGitWorktree(input: CreateGitWorktreeInput): Promise<CreateGitWorktreeResult> {
+  const repoPath = path.resolve(String(input.repoPath || ""));
+  const worktreePath = path.resolve(String(input.worktreePath || ""));
+  const branch = String(input.branch || "").trim();
+  const baseRef = String(input.baseRef || "HEAD").trim() || "HEAD";
+  const lock = input.lock !== false;
+  const lockReason = String(input.lockReason || "").trim();
+
+  if (!repoPath || !worktreePath || !branch) return { ok: false, reason: "bad_input", message: "repoPath, worktreePath, and branch are required" };
+
+  const branchNameOk = await execCapture("git", ["-C", repoPath, "check-ref-format", "--branch", branch], { timeoutMs: 2500 });
+  if (!branchNameOk.ok) return { ok: false, reason: "bad_branch", message: `invalid branch name: ${branch}` };
+
+  const exists = await hasLocalBranch(repoPath, branch);
+  const args = ["-C", repoPath, "worktree", "add"];
+  if (lock) {
+    args.push("--lock");
+    if (lockReason) args.push("--reason", lockReason);
+  }
+  if (exists) args.push(worktreePath, branch);
+  else args.push("-b", branch, worktreePath, baseRef);
+
+  const r = await execCapture("git", args, { timeoutMs: 12_000 });
+  if (!r.ok) {
+    const message = (r.stderr || r.stdout || r.error || "failed to create git worktree").trim();
+    if (/already checked out/i.test(message)) return { ok: false, reason: "branch_checked_out", message };
+    if (/already exists/i.test(message)) return { ok: false, reason: "path_exists", message };
+    if (/not a git repository/i.test(message)) return { ok: false, reason: "not_git", message };
+    return { ok: false, reason: "create_failed", message };
+  }
+
+  return {
+    ok: true,
+    repoPath,
+    worktreePath,
+    branch,
+    branchCreated: !exists,
+  };
+}
+
+export async function removeGitWorktree(input: { repoPath: string; worktreePath: string; force?: boolean }): Promise<{ ok: true } | { ok: false; message: string }> {
+  const repoPath = path.resolve(String(input.repoPath || ""));
+  const worktreePath = path.resolve(String(input.worktreePath || ""));
+  const force = input.force !== false;
+  if (!repoPath || !worktreePath) return { ok: false, message: "repoPath and worktreePath are required" };
+
+  // Best effort: remove lock first so cleanup can succeed for lock-protected worktrees.
+  await execCapture("git", ["-C", repoPath, "worktree", "unlock", worktreePath], { timeoutMs: 4000 });
+  const args = ["-C", repoPath, "worktree", "remove"];
+  if (force) args.push("--force");
+  args.push(worktreePath);
+  const r = await execCapture("git", args, { timeoutMs: 10_000 });
+  if (!r.ok) return { ok: false, message: (r.stderr || r.stdout || r.error || "failed to remove worktree").trim() };
+  return { ok: true };
+}

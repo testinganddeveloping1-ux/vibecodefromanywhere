@@ -18,6 +18,9 @@
     "start": "node dist/server/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:two-cli": "vitest run server/test/two_cli_communication_stability.test.ts",
+    "test:two-cli:soak": "bash -lc 'for i in 1 2 3 4 5; do echo \"[two-cli] run $i/5\"; npx vitest run server/test/two_cli_communication_stability.test.ts || exit 1; done'",
+    "test:two-cli:real-codex": "FYP_REAL_CODEX_TEST=1 vitest run server/test/two_cli_real_codex_stability.test.ts",
     "typecheck": "tsc -p server/tsconfig.json --noEmit && tsc -p tools/tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit"
   },
   "dependencies": {

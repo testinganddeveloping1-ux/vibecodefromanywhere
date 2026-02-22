@@ -1,0 +1,44 @@
+You are redesigning the frontend only for an existing backend API/WS system called FromYourPhone.
+
+Goals:
+1. Build a clean, uncrowded mobile-first workflow.
+2. Build wrapper mode as default; terminal mode is optional behind backend feature flag.
+3. Inbox-first task flow with fast pending-action triage.
+4. Preserve backend contracts exactly; do not invent incompatible schemas.
+
+Constraints:
+- Do not rewrite backend.
+- Consume normalized wrapper messages with block types: text, thinking, tool_use, tool_result.
+- Respect call correlation via callId/tool_use_id.
+- Show tool command/input summaries without forcing deep expansion.
+- Keep strict event ordering and live streaming behavior.
+- Avoid clutter: prioritize running/pending tasks; hide idle by default.
+- Read `GET /api/features` and only expose terminal mode UI when `features.terminalModeEnabled === true`.
+- Use `GET /api/tasks?includeIdle=1` only for explicit "show idle" views.
+- Respect orchestration dispatch behavior:
+  - `POST /api/orchestrations` defaults to `dispatchMode=orchestrator-first`.
+  - Workers may start idle until dispatch events are sent.
+- Use harness APIs for create-flow scaffolding:
+  - `GET /api/harness/prompts`
+  - `POST /api/harness/creator/recommend`
+  - `POST /api/harness/creator/build`
+- Support orchestration automation controls:
+  - `GET /api/orchestrations/:id/automation-policy`
+  - `PATCH /api/orchestrations/:id/automation-policy`
+  - Render `item.automation` from `GET /api/orchestrations/:id` (pending question count, last review/dispatch state).
+  - Surface orchestrator automation events (`orchestration.question.*`, `orchestration.review.*`) clearly in wrapper timeline.
+
+Required screens:
+- Inbox (task cards, pending-first)
+- Task detail
+- Session view (wrapper mode)
+- Session view (terminal mode only when backend feature allows it)
+- Create task/session flow
+- Session settings/action sheet
+
+Data contracts:
+- REST: /api/tasks, /api/inbox, /api/sessions, /api/tool-sessions and related mutation routes.
+- WS: global + per-session channels for live updates.
+- Orchestration command bus: /api/orchestrations/:id/dispatch
+
+Read docs/frontend-handoff.md before implementing.

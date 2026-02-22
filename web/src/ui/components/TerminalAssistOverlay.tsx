@@ -1,5 +1,8 @@
 import React from "react";
 import type { TuiAssist } from "../types";
+import { Button } from "./Button";
+import { Chip } from "./Chip";
+import styles from "./TerminalAssistOverlay.module.css";
 
 export function TerminalAssistOverlay(props: {
   assist: TuiAssist;
@@ -8,28 +11,37 @@ export function TerminalAssistOverlay(props: {
 }) {
   const a = props.assist;
   return (
-    <div className="assistOverlay" aria-label="Terminal assist">
-      <div className="assistCard">
-        <div className="assistHead">
-          <span className="chip">assist</span>
-          <span className="mono assistTitle">{a.title}</span>
-          <div className="spacer" />
-          <button className="btn ghost" onClick={props.onHide}>
+    <div className={styles.overlay} aria-label="Terminal assist">
+      <div className={styles.card}>
+        <div className={styles.head}>
+          <Chip>assist</Chip>
+          <span className={styles.title}>{a.title}</span>
+          <div style={{ flex: 1 }} />
+          <Button variant="ghost" onClick={props.onHide}>
             Hide
-          </button>
+          </Button>
         </div>
-        {a.body ? <div className="assistBody mono">{a.body}</div> : null}
-        <div className="assistActions">
+        {a.body ? <div className={styles.body}>{a.body}</div> : null}
+        <div className={styles.actions}>
           {(a.options ?? []).slice(0, 12).map((o) => {
             const label = String(o.label ?? "");
             const low = label.toLowerCase();
-            const isNav = low === "up" || low === "down" || low === "tab" || low === "shift+tab" || low === "esc";
+            const isNav =
+              low === "up" ||
+              low === "down" ||
+              low === "tab" ||
+              low === "shift+tab" ||
+              low === "esc";
             const isEnter = low === "enter";
-            const cls = isEnter ? "btn primary" : isNav ? "btn ghost" : "btn";
+            const variant = isEnter ? "primary" : isNav ? "ghost" : "default";
             return (
-              <button key={o.id} className={cls} onClick={() => props.onSend(String(o.send ?? ""))}>
+              <Button
+                key={o.id}
+                variant={variant}
+                onClick={() => props.onSend(String(o.send ?? ""))}
+              >
                 {label}
-              </button>
+              </Button>
             );
           })}
         </div>
@@ -37,4 +49,3 @@ export function TerminalAssistOverlay(props: {
     </div>
   );
 }
-

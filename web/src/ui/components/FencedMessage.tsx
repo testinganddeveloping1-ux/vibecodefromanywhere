@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import styles from "./FencedMessage.module.css";
 
 type Segment =
   | { kind: "text"; text: string }
@@ -23,6 +24,13 @@ function splitFenced(raw: string): Segment[] {
   return out;
 }
 
+function isRuleLine(line: string): boolean {
+  const t = String(line ?? "").trim();
+  if (t.length < 3) return false;
+  if (/[A-Za-z0-9]/.test(t)) return false;
+  return /^[-_=~\u2500-\u259F\u23af\u2010-\u2015]+$/u.test(t);
+}
+
 function renderInline(text: string, keyBase: string): ReactNode[] {
   const out: ReactNode[] = [];
   const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
@@ -35,19 +43,19 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
     if (start > idx) out.push(text.slice(idx, start));
     if (token.startsWith("`")) {
       out.push(
-        <code key={`${keyBase}-c-${part}`} className="mdInlineCode">
+        <code key={`${keyBase}-c-${part}`} className={styles.inlineCode}>
           {token.slice(1, -1)}
         </code>,
       );
     } else if (token.startsWith("**")) {
       out.push(
-        <strong key={`${keyBase}-b-${part}`} className="mdStrong">
+        <strong key={`${keyBase}-b-${part}`} className={styles.strong}>
           {token.slice(2, -2)}
         </strong>,
       );
     } else {
       out.push(
-        <em key={`${keyBase}-i-${part}`} className="mdEm">
+        <em key={`${keyBase}-i-${part}`} className={styles.em}>
           {token.slice(1, -1)}
         </em>,
       );
@@ -73,7 +81,13 @@ function renderText(text: string, keyBase: string): ReactNode[] {
     if (heading && lines.length === 1) {
       const level = Math.min(6, Math.max(1, heading[1]?.length ?? 1));
       const content = heading[2] ?? "";
-      const cls = `mdH${level}`;
+
+      const headerMap: Record<number, string> = {
+        1: styles.h1, 2: styles.h2, 3: styles.h3,
+        4: styles.h4, 5: styles.h5, 6: styles.h6
+      };
+
+      const cls = headerMap[level] || styles.h6;
       out.push(
         <div key={k} className={cls}>
           {renderInline(content, `${k}-h`)}
@@ -85,7 +99,7 @@ function renderText(text: string, keyBase: string): ReactNode[] {
     const isQuote = lines.every((ln) => /^\s*>\s?/.test(ln));
     if (isQuote) {
       out.push(
-        <blockquote key={k} className="mdQuote">
+        <blockquote key={k} className={styles.quote}>
           {lines.map((ln, li) => (
             <span key={`${k}-q-${li}`}>
               {renderInline(ln.replace(/^\s*>\s?/, ""), `${k}-q-${li}`)}
@@ -100,9 +114,9 @@ function renderText(text: string, keyBase: string): ReactNode[] {
     const isUl = lines.every((ln) => /^\s*[-*+]\s+/.test(ln));
     if (isUl) {
       out.push(
-        <ul key={k} className="mdUl">
+        <ul key={k} className={styles.ul}>
           {lines.map((ln, li) => (
-            <li key={`${k}-ul-${li}`} className="mdLi">
+            <li key={`${k}-ul-${li}`} className={styles.li}>
               {renderInline(ln.replace(/^\s*[-*+]\s+/, ""), `${k}-ul-${li}`)}
             </li>
           ))}
@@ -114,9 +128,9 @@ function renderText(text: string, keyBase: string): ReactNode[] {
     const isOl = lines.every((ln) => /^\s*\d+\.\s+/.test(ln));
     if (isOl) {
       out.push(
-        <ol key={k} className="mdOl">
+        <ol key={k} className={styles.ol}>
           {lines.map((ln, li) => (
-            <li key={`${k}-ol-${li}`} className="mdLi">
+            <li key={`${k}-ol-${li}`} className={styles.li}>
               {renderInline(ln.replace(/^\s*\d+\.\s+/, ""), `${k}-ol-${li}`)}
             </li>
           ))}
@@ -125,8 +139,13 @@ function renderText(text: string, keyBase: string): ReactNode[] {
       return;
     }
 
+    const isHr = lines.length === 1 && isRuleLine(first);
+    if (isHr) {
+      return;
+    }
+
     out.push(
-      <p key={k} className="mdP">
+      <p key={k} className={styles.p}>
         {lines.map((ln, li) => (
           <span key={`${k}-p-${li}`}>
             {renderInline(ln, `${k}-p-${li}`)}
@@ -136,24 +155,30 @@ function renderText(text: string, keyBase: string): ReactNode[] {
       </p>,
     );
   });
-  return out.length ? out : [<div key={`${keyBase}-empty`} className="mdText">{text}</div>];
+  if (out.length > 0) return out;
+  const onlyRules = blocks.every((block) => {
+    const lines = block.split("\n").map((ln) => ln.trim()).filter(Boolean);
+    return lines.length > 0 && lines.every((ln) => isRuleLine(ln));
+  });
+  if (onlyRules) return [];
+  return [<div key={`${keyBase}-empty`} className={styles.text}>{text}</div>];
 }
 
 export function FencedMessage({ text }: { text: string }) {
   const raw = String(text ?? "");
   const segments = splitFenced(raw);
   return (
-    <div className="md">
+    <div className={styles.md}>
       {segments.map((seg, i) => {
         if (seg.kind === "code") {
           return (
-            <pre key={`code-${i}`} className="mdCode" data-lang={seg.lang || undefined}>
+            <pre key={`code-${i}`} className={styles.codeBlock} data-lang={seg.lang || undefined}>
               <code>{seg.code}</code>
             </pre>
           );
         }
         return (
-          <div key={`text-${i}`} className="mdText">
+          <div key={`text-${i}`} className={styles.text}>
             {renderText(seg.text, `md-${i}`)}
           </div>
         );

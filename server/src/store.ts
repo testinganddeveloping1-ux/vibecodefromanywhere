@@ -37,6 +37,70 @@ export type AttentionItemRow = {
   options: any;
 };
 
+export type OrchestrationRow = {
+  id: string;
+  name: string;
+  projectPath: string;
+  orchestratorSessionId: string;
+  status: "active" | "cleaning" | "cleaned" | "error";
+  lastError: string | null;
+  cleanedAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type OrchestrationWorkerRow = {
+  id: number;
+  orchestrationId: string;
+  workerIndex: number;
+  name: string;
+  tool: ToolId;
+  profileId: string;
+  sessionId: string;
+  projectPath: string;
+  worktreePath: string | null;
+  branch: string | null;
+  baseRef: string | null;
+  taskPrompt: string;
+  createdAt: number;
+};
+
+export type TaskRow = {
+  id: string;
+  title: string;
+  kind: "single" | "group" | "orchestrator";
+  status: "active" | "paused" | "archived" | "error";
+  goal: string | null;
+  defaultMode: "wrap" | "terminal";
+  visibility: "user" | "internal";
+  source: "manual" | "planner" | "migration";
+  plannerConfig: any;
+  archivedAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type TaskMemberRow = {
+  id: number;
+  taskId: string;
+  sessionId: string;
+  role: "parent" | "child" | "solo" | "helper";
+  ordinal: number;
+  title: string | null;
+  isInternal: boolean;
+  defaultHidden: boolean;
+  modeOverride: "wrap" | "terminal" | null;
+  createdAt: number;
+};
+
+export type HarnessCommandReplayRow = {
+  cacheKey: string;
+  orchestrationId: string;
+  commandId: string;
+  ts: number;
+  response: any;
+};
+
 export type Store = ReturnType<typeof createStore>;
 
 export function createStore(baseDir: string) {
@@ -115,6 +179,78 @@ export function createStore(baseDir: string) {
       data TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_attention_actions ON attention_actions(attentionId, ts);
+
+    CREATE TABLE IF NOT EXISTS orchestrations (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      projectPath TEXT NOT NULL,
+      orchestratorSessionId TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      lastError TEXT,
+      cleanedAt INTEGER,
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_orchestrations_updated ON orchestrations(updatedAt DESC);
+
+    CREATE TABLE IF NOT EXISTS orchestration_workers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      orchestrationId TEXT NOT NULL,
+      workerIndex INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      tool TEXT NOT NULL,
+      profileId TEXT NOT NULL,
+      sessionId TEXT NOT NULL,
+      projectPath TEXT NOT NULL,
+      worktreePath TEXT,
+      branch TEXT,
+      baseRef TEXT,
+      taskPrompt TEXT NOT NULL,
+      createdAt INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_orch_workers_orch ON orchestration_workers(orchestrationId, workerIndex);
+
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      goal TEXT,
+      defaultMode TEXT NOT NULL DEFAULT 'wrap',
+      visibility TEXT NOT NULL DEFAULT 'user',
+      source TEXT NOT NULL DEFAULT 'manual',
+      plannerConfig TEXT NOT NULL DEFAULT '{}',
+      archivedAt INTEGER,
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updatedAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, visibility, updatedAt DESC);
+
+    CREATE TABLE IF NOT EXISTS task_members (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      taskId TEXT NOT NULL,
+      sessionId TEXT NOT NULL,
+      role TEXT NOT NULL,
+      ordinal INTEGER NOT NULL DEFAULT 0,
+      title TEXT,
+      isInternal INTEGER NOT NULL DEFAULT 0,
+      defaultHidden INTEGER NOT NULL DEFAULT 0,
+      modeOverride TEXT,
+      createdAt INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_task_members_unique ON task_members(taskId, sessionId);
+    CREATE INDEX IF NOT EXISTS idx_task_members_task ON task_members(taskId, ordinal, id);
+    CREATE INDEX IF NOT EXISTS idx_task_members_session ON task_members(sessionId);
+
+    CREATE TABLE IF NOT EXISTS harness_command_replay (
+      cacheKey TEXT PRIMARY KEY,
+      orchestrationId TEXT NOT NULL,
+      commandId TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      response TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_harness_command_replay_ts ON harness_command_replay(ts DESC);
   `);
 
   // Lightweight migrations for older dbs
@@ -130,11 +266,37 @@ export function createStore(baseDir: string) {
   addCol("label", "label TEXT");
   addCol("pinnedSlot", "pinnedSlot INTEGER");
   addCol("transport", "transport TEXT");
+  const orchCols = (db.prepare("PRAGMA table_info(orchestrations)").all() as any[]).map((r) => String(r.name));
+  const addOrchCol = (name: string, ddl: string) => {
+    if (!orchCols.includes(name)) db.exec(`ALTER TABLE orchestrations ADD COLUMN ${ddl}`);
+  };
+  addOrchCol("status", "status TEXT NOT NULL DEFAULT 'active'");
+  addOrchCol("lastError", "lastError TEXT");
+  addOrchCol("cleanedAt", "cleanedAt INTEGER");
+  const taskCols = (db.prepare("PRAGMA table_info(tasks)").all() as any[]).map((r) => String(r.name));
+  const addTaskCol = (name: string, ddl: string) => {
+    if (!taskCols.includes(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${ddl}`);
+  };
+  addTaskCol("status", "status TEXT NOT NULL DEFAULT 'active'");
+  addTaskCol("goal", "goal TEXT");
+  addTaskCol("defaultMode", "defaultMode TEXT NOT NULL DEFAULT 'wrap'");
+  addTaskCol("visibility", "visibility TEXT NOT NULL DEFAULT 'user'");
+  addTaskCol("source", "source TEXT NOT NULL DEFAULT 'manual'");
+  addTaskCol("plannerConfig", "plannerConfig TEXT NOT NULL DEFAULT '{}'");
+  addTaskCol("archivedAt", "archivedAt INTEGER");
+  const taskMemberCols = (db.prepare("PRAGMA table_info(task_members)").all() as any[]).map((r) => String(r.name));
+  const addTaskMemberCol = (name: string, ddl: string) => {
+    if (!taskMemberCols.includes(name)) db.exec(`ALTER TABLE task_members ADD COLUMN ${ddl}`);
+  };
+  addTaskMemberCol("isInternal", "isInternal INTEGER NOT NULL DEFAULT 0");
+  addTaskMemberCol("defaultHidden", "defaultHidden INTEGER NOT NULL DEFAULT 0");
+  addTaskMemberCol("modeOverride", "modeOverride TEXT");
 
   const stmtCreateSession = db.prepare(
     "INSERT INTO sessions (id, tool, profileId, transport, toolSessionId, cwd, workspaceKey, workspaceRoot, treePath, label, pinnedSlot, createdAt, updatedAt, exitCode, signal) VALUES (@id, @tool, @profileId, @transport, @toolSessionId, @cwd, @workspaceKey, @workspaceRoot, @treePath, @label, @pinnedSlot, @createdAt, @updatedAt, NULL, NULL)",
   );
-  const stmtListSessions = db.prepare("SELECT * FROM sessions ORDER BY createdAt DESC");
+  const stmtListSessions = db.prepare("SELECT * FROM sessions ORDER BY updatedAt DESC");
+  const stmtListSessionsLimit = db.prepare("SELECT * FROM sessions ORDER BY updatedAt DESC LIMIT ?");
   const stmtGetSession = db.prepare("SELECT * FROM sessions WHERE id = ?");
   const stmtTouchSession = db.prepare("UPDATE sessions SET updatedAt = ? WHERE id = ?");
   const stmtSetSessionMeta = db.prepare(
@@ -234,6 +396,77 @@ export function createStore(baseDir: string) {
   );
   const stmtDeleteAttentionItemsBySession = db.prepare("DELETE FROM attention_items WHERE sessionId = ?");
 
+  const stmtOrchInsert = db.prepare(
+    "INSERT INTO orchestrations (id, name, projectPath, orchestratorSessionId, status, lastError, cleanedAt, createdAt, updatedAt) VALUES (@id, @name, @projectPath, @orchestratorSessionId, @status, @lastError, @cleanedAt, @createdAt, @updatedAt)",
+  );
+  const stmtOrchInsertWorker = db.prepare(
+    "INSERT INTO orchestration_workers (orchestrationId, workerIndex, name, tool, profileId, sessionId, projectPath, worktreePath, branch, baseRef, taskPrompt, createdAt) VALUES (@orchestrationId, @workerIndex, @name, @tool, @profileId, @sessionId, @projectPath, @worktreePath, @branch, @baseRef, @taskPrompt, @createdAt)",
+  );
+  const stmtOrchList = db.prepare("SELECT id, name, projectPath, orchestratorSessionId, status, lastError, cleanedAt, createdAt, updatedAt FROM orchestrations ORDER BY updatedAt DESC LIMIT ?");
+  const stmtOrchGet = db.prepare("SELECT id, name, projectPath, orchestratorSessionId, status, lastError, cleanedAt, createdAt, updatedAt FROM orchestrations WHERE id = ?");
+  const stmtOrchWorkers = db.prepare(
+    "SELECT id, orchestrationId, workerIndex, name, tool, profileId, sessionId, projectPath, worktreePath, branch, baseRef, taskPrompt, createdAt FROM orchestration_workers WHERE orchestrationId = ? ORDER BY workerIndex ASC",
+  );
+  const stmtOrchState = db.prepare(
+    "UPDATE orchestrations SET status = ?, lastError = ?, cleanedAt = ?, updatedAt = ? WHERE id = ?",
+  );
+  const stmtOrchDeleteWorkers = db.prepare("DELETE FROM orchestration_workers WHERE orchestrationId = ?");
+  const stmtOrchDelete = db.prepare("DELETE FROM orchestrations WHERE id = ?");
+
+  const stmtTaskInsert = db.prepare(
+    "INSERT INTO tasks (id, title, kind, status, goal, defaultMode, visibility, source, plannerConfig, archivedAt, createdAt, updatedAt) VALUES (@id, @title, @kind, @status, @goal, @defaultMode, @visibility, @source, @plannerConfig, @archivedAt, @createdAt, @updatedAt)",
+  );
+  const stmtTaskUpsert = db.prepare(
+    "INSERT INTO tasks (id, title, kind, status, goal, defaultMode, visibility, source, plannerConfig, archivedAt, createdAt, updatedAt) VALUES (@id, @title, @kind, @status, @goal, @defaultMode, @visibility, @source, @plannerConfig, @archivedAt, @createdAt, @updatedAt) ON CONFLICT(id) DO UPDATE SET title=excluded.title, kind=excluded.kind, status=excluded.status, goal=excluded.goal, defaultMode=excluded.defaultMode, visibility=excluded.visibility, source=excluded.source, plannerConfig=excluded.plannerConfig, archivedAt=excluded.archivedAt, updatedAt=excluded.updatedAt",
+  );
+  const stmtTaskGet = db.prepare(
+    "SELECT id, title, kind, status, goal, defaultMode, visibility, source, plannerConfig, archivedAt, createdAt, updatedAt FROM tasks WHERE id = ?",
+  );
+  const stmtTaskList = db.prepare(
+    "SELECT id, title, kind, status, goal, defaultMode, visibility, source, plannerConfig, archivedAt, createdAt, updatedAt FROM tasks ORDER BY updatedAt DESC LIMIT ?",
+  );
+  const stmtTaskSetMode = db.prepare("UPDATE tasks SET defaultMode = ?, updatedAt = ? WHERE id = ?");
+  const stmtTaskSetStatus = db.prepare("UPDATE tasks SET status = ?, archivedAt = ?, updatedAt = ? WHERE id = ?");
+  const stmtTaskDelete = db.prepare("DELETE FROM tasks WHERE id = ?");
+
+  const stmtTaskMemberUpsert = db.prepare(
+    "INSERT INTO task_members (taskId, sessionId, role, ordinal, title, isInternal, defaultHidden, modeOverride, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(taskId, sessionId) DO UPDATE SET role=excluded.role, ordinal=excluded.ordinal, title=excluded.title, isInternal=excluded.isInternal, defaultHidden=excluded.defaultHidden, modeOverride=COALESCE(excluded.modeOverride, task_members.modeOverride)",
+  );
+  const stmtTaskMemberList = db.prepare(
+    "SELECT id, taskId, sessionId, role, ordinal, title, isInternal, defaultHidden, modeOverride, createdAt FROM task_members WHERE taskId = ? ORDER BY ordinal ASC, id ASC",
+  );
+  const stmtTaskMemberGetBySession = db.prepare(
+    "SELECT id, taskId, sessionId, role, ordinal, title, isInternal, defaultHidden, modeOverride, createdAt FROM task_members WHERE sessionId = ? ORDER BY id DESC LIMIT 1",
+  );
+  const stmtTaskMemberSetModeOverride = db.prepare(
+    "UPDATE task_members SET modeOverride = ? WHERE taskId = ? AND sessionId = ?",
+  );
+  const stmtTaskMemberDeleteBySession = db.prepare("DELETE FROM task_members WHERE sessionId = ?");
+  const stmtTaskMembersDeleteByTask = db.prepare("DELETE FROM task_members WHERE taskId = ?");
+  const stmtTaskMemberCountByTask = db.prepare("SELECT taskId, COUNT(*) AS count FROM task_members GROUP BY taskId");
+  const stmtTaskOrphans = db.prepare(
+    "SELECT t.id FROM tasks t LEFT JOIN task_members tm ON tm.taskId = t.id WHERE tm.id IS NULL",
+  );
+  const stmtHarnessReplayGet = db.prepare(
+    "SELECT cacheKey, orchestrationId, commandId, ts, response FROM harness_command_replay WHERE cacheKey = ?",
+  );
+  const stmtHarnessReplayUpsert = db.prepare(
+    `
+      INSERT INTO harness_command_replay (cacheKey, orchestrationId, commandId, ts, response)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(cacheKey) DO UPDATE SET
+        orchestrationId=excluded.orchestrationId,
+        commandId=excluded.commandId,
+        ts=excluded.ts,
+        response=excluded.response
+    `,
+  );
+  const stmtHarnessReplayDeleteOlderThan = db.prepare("DELETE FROM harness_command_replay WHERE ts < ?");
+  const stmtHarnessReplayCount = db.prepare("SELECT COUNT(*) as count FROM harness_command_replay");
+  const stmtHarnessReplayDeleteOldest = db.prepare(
+    "DELETE FROM harness_command_replay WHERE cacheKey IN (SELECT cacheKey FROM harness_command_replay ORDER BY ts ASC LIMIT ?)",
+  );
+
   // Backfill: older DBs may have sessions without cwd populated. This creates confusing blank
   // "dir" workspace entries in the phone UI. We recover cwd from the stored session.created event.
   const stmtSessionsMissingCwd = db.prepare("SELECT id FROM sessions WHERE cwd IS NULL OR TRIM(cwd) = '' LIMIT ?");
@@ -289,8 +522,10 @@ export function createStore(baseDir: string) {
     });
   }
 
-  function listSessions(): StoreSessionRow[] {
-    const rows = stmtListSessions.all() as any[];
+  function listSessions(limit?: number): StoreSessionRow[] {
+    const hasLimit = Number.isFinite(Number(limit));
+    const lim = hasLimit ? Math.min(2000, Math.max(1, Math.floor(Number(limit)))) : null;
+    const rows = lim == null ? (stmtListSessions.all() as any[]) : (stmtListSessionsLimit.all(lim) as any[]);
     return rows.map((r) => ({ ...r, transport: String(r.transport ?? "pty") })) as any;
   }
 
@@ -349,6 +584,7 @@ export function createStore(baseDir: string) {
   const txDeleteSession = db.transaction((sessionId: string) => {
     // Fully remove a FromYourPhone session from the local DB.
     // This does NOT touch tool-native logs (Codex/Claude/OpenCode).
+    stmtTaskMemberDeleteBySession.run(sessionId);
     stmtDeleteAttentionActionsBySession.run(sessionId);
     stmtDeleteAttentionItemsBySession.run(sessionId);
     stmtDeleteEvents.run(sessionId);
@@ -572,6 +808,342 @@ export function createStore(baseDir: string) {
     return out;
   }
 
+  const txCreateOrchestration = db.transaction(
+    (input: {
+      id: string;
+      name: string;
+      projectPath: string;
+      orchestratorSessionId: string;
+      workers: Array<{
+        workerIndex: number;
+        name: string;
+        tool: ToolId;
+        profileId: string;
+        sessionId: string;
+        projectPath: string;
+        worktreePath?: string | null;
+        branch?: string | null;
+        baseRef?: string | null;
+        taskPrompt: string;
+      }>;
+    }) => {
+      const now = Date.now();
+      stmtOrchInsert.run({
+        id: input.id,
+        name: input.name,
+        projectPath: input.projectPath,
+        orchestratorSessionId: input.orchestratorSessionId,
+        status: "active",
+        lastError: null,
+        cleanedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      } as any);
+      for (const w of input.workers) {
+        stmtOrchInsertWorker.run({
+          orchestrationId: input.id,
+          workerIndex: w.workerIndex,
+          name: w.name,
+          tool: w.tool,
+          profileId: w.profileId,
+          sessionId: w.sessionId,
+          projectPath: w.projectPath,
+          worktreePath: w.worktreePath ?? null,
+          branch: w.branch ?? null,
+          baseRef: w.baseRef ?? null,
+          taskPrompt: w.taskPrompt,
+          createdAt: now,
+        } as any);
+      }
+    },
+  );
+
+  function createOrchestration(input: {
+    id: string;
+    name: string;
+    projectPath: string;
+    orchestratorSessionId: string;
+    workers: Array<{
+      workerIndex: number;
+      name: string;
+      tool: ToolId;
+      profileId: string;
+      sessionId: string;
+      projectPath: string;
+      worktreePath?: string | null;
+      branch?: string | null;
+      baseRef?: string | null;
+      taskPrompt: string;
+    }>;
+  }) {
+    txCreateOrchestration(input);
+  }
+
+  function listOrchestrations(limit = 60): OrchestrationRow[] {
+    const lim = Math.min(500, Math.max(1, Math.floor(limit || 60)));
+    const rows = stmtOrchList.all(lim) as any[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      name: String(r.name),
+      projectPath: String(r.projectPath),
+      orchestratorSessionId: String(r.orchestratorSessionId),
+      status: (String(r.status || "active") as any) ?? "active",
+      lastError: r.lastError == null ? null : String(r.lastError),
+      cleanedAt: r.cleanedAt == null ? null : Number(r.cleanedAt),
+      createdAt: Number(r.createdAt ?? 0),
+      updatedAt: Number(r.updatedAt ?? 0),
+    }));
+  }
+
+  function getOrchestration(id: string): null | { orchestration: OrchestrationRow; workers: OrchestrationWorkerRow[] } {
+    const row = stmtOrchGet.get(id) as any;
+    if (!row) return null;
+    const workers = (stmtOrchWorkers.all(id) as any[]).map((r) => ({
+      id: Number(r.id),
+      orchestrationId: String(r.orchestrationId),
+      workerIndex: Number(r.workerIndex ?? 0),
+      name: String(r.name),
+      tool: String(r.tool) as ToolId,
+      profileId: String(r.profileId),
+      sessionId: String(r.sessionId),
+      projectPath: String(r.projectPath),
+      worktreePath: r.worktreePath == null ? null : String(r.worktreePath),
+      branch: r.branch == null ? null : String(r.branch),
+      baseRef: r.baseRef == null ? null : String(r.baseRef),
+      taskPrompt: String(r.taskPrompt ?? ""),
+      createdAt: Number(r.createdAt ?? 0),
+    })) as OrchestrationWorkerRow[];
+    return {
+      orchestration: {
+        id: String(row.id),
+        name: String(row.name),
+        projectPath: String(row.projectPath),
+        orchestratorSessionId: String(row.orchestratorSessionId),
+        status: (String(row.status || "active") as any) ?? "active",
+        lastError: row.lastError == null ? null : String(row.lastError),
+        cleanedAt: row.cleanedAt == null ? null : Number(row.cleanedAt),
+        createdAt: Number(row.createdAt ?? 0),
+        updatedAt: Number(row.updatedAt ?? 0),
+      },
+      workers,
+    };
+  }
+
+  function setOrchestrationState(
+    id: string,
+    input: { status: "active" | "cleaning" | "cleaned" | "error"; lastError?: string | null; cleanedAt?: number | null },
+  ) {
+    stmtOrchState.run(
+      input.status,
+      input.lastError == null ? null : String(input.lastError),
+      input.cleanedAt == null ? null : Number(input.cleanedAt),
+      Date.now(),
+      id,
+    );
+  }
+
+  const txDeleteOrchestration = db.transaction((id: string) => {
+    stmtOrchDeleteWorkers.run(id);
+    stmtOrchDelete.run(id);
+  });
+
+  function deleteOrchestration(id: string) {
+    txDeleteOrchestration(id);
+  }
+
+  function parseTaskRow(r: any): TaskRow {
+    let plannerConfig: any = {};
+    try {
+      plannerConfig = JSON.parse(String(r.plannerConfig ?? "{}"));
+    } catch {
+      plannerConfig = {};
+    }
+    const kind = String(r.kind ?? "single");
+    const status = String(r.status ?? "active");
+    const mode = String(r.defaultMode ?? "wrap");
+    const visibility = String(r.visibility ?? "user");
+    const source = String(r.source ?? "manual");
+    return {
+      id: String(r.id),
+      title: String(r.title ?? ""),
+      kind: (kind === "single" || kind === "group" || kind === "orchestrator" ? kind : "single") as any,
+      status: (status === "active" || status === "paused" || status === "archived" || status === "error" ? status : "active") as any,
+      goal: r.goal == null ? null : String(r.goal),
+      defaultMode: (mode === "terminal" ? "terminal" : "wrap") as any,
+      visibility: (visibility === "internal" ? "internal" : "user") as any,
+      source: (source === "planner" || source === "migration" ? source : "manual") as any,
+      plannerConfig,
+      archivedAt: r.archivedAt == null ? null : Number(r.archivedAt),
+      createdAt: Number(r.createdAt ?? 0),
+      updatedAt: Number(r.updatedAt ?? 0),
+    };
+  }
+
+  function parseTaskMemberRow(r: any): TaskMemberRow {
+    const role = String(r.role ?? "solo");
+    const mode = String(r.modeOverride ?? "");
+    return {
+      id: Number(r.id),
+      taskId: String(r.taskId),
+      sessionId: String(r.sessionId),
+      role: (role === "parent" || role === "child" || role === "helper" ? role : "solo") as any,
+      ordinal: Number(r.ordinal ?? 0),
+      title: r.title == null ? null : String(r.title),
+      isInternal: Number(r.isInternal ?? 0) === 1,
+      defaultHidden: Number(r.defaultHidden ?? 0) === 1,
+      modeOverride: mode === "wrap" || mode === "terminal" ? (mode as any) : null,
+      createdAt: Number(r.createdAt ?? 0),
+    };
+  }
+
+  function upsertTask(input: {
+    id: string;
+    title: string;
+    kind: TaskRow["kind"];
+    status?: TaskRow["status"];
+    goal?: string | null;
+    defaultMode?: TaskRow["defaultMode"];
+    visibility?: TaskRow["visibility"];
+    source?: TaskRow["source"];
+    plannerConfig?: any;
+    archivedAt?: number | null;
+  }) {
+    const now = Date.now();
+    const cur = stmtTaskGet.get(input.id) as any;
+    const createdAt = cur ? Number(cur.createdAt ?? now) : now;
+    stmtTaskUpsert.run({
+      id: input.id,
+      title: input.title,
+      kind: input.kind,
+      status: input.status ?? "active",
+      goal: input.goal ?? null,
+      defaultMode: input.defaultMode ?? "wrap",
+      visibility: input.visibility ?? "user",
+      source: input.source ?? "manual",
+      plannerConfig: JSON.stringify(input.plannerConfig ?? {}),
+      archivedAt: input.archivedAt ?? null,
+      createdAt,
+      updatedAt: now,
+    } as any);
+  }
+
+  function createTask(input: {
+    id: string;
+    title: string;
+    kind: TaskRow["kind"];
+    status?: TaskRow["status"];
+    goal?: string | null;
+    defaultMode?: TaskRow["defaultMode"];
+    visibility?: TaskRow["visibility"];
+    source?: TaskRow["source"];
+    plannerConfig?: any;
+    archivedAt?: number | null;
+  }) {
+    const now = Date.now();
+    stmtTaskInsert.run({
+      id: input.id,
+      title: input.title,
+      kind: input.kind,
+      status: input.status ?? "active",
+      goal: input.goal ?? null,
+      defaultMode: input.defaultMode ?? "wrap",
+      visibility: input.visibility ?? "user",
+      source: input.source ?? "manual",
+      plannerConfig: JSON.stringify(input.plannerConfig ?? {}),
+      archivedAt: input.archivedAt ?? null,
+      createdAt: now,
+      updatedAt: now,
+    } as any);
+  }
+
+  function listTasks(limit = 120): TaskRow[] {
+    const lim = Math.min(1000, Math.max(1, Math.floor(limit || 120)));
+    return (stmtTaskList.all(lim) as any[]).map(parseTaskRow);
+  }
+
+  function getTask(id: string): TaskRow | null {
+    const row = stmtTaskGet.get(id) as any;
+    return row ? parseTaskRow(row) : null;
+  }
+
+  function setTaskDefaultMode(taskId: string, mode: "wrap" | "terminal") {
+    stmtTaskSetMode.run(mode, Date.now(), taskId);
+  }
+
+  function setTaskStatus(taskId: string, status: TaskRow["status"], archivedAt: number | null = null) {
+    stmtTaskSetStatus.run(status, archivedAt, Date.now(), taskId);
+  }
+
+  function deleteTask(taskId: string) {
+    stmtTaskMembersDeleteByTask.run(taskId);
+    stmtTaskDelete.run(taskId);
+  }
+
+  function upsertTaskMember(input: {
+    taskId: string;
+    sessionId: string;
+    role: TaskMemberRow["role"];
+    ordinal: number;
+    title?: string | null;
+    isInternal?: boolean;
+    defaultHidden?: boolean;
+    modeOverride?: "wrap" | "terminal" | null;
+  }) {
+    const now = Date.now();
+    try {
+      stmtTaskMemberDeleteBySession.run(input.sessionId);
+    } catch {
+      // ignore
+    }
+    stmtTaskMemberUpsert.run(
+      input.taskId,
+      input.sessionId,
+      input.role,
+      Math.floor(Number(input.ordinal ?? 0)),
+      input.title ?? null,
+      input.isInternal ? 1 : 0,
+      input.defaultHidden ? 1 : 0,
+      input.modeOverride ?? null,
+      now,
+    );
+    stmtTaskSetStatus.run("active", null, now, input.taskId);
+  }
+
+  function listTaskMembers(taskId: string): TaskMemberRow[] {
+    return (stmtTaskMemberList.all(taskId) as any[]).map(parseTaskMemberRow);
+  }
+
+  function getTaskMemberBySession(sessionId: string): TaskMemberRow | null {
+    const row = stmtTaskMemberGetBySession.get(sessionId) as any;
+    return row ? parseTaskMemberRow(row) : null;
+  }
+
+  function setTaskMemberModeOverride(taskId: string, sessionId: string, modeOverride: "wrap" | "terminal" | null) {
+    stmtTaskMemberSetModeOverride.run(modeOverride, taskId, sessionId);
+    stmtTaskSetStatus.run("active", null, Date.now(), taskId);
+  }
+
+  function clearTaskMembers(taskId: string) {
+    stmtTaskMembersDeleteByTask.run(taskId);
+    stmtTaskSetStatus.run("active", null, Date.now(), taskId);
+  }
+
+  function pruneOrphanTasks() {
+    const rows = stmtTaskOrphans.all() as any[];
+    for (const r of rows) {
+      const id = String(r?.id ?? "");
+      if (!id) continue;
+      stmtTaskDelete.run(id);
+    }
+  }
+
+  function getTaskMemberCounts(): Record<string, number> {
+    const rows = stmtTaskMemberCountByTask.all() as any[];
+    const out: Record<string, number> = {};
+    for (const r of rows) out[String(r.taskId)] = Number(r.count ?? 0);
+    return out;
+  }
+
   function doctor() {
     return {
       ok: true,
@@ -581,6 +1153,53 @@ export function createStore(baseDir: string) {
 
   function close() {
     db.close();
+  }
+
+  function getHarnessCommandReplay(cacheKey: string): HarnessCommandReplayRow | null {
+    const row = stmtHarnessReplayGet.get(cacheKey) as any;
+    if (!row) return null;
+    let response: any = {};
+    try {
+      response = JSON.parse(String(row.response ?? "{}"));
+    } catch {
+      response = {};
+    }
+    return {
+      cacheKey: String(row.cacheKey ?? ""),
+      orchestrationId: String(row.orchestrationId ?? ""),
+      commandId: String(row.commandId ?? ""),
+      ts: Number(row.ts ?? 0),
+      response,
+    };
+  }
+
+  function upsertHarnessCommandReplay(input: {
+    cacheKey: string;
+    orchestrationId: string;
+    commandId: string;
+    ts: number;
+    response: any;
+  }) {
+    stmtHarnessReplayUpsert.run(
+      input.cacheKey,
+      input.orchestrationId,
+      input.commandId,
+      Math.floor(Number(input.ts ?? Date.now())),
+      JSON.stringify(input.response ?? {}),
+    );
+  }
+
+  function pruneHarnessCommandReplay(input: { olderThanTs: number; maxRows: number; keepRows: number }) {
+    const olderThanTs = Math.floor(Number(input.olderThanTs ?? 0));
+    const maxRows = Math.max(100, Math.floor(Number(input.maxRows ?? 300)));
+    const keepRows = Math.max(50, Math.min(maxRows, Math.floor(Number(input.keepRows ?? 220))));
+
+    stmtHarnessReplayDeleteOlderThan.run(olderThanTs);
+    const row = stmtHarnessReplayCount.get() as any;
+    const count = Number(row?.count ?? 0);
+    if (count <= maxRows) return;
+    const drop = count - keepRows;
+    if (drop > 0) stmtHarnessReplayDeleteOldest.run(drop);
   }
 
   return {
@@ -608,6 +1227,28 @@ export function createStore(baseDir: string) {
     updateAttentionItem,
     addAttentionAction,
     getOpenAttentionCounts,
+    createOrchestration,
+    listOrchestrations,
+    getOrchestration,
+    setOrchestrationState,
+    deleteOrchestration,
+    createTask,
+    upsertTask,
+    listTasks,
+    getTask,
+    setTaskDefaultMode,
+    setTaskStatus,
+    deleteTask,
+    upsertTaskMember,
+    listTaskMembers,
+    getTaskMemberBySession,
+    setTaskMemberModeOverride,
+    clearTaskMembers,
+    pruneOrphanTasks,
+    getTaskMemberCounts,
+    getHarnessCommandReplay,
+    upsertHarnessCommandReplay,
+    pruneHarnessCommandReplay,
     doctor,
     close,
   };

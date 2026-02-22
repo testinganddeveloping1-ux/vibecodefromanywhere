@@ -134,7 +134,7 @@ function cleanText(v: string): string {
   return v.replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
 }
 
-function clampText(v: string, max = 12000): string {
+function clampText(v: string, max = 250000): string {
   if (v.length <= max) return v;
   return `${v.slice(0, Math.max(0, max - 15))}\n\n...[truncated]`;
 }
@@ -241,6 +241,30 @@ function codexReasoningText(payload: any): string {
     if (text) parts.push(text);
   }
   return cleanText(parts.join("\n"));
+}
+
+function codexCallId(payload: any): string | undefined {
+  const cand = [payload?.call_id, payload?.callId, payload?.id];
+  for (const v of cand) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return undefined;
+}
+
+function codexToolName(pType: string, payload: any): string {
+  if (typeof payload?.name === "string" && payload.name.trim()) return payload.name.trim();
+  if (pType.endsWith("_call")) return pType.slice(0, -"_call".length);
+  if (pType.endsWith("_output")) return pType.slice(0, -"_output".length);
+  return pType || "tool";
+}
+
+function codexCallInput(payload: any): any {
+  if (payload && typeof payload === "object") {
+    if ("input" in payload) return payload.input;
+    if ("arguments" in payload) return payload.arguments;
+    if ("action" in payload) return payload.action;
+  }
+  return payload;
 }
 
 function extractCodexPreviewFromTail(rawTail: string): { title: string | null; preview: string | null } {
@@ -503,14 +527,25 @@ export class ToolSessionIndex {
   }
 
   private rescan() {
-    const next: ToolSessionSummary[] = [];
+    const byKey = new Map<string, ToolSessionSummary>();
     const nextFiles = new Map<string, string>();
+    const upsert = (item: ToolSessionSummary, filePath: string) => {
+      const key = `${item.tool}:${item.id}`;
+      const cur = byKey.get(key);
+      if (!cur || Number(item.updatedAt ?? 0) >= Number(cur.updatedAt ?? 0)) {
+        byKey.set(key, item);
+        nextFiles.set(key, filePath);
+      }
+    };
+    const MAX_CODEX_FILES = 600;
+    const MAX_CLAUDE_INDEXED = 1200;
+    const MAX_CLAUDE_FALLBACK_PER_PROJECT = 120;
 
     // Codex sessions (jsonl logs)
     const codexBase = path.join(os.homedir(), ".codex", "sessions");
     if (fs.existsSync(codexBase)) {
       const files: string[] = [];
-      walkFiles(codexBase, files, { maxFiles: 2000 });
+      walkFiles(codexBase, files, { maxFiles: MAX_CODEX_FILES });
       for (const fp of files) {
         const first = readFirstLine(fp);
         if (!first) continue;
@@ -530,20 +565,17 @@ export class ToolSessionIndex {
         }
 
         const createdAt = isoToMs(obj.payload.timestamp) ?? isoToMs(obj.timestamp) ?? null;
-        const tail = readTail(fp, 256 * 1024);
-        const pv = extractCodexPreviewFromTail(tail);
-        next.push({
+        upsert({
           tool: "codex",
           id,
           cwd: cwdAbs,
           createdAt,
           updatedAt,
-          title: pv.title,
-          preview: pv.preview,
+          title: null,
+          preview: null,
           messageCount: null,
           gitBranch: null,
-        });
-        nextFiles.set(`codex:${id}`, fp);
+        }, fp);
       }
     }
 
@@ -560,6 +592,7 @@ export class ToolSessionIndex {
       } catch {
         dirs = [];
       }
+      let claudeIndexedCount = 0;
       const indexedClaude = new Set<string>();
       for (const d of dirs) {
         if (!d.isDirectory()) continue;
@@ -573,6 +606,7 @@ export class ToolSessionIndex {
           }
           const entries = Array.isArray(idx?.entries) ? idx.entries : [];
           for (const e of entries) {
+            if (claudeIndexedCount >= MAX_CLAUDE_INDEXED) break;
             const id = typeof e?.sessionId === "string" ? e.sessionId : "";
             const fullPath = typeof e?.fullPath === "string" ? e.fullPath : "";
             const projectPath = typeof e?.projectPath === "string" ? e.projectPath : "";
@@ -585,27 +619,19 @@ export class ToolSessionIndex {
             const messageCount = Number.isFinite(Number(e?.messageCount)) ? Number(e.messageCount) : null;
             const gitBranch = typeof e?.gitBranch === "string" ? e.gitBranch : null;
 
-            let preview: string | null = null;
-            try {
-              const tail = readTail(fullPath, 256 * 1024);
-              preview = extractClaudePreviewFromTail(tail).preview;
-            } catch {
-              preview = null;
-            }
-
-            next.push({
+            upsert({
               tool: "claude",
               id,
               cwd: cwdAbs,
               createdAt,
               updatedAt,
               title,
-              preview,
+              preview: null,
               messageCount,
               gitBranch,
-            });
-            nextFiles.set(`claude:${id}`, fullPath);
+            }, fullPath);
             indexedClaude.add(id);
+            claudeIndexedCount += 1;
           }
         }
 
@@ -622,7 +648,7 @@ export class ToolSessionIndex {
         }
 
         // Avoid pathologically large scans: cap per-project.
-        if (files.length > 800) files = files.slice(0, 800);
+        if (files.length > MAX_CLAUDE_FALLBACK_PER_PROJECT) files = files.slice(0, MAX_CLAUDE_FALLBACK_PER_PROJECT);
 
         for (const fp of files) {
           const base = path.basename(fp);
@@ -644,32 +670,24 @@ export class ToolSessionIndex {
             updatedAt = Date.now();
           }
 
-          let preview: string | null = null;
-          try {
-            const tail = readTail(fp, 256 * 1024);
-            preview = extractClaudePreviewFromTail(tail).preview;
-          } catch {
-            preview = null;
-          }
-
-          next.push({
+          upsert({
             tool: "claude",
             id,
             cwd: cwdAbs,
             createdAt: meta.createdAt,
             updatedAt,
             title: meta.title,
-            preview,
+            preview: null,
             messageCount: null,
             gitBranch: meta.gitBranch,
-          });
-          nextFiles.set(`claude:${id}`, fp);
+          }, fp);
           indexedClaude.add(id);
         }
       }
     }
 
     // Sort by recent activity.
+    const next = Array.from(byKey.values());
     next.sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
     this.summaries = next;
     this.fileByKey = nextFiles;
@@ -722,20 +740,33 @@ function parseCodexMessagesFromText(raw: string): ToolSessionMessage[] {
       continue;
     }
 
-    if (pType === "function_call") {
-      const name = typeof payload.name === "string" ? payload.name : "";
-      const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
-      const text = formatToolCallText(name, payload.arguments);
+    // Generic Codex tool-call coverage:
+    // - function_call / function_call_output
+    // - custom_tool_call / custom_tool_call_output
+    // - web_search_call
+    // - future call families that follow *_call / *_output naming.
+    if (pType.endsWith("_call")) {
+      const name = codexToolName(pType, payload);
+      const callId = codexCallId(payload);
+      const text = formatToolCallText(name, codexCallInput(payload));
       const msg = messageFromBlocks("assistant", ts, [{ type: "tool_use", text, name, callId }]);
       if (msg) out.push(msg);
+
+      // Some calls include explicit status without a companion output item.
+      const status = typeof payload.status === "string" ? payload.status.trim() : "";
+      if (status && status !== "in_progress") {
+        const statusMsg = messageFromBlocks("assistant", ts, [{ type: "tool_result", text: `[${status}]`, callId }]);
+        if (statusMsg) out.push(statusMsg);
+      }
       continue;
     }
 
-    if (pType === "function_call_output") {
-      const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
-      const outputText = cleanText(extractAnyText(payload.output));
+    if (pType.endsWith("_output")) {
+      const callId = codexCallId(payload);
+      const outputText = cleanText(extractAnyText(payload.output ?? payload.result ?? payload));
       const msg = messageFromBlocks("assistant", ts, [{ type: "tool_result", text: outputText, callId }]);
       if (msg) out.push(msg);
+      continue;
     }
   }
   return out;
@@ -887,6 +918,15 @@ export function parseOpenCodeExport(
         if (text) blocks.push({ type: "thinking", text });
         continue;
       }
+      if (t === "step-start") {
+        blocks.push({ type: "text", text: "[step started]" });
+        continue;
+      }
+      if (t === "step-finish") {
+        const reason = typeof (p as any).reason === "string" ? String((p as any).reason) : "";
+        blocks.push({ type: "text", text: reason ? `[step finished: ${reason}]` : "[step finished]" });
+        continue;
+      }
       if (t === "tool") {
         const name = typeof (p as any).tool === "string" ? String((p as any).tool) : "";
         const callId = typeof (p as any).callID === "string" ? String((p as any).callID) : undefined;
@@ -907,7 +947,7 @@ export function parseOpenCodeExport(
         if (text) blocks.push({ type: "tool_result", text, callId });
         continue;
       }
-      // ignore step-start/step-finish and any unknown parts
+      // ignore unknown part types
     }
 
     const msg = messageFromBlocks(role as any, ts, blocks);

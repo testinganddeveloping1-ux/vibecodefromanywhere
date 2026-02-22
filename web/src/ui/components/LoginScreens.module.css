@@ -1,0 +1,173 @@
+.container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    padding: 24px;
+}
+
+.card {
+    width: 100%;
+    max-width: 400px;
+    background: rgba(18, 18, 18, 0.7);
+    backdrop-filter: blur(28px) saturate(180%);
+    -webkit-backdrop-filter: blur(28px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-top: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 28px;
+    padding: 32px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+    animation: fadeUp 0.4s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.header {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 8px;
+}
+
+.logoBox {
+    width: 56px;
+    height: 56px;
+    border-radius: 16px;
+    background: linear-gradient(135deg, #ff8a3d, #ff5e62);
+    box-shadow: 0 8px 24px rgba(255, 138, 61, 0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+}
+
+.logoBox svg {
+    width: 28px;
+    height: 28px;
+    fill: currentColor;
+}
+
+.title {
+    font-family: var(--sans, sans-serif);
+    font-size: 22px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.02em;
+}
+
+.subtitle {
+    font-size: 14px;
+    color: #8b949e;
+    text-align: center;
+    line-height: 1.5;
+}
+
+.inputGroup {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.label {
+    font-size: 12px;
+    font-weight: 600;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-left: 4px;
+}
+
+.input {
+    width: 100%;
+    padding: 14px 16px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    font-size: 16px;
+    /* Prevents auto zoom */
+    font-family: var(--mono, monospace);
+    color: #fff;
+    transition: all 0.2s ease;
+}
+
+.input:focus {
+    border-color: rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.06);
+    outline: none;
+    box-shadow: 0 0 0 4px rgba(255, 138, 61, 0.1);
+}
+
+.input::placeholder {
+    color: #666;
+    font-family: var(--sans, sans-serif);
+}
+
+.actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 8px;
+}
+
+.btn {
+    flex: 1;
+    padding: 14px 16px;
+    border-radius: 14px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+    border: none;
+    transition: transform 0.1s, background 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn:active {
+    transform: scale(0.96);
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.btnPrimary {
+    flex: 1.5;
+    background: #fff;
+    color: #000;
+}
+
+.btnPrimary:active {
+    background: #e0e0e0;
+}
+
+.hint {
+    font-size: 12px;
+    color: #666;
+    text-align: center;
+    line-height: 1.5;
+    margin-top: 4px;
+}
+
+.message {
+    font-size: 13px;
+    color: #ff8a3d;
+    background: rgba(255, 138, 61, 0.1);
+    padding: 10px 14px;
+    border-radius: 10px;
+    text-align: center;
+    margin-top: -4px;
+}
+
+@keyframes fadeUp {
+    from {
+        opacity: 0;
+        transform: translateY(12px) scale(0.98);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}

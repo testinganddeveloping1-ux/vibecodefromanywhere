@@ -1,0 +1,139 @@
+.chat {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
+  padding: 16px;
+  gap: 16px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.meta {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  color: #8b949e;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.error {
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+  color: #ff3b30;
+  padding: 8px 0;
+}
+
+.msgs {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+}
+
+.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: #666;
+  font-size: 13px;
+}
+
+.bubbleRow {
+  display: flex;
+}
+
+.bubbleUser {
+  justify-content: flex-end;
+}
+
+.bubbleAssistant {
+  justify-content: flex-start;
+}
+
+.bubble {
+  max-width: 85%;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+  padding: 14px 18px;
+  font-size: 14px;
+  line-height: 1.5;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+}
+
+.bubbleUser .bubble {
+  background: linear-gradient(135deg, rgba(255, 138, 61, 0.15), rgba(255, 94, 98, 0.15));
+  border-color: rgba(255, 138, 61, 0.2);
+}
+
+.bubbleAssistant .bubble {
+  border-bottom-left-radius: 4px;
+}
+
+.bubbleUser .bubble {
+  border-bottom-right-radius: 4px;
+}
+
+.bubbleThinking {
+  background: rgba(245, 166, 35, 0.05);
+  border-color: rgba(245, 166, 35, 0.15);
+  border-style: dashed;
+  color: #a1a1aa;
+}
+
+.bubbleToolUse {
+  background: rgba(96, 165, 250, 0.05);
+  border-color: rgba(96, 165, 250, 0.15);
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+}
+
+.bubbleToolResult {
+  background: rgba(52, 199, 89, 0.05);
+  border-color: rgba(52, 199, 89, 0.15);
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+}
+
+.bubbleKind {
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  color: #8b949e;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+
+.diff {
+  margin-top: 8px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.diff summary {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  color: #a1a1aa;
+  padding: 8px 12px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
