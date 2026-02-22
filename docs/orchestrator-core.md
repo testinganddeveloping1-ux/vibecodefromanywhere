@@ -640,7 +640,20 @@ Do not bypass lock and cleanup safety paths.
 - Keep tests green.
 - Keep docs explicit.
 
-## 44) References
+## 44) External best-practice adoption loop
+Use `docs/agent-command-library/25-agentic-implementation-critical-thinking-loop.md` as a process hardening baseline.
+
+Minimum behavioral requirements:
+- evidence-before-claims in every worker handoff;
+- risk-tiered approval and escalation for medium/high risk actions;
+- no-op/no-message discipline when workers are on-track;
+- reproducibility pack for meaningful bugfix/regression work;
+- security evidence for security-sensitive changes.
+
+This is intentionally process-focused.
+It targets implementation quality, dispatch quality, and review quality.
+
+## 45) References
 Codex non-interactive:
 https://developers.openai.com/codex/noninteractive
 

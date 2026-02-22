@@ -30,6 +30,7 @@ It is built from local skill crosswalks plus operational hardening docs so comma
 22. `22-sota-enforcement-loop.md`
 23. `23-live-skill-provenance-model.md`
 24. `24-manual-sota-review-2026-02-21.md`
+25. `25-agentic-implementation-critical-thinking-loop.md`
 
 ## Command Families
 

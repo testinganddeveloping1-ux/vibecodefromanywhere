@@ -20,6 +20,7 @@ Last updated: 2026-02-22
 - Update in progress:
   - Orchestrator-worker workflow with stronger objective consideration
   - Auto-approve style automation paths for worker questions/dispatch policy
+  - OSS-derived implementation critical-thinking loop for agent/process quality
 - Warning:
   - `NOT TESTED` for real production codebases yet
   - Do not run this on critical repos without manual review
@@ -284,6 +285,7 @@ Detailed architecture notes:
 - `docs/agent-command-library/22-sota-enforcement-loop.md`
 - `docs/agent-command-library/23-live-skill-provenance-model.md`
 - `docs/agent-command-library/24-manual-sota-review-2026-02-21.md`
+- `docs/agent-command-library/25-agentic-implementation-critical-thinking-loop.md`
 
 ## Tool Sessions (Chat History)
 

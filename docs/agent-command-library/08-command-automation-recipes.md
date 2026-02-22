@@ -121,6 +121,28 @@ Trigger structured review request and response loop.
 - Applied fixes
 - Deferred findings with reason
 
+## `process-retro`
+
+### Intent
+Capture process flaws and corrective actions after a meaningful task cycle.
+
+### Input schema
+
+```json
+{
+  "target": "worker:Worker A",
+  "scope": ["workflow", "dispatch", "verification", "handoff"],
+  "context": "short summary of recent task run"
+}
+```
+
+### Required outputs
+
+- Top process failures (not code bugs)
+- Evidence for each failure
+- Corrective rule update proposal
+- Which rule becomes mandatory next cycle
+
 ## `security-sast`
 
 ### Intent
